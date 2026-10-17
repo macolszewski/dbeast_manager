@@ -239,6 +239,37 @@ pub struct RunRequest {
     pub expected_context: Option<ResolvedContext>,
 }
 
+/// The table of a table editor tab whose SELECT is paged on the server.
+#[derive(Clone, Debug)]
+pub struct TablePage {
+    pub schema: Option<String>,
+    pub table: String,
+    /// The SQL has the user's ORDER BY; otherwise the primary key orders pages.
+    pub ordered: bool,
+}
+
+/// The paged SQL and the window to read from its result. Without an ORDER BY
+/// consecutive reads could return the rows of a page in another order, or
+/// other rows, so the primary key gives a stable order when there is one.
+async fn table_page_query(
+    conn: &mut Connection,
+    driver: DriverKind,
+    table: &TablePage,
+    sql: &str,
+    page: Page,
+) -> (String, Page) {
+    // An unqualified PostgreSQL table would be looked up in "public" only.
+    let keys = if table.ordered || (driver == DriverKind::Postgres && table.schema.is_none()) {
+        Vec::new()
+    } else {
+        // Without the key the page is still correct, only its order is not fixed.
+        conn.primary_key(table.schema.as_deref(), &table.table)
+            .await
+            .unwrap_or_default()
+    };
+    crate::drivers::page_query(driver, sql, &keys, page)
+}
+
 #[derive(Default)]
 struct SessionState {
     conn: Option<Connection>,
@@ -842,6 +873,16 @@ impl Backend {
 
     /// Executes statements one by one in the console's own session, stopping at the first error.
     pub fn run(&self, req: RunRequest) {
+        self.run_paged(req, None);
+    }
+
+    /// Like [`Backend::run`] for a table editor's generated SELECT, which the
+    /// server limits to the requested page.
+    pub fn run_table_page(&self, req: RunRequest, table: TablePage) {
+        self.run_paged(req, Some(table));
+    }
+
+    fn run_paged(&self, req: RunRequest, table_page: Option<TablePage>) {
         let Some((registration, token)) = explain::cancel::Registry::register(
             &self.query_requests,
             &req.ds.id,
@@ -962,6 +1003,10 @@ impl Backend {
                             }
                             if control.is_some() {
                                 conn.execute(&sql, page).await
+                            } else if let Some(table) = &table_page {
+                                let (paged, window) = table_page_query(conn, ds.driver, table, &sql, page).await;
+                                conn.execute_with_context(&paged, window, expected_context.as_ref())
+                                    .await
                             } else {
                                 conn.execute_with_context(&sql, page, expected_context.as_ref())
                                     .await

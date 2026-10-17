@@ -11,6 +11,7 @@ use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, Config, Row, Statement};
 pub(super) mod graph;
 pub(super) mod mcp;
+mod text;
 
 const CONTEXT_SQL: &str = "select pg_catalog.current_database(), \
     pg_catalog.current_setting('search_path'), pg_catalog.current_schemas(false), \
@@ -30,6 +31,9 @@ pub struct PgConn {
     initial_search_path: String,
     update_statements: std::collections::HashMap<String, Statement>,
     mcp_endpoint: Option<(String, u16, String)>,
+    /// Socket address and TLS name for cancel requests that stop a read-only
+    /// statement after its page; `None` where that is not possible.
+    page_cancel: Option<(String, u16, String)>,
 }
 
 struct ConnectionTask(tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>);
@@ -66,7 +70,7 @@ impl PgConn {
     pub(super) async fn execute_explain(&self, prepared: PreparedExplain, params: &[Value], expected: Option<&ResolvedContext>) -> Result<QueryResult> {
         super::check_expected_context(Some(&prepared.context), expected)?;
         anyhow::ensure!(prepared.statement.params().len() == params.len(), "EXPLAIN parameter count mismatch.");
-        self.query_prepared(&prepared.statement, params, Page::ALL, Some(prepared.context))
+        self.query_prepared(&prepared.statement, params, Page::ALL, Some(prepared.context), false)
             .await
     }
 
@@ -112,6 +116,10 @@ impl PgConn {
         }
         let context_statement = client.prepare(CONTEXT_SQL).await?;
         let initial_search_path = client.query_one(&context_statement, &[]).await?.get(1);
+        let page_cancel = (!ds.host.is_empty() && !ds.host.starts_with('/')).then(|| {
+            let host = if endpoint.tunneled { &endpoint.host } else { &ds.host };
+            (host.clone(), endpoint.port, ds.host.clone())
+        });
         Ok(Self {
             client,
             _connection_task: connection_task,
@@ -121,6 +129,7 @@ impl PgConn {
             initial_search_path,
             update_statements: Default::default(),
             mcp_endpoint: None,
+            page_cancel,
         })
     }
 
@@ -181,10 +190,15 @@ impl PgConn {
         // first so it describes the namespace before parsing/executing user SQL.
         // Do not short-circuit on a snapshot error: ROLLBACK must still execute
         // in an aborted transaction, where the context SELECT is rejected.
-        let (stmt, context) = if capture {
-            let (context, stmt) = tokio::join!(biased;
+        let may_stop_early = capture
+            && self.page_cancel.is_some()
+            && page.limit != usize::MAX
+            && read_only_select(sql);
+        let (stmt, context, stop_early) = if capture {
+            let (context, stmt, autocommit) = tokio::join!(biased;
                 self.resolved_context(),
-                self.client.prepare(sql)
+                self.client.prepare(sql),
+                self.outside_transaction_block(may_stop_early)
             );
             let stmt = stmt?;
             let context = if stmt.columns().is_empty() && expected.is_none() {
@@ -192,9 +206,9 @@ impl PgConn {
             } else {
                 Some(context?)
             };
-            (stmt, context)
+            (stmt, context, autocommit)
         } else {
-            (self.client.prepare(sql).await?, None)
+            (self.client.prepare(sql).await?, None, false)
         };
         super::check_expected_context(context.as_ref(), expected)?;
         if stmt.columns().is_empty() {
@@ -206,7 +220,63 @@ impl PgConn {
             });
         }
 
-        self.query_prepared(&stmt, &[], page, context).await
+        self.query_prepared(&stmt, &[], page, context, stop_early).await
+    }
+
+    /// Whether the session is outside an explicit transaction block, checked
+    /// only when `check` is set. In autocommit a simple query starts its own
+    /// transaction, so `now()` equals `statement_timestamp()`; inside a block
+    /// `now()` is the time of BEGIN. Errors (an aborted block) count as inside.
+    async fn outside_transaction_block(&self, check: bool) -> bool {
+        if !check {
+            return false;
+        }
+        let Ok(messages) = self
+            .client
+            .simple_query("select pg_catalog.now() = pg_catalog.statement_timestamp()")
+            .await
+        else {
+            return false;
+        };
+        messages.iter().any(|message| {
+            matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("t"))
+        })
+    }
+
+    /// Sends a cancel request and waits until the server closes the cancel
+    /// connection, which it does only after signalling the backend. A signal
+    /// that arrives after the statement already finished then finds the
+    /// backend idle, where PostgreSQL ignores it, instead of hitting the
+    /// session's next statement.
+    async fn cancel_and_wait(&self) -> Result<()> {
+        use tokio::net::TcpStream;
+        let (host, port, tls_name) = self
+            .page_cancel
+            .as_ref()
+            .context("Cancel requests are not available for this connection.")?;
+        let socket = TcpStream::connect((host.as_str(), *port)).await?.into_std()?;
+        let watcher = TcpStream::from_std(socket.try_clone()?)?;
+        let socket = TcpStream::from_std(socket)?;
+        let token = self.client.cancel_token();
+        match &self.tls {
+            Some(tls) => {
+                use tokio_postgres::tls::MakeTlsConnect;
+                let mut make = postgres_native_tls::MakeTlsConnector::new(tls.clone());
+                let connect = MakeTlsConnect::<TcpStream>::make_tls_connect(&mut make, tls_name)?;
+                token.cancel_query_raw(socket, connect).await?;
+            }
+            None => token.cancel_query_raw(socket, tokio_postgres::NoTls).await?,
+        }
+        let mut buffer = [0u8; 256];
+        loop {
+            watcher.readable().await?;
+            match watcher.try_read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     async fn query_prepared(
@@ -215,6 +285,7 @@ impl PgConn {
         params: &[Value],
         page: Page,
         context: Option<ResolvedContext>,
+        stop_early: bool,
     ) -> Result<QueryResult> {
         let origins = stmt
             .columns()
@@ -245,7 +316,8 @@ impl PgConn {
                     .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync)),
             )
             .await?;
-        let (rows, truncated) = collect_rows(rows, page, &mut exact_columns).await?;
+        let (rows, truncated) =
+            collect_rows(rows, page, &mut exact_columns, stop_early.then_some(self)).await?;
         Ok(QueryResult {
             columns,
             rows,
@@ -331,7 +403,17 @@ impl PgConn {
         let mut batch = Vec::with_capacity(super::STREAM_BATCH);
         let mut total = 0u64;
         while let Some(row) = stream.next().await {
-            batch.push(row_values(&row?, &mut exact));
+            let mut lossy = None;
+            batch.push(row_values(&row?, &mut exact, &mut lossy));
+            // A placeholder in a file would silently replace the stored value.
+            if let Some(index) = lossy {
+                let column = &statement.columns()[index];
+                anyhow::bail!(
+                    "Export stopped: column \"{}\" of type {} has a value DBeast cannot read exactly.",
+                    column.name(),
+                    column.type_().name()
+                );
+            }
             if batch.len() == super::STREAM_BATCH {
                 total += batch.len() as u64;
                 let full = std::mem::replace(&mut batch, Vec::with_capacity(super::STREAM_BATCH));
@@ -360,7 +442,7 @@ impl PgConn {
             !statement.columns().is_empty(),
             "A related query must return rows."
         );
-        self.query_prepared(&statement, &query.params, page, Some(context))
+        self.query_prepared(&statement, &query.params, page, Some(context), false)
             .await
     }
 
@@ -1077,51 +1159,100 @@ impl PgConn {
     }
 }
 
+/// Reads the requested page. The row after the page decides `truncated`, and
+/// neither its error nor a later one may be lost: a failed statement is never
+/// reported as successful (in a transaction block it would leave the block
+/// aborted behind a success message). Rows past the page are therefore read
+/// to the end, unless `cancel` is given: only for read-only SELECTs outside a
+/// transaction block, which the server then stops early, so the cancellation
+/// rolls back nothing and its error is the expected end of the stream.
 async fn collect_rows(
     stream: tokio_postgres::RowStream,
     page: Page,
     exact_columns: &mut [bool],
+    cancel: Option<&PgConn>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
     use futures_util::StreamExt;
     let mut stream = std::pin::pin!(stream);
     let mut rows = Vec::new();
     let mut seen = 0usize;
     while let Some(row) = stream.next().await {
+        let row = row?;
         seen += 1;
         if seen <= page.skip {
-            row?;
             continue;
         }
         if rows.len() == page.limit {
-            // Dropping the stream lets the connection discard the remaining rows.
+            finish_stream(stream, cancel).await?;
             return Ok((rows, true));
         }
-        rows.push(row_values(&row?, exact_columns));
+        rows.push(row_values(&row, exact_columns, &mut None));
     }
     Ok((rows, false))
 }
 
-fn row_values(row: &Row, exact_columns: &mut [bool]) -> Vec<Value> {
+async fn finish_stream(
+    mut stream: std::pin::Pin<&mut tokio_postgres::RowStream>,
+    cancel: Option<&PgConn>,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    let drain = async {
+        while let Some(row) = stream.next().await {
+            row?;
+        }
+        Ok::<_, tokio_postgres::Error>(())
+    };
+    let Some(conn) = cancel else {
+        return Ok(drain.await?);
+    };
+    let wait = std::time::Duration::from_secs(5);
+    // A failed cancel request only means the rest is read to the end.
+    let (_, drained) = tokio::join!(tokio::time::timeout(wait, conn.cancel_and_wait()), drain);
+    match drained {
+        Err(error) if error.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) => Ok(()),
+        drained => Ok(drained?),
+    }
+}
+
+/// Converts one row; `lossy` receives the first column whose value is a
+/// placeholder instead of the server's value.
+fn row_values(row: &Row, exact_columns: &mut [bool], lossy: &mut Option<usize>) -> Vec<Value> {
     (0..row.len())
         .map(|i| match row.try_get::<_, PgValue>(i) {
             Ok(v) => {
                 exact_columns[i] &= v.1;
+                if !v.2 {
+                    lossy.get_or_insert(i);
+                }
                 v.0
             }
             Err(e) => {
                 exact_columns[i] = false;
+                lossy.get_or_insert(i);
                 Value::Text(format!("<{e}>"))
             }
         })
         .collect()
 }
 
-/// Decodes any PostgreSQL value from the binary protocol.
-struct PgValue(Value, bool);
+/// Decodes any PostgreSQL value from the binary protocol: the value, whether
+/// grid edits may use it, and whether it is the server's value at all (a
+/// `<type: hex>` placeholder otherwise).
+struct PgValue(Value, bool, bool);
 
 impl<'a> FromSql<'a> for PgValue {
     fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        use chrono::Datelike;
         let mut exact = true;
+        let mut lossless = true;
+        // PostgreSQL's text output for values without an exact typed form.
+        let mut server_text = || match text::output(ty, raw) {
+            Some(text) => Value::Text(text),
+            None => {
+                lossless = false;
+                Value::Text(format!("<{}: {}>", ty.name(), hex(raw)))
+            }
+        };
         let v = match *ty {
             Type::BOOL => Value::Bool(bool::from_sql(ty, raw)?),
             Type::INT2 => Value::Int(i16::from_sql(ty, raw)? as i64),
@@ -1130,27 +1261,35 @@ impl<'a> FromSql<'a> for PgValue {
             Type::OID => Value::Int(u32::from_sql(ty, raw)? as i64),
             Type::FLOAT4 => Value::Float(f32::from_sql(ty, raw)? as f64),
             Type::FLOAT8 => Value::Float(f64::from_sql(ty, raw)?),
-            Type::NUMERIC => match rust_decimal::Decimal::from_sql(ty, raw) {
-                Ok(d) => {
-                    // Decimal's decoder may round while returning Ok. Seven
-                    // base-10000 groups and scale <= 28 form a safe exact subset.
-                    exact = raw.len() >= 8
-                        && u16::from_be_bytes([raw[0], raw[1]]) <= 7
-                        && u16::from_be_bytes([raw[6], raw[7]]) <= 28;
-                    Value::Decimal(d.to_string())
-                }
-                // NaN, infinity or more digits than Decimal holds.
-                Err(_) => {
+            Type::NUMERIC => match text::numeric(raw) {
+                Some(text) if text.ends_with("Infinity") || text == "NaN" => {
                     exact = false;
-                    Value::Text("<numeric>".into())
+                    Value::Text(text)
                 }
+                Some(text) => {
+                    // Edits stay limited to the subset the previous Decimal
+                    // decoder handled: seven base-10000 groups, scale <= 28.
+                    exact = u16::from_be_bytes([raw[0], raw[1]]) <= 7
+                        && u16::from_be_bytes([raw[6], raw[7]]) <= 28;
+                    Value::Decimal(text)
+                }
+                None => server_text(),
             },
-            Type::TIMESTAMP => Value::Text(chrono::NaiveDateTime::from_sql(ty, raw)?.to_string()),
-            Type::TIMESTAMPTZ => {
-                Value::Text(chrono::DateTime::<chrono::Utc>::from_sql(ty, raw)?.to_rfc3339())
-            }
-            Type::DATE => Value::Text(chrono::NaiveDate::from_sql(ty, raw)?.to_string()),
-            Type::TIME => Value::Text(chrono::NaiveTime::from_sql(ty, raw)?.to_string()),
+            // Infinity and BC dates have no chrono form PostgreSQL reads back.
+            Type::TIMESTAMP => match chrono::NaiveDateTime::from_sql(ty, raw) {
+                Ok(t) if t.year() > 0 => Value::Text(t.to_string()),
+                _ => server_text(),
+            },
+            Type::TIMESTAMPTZ => match chrono::DateTime::<chrono::Utc>::from_sql(ty, raw) {
+                Ok(t) if t.year() > 0 => Value::Text(t.to_rfc3339()),
+                _ => server_text(),
+            },
+            Type::DATE => match chrono::NaiveDate::from_sql(ty, raw) {
+                Ok(d) if d.year() > 0 => Value::Text(d.to_string()),
+                _ => server_text(),
+            },
+            // chrono wraps 24:00:00 around to midnight.
+            Type::TIME => server_text(),
             Type::JSON | Type::JSONB => {
                 let text = if *ty == Type::JSONB {
                     match raw.split_first() {
@@ -1166,37 +1305,21 @@ impl<'a> FromSql<'a> for PgValue {
             }
             Type::UUID => Value::Text(uuid::Uuid::from_sql(ty, raw)?.to_string()),
             Type::BYTEA => Value::Bytes(raw.to_vec()),
-            Type::INET | Type::CIDR => Value::Text(
-                std::net::IpAddr::from_sql(ty, raw)
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|_| hex(raw)),
-            ),
-            Type::INTERVAL => Value::Text(interval(raw)),
-            Type::BOOL_ARRAY => array(Vec::<Option<bool>>::from_sql(ty, raw)?),
-            Type::INT2_ARRAY => array(Vec::<Option<i16>>::from_sql(ty, raw)?),
-            Type::INT4_ARRAY => array(Vec::<Option<i32>>::from_sql(ty, raw)?),
-            Type::INT8_ARRAY => array(Vec::<Option<i64>>::from_sql(ty, raw)?),
-            Type::FLOAT8_ARRAY => array(Vec::<Option<f64>>::from_sql(ty, raw)?),
-            Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::NAME_ARRAY => {
-                array(Vec::<Option<String>>::from_sql(ty, raw)?)
-            }
             // PostGIS sends EWKB; keep the bytes for the Geo Viewer.
             _ if matches!(ty.name(), "geometry" | "geography") => Value::Bytes(raw.to_vec()),
-            _ => match std::str::from_utf8(raw) {
-                // text, varchar, char, name, xml, enums and citext are sent as UTF-8.
-                Ok(s) => Value::Text(s.to_string()),
-                Err(_) => Value::Text(format!("<{}: {}>", ty.name(), hex(raw))),
-            },
+            // Arrays, intervals, network types, ranges, text types and the rest.
+            _ => server_text(),
         };
-        exact &= editable_pg_type(
-            ty.name(),
-            matches!(ty.kind(), tokio_postgres::types::Kind::Enum(_)),
-        );
-        Ok(PgValue(v, exact))
+        exact &= lossless
+            && editable_pg_type(
+                ty.name(),
+                matches!(ty.kind(), tokio_postgres::types::Kind::Enum(_)),
+            );
+        Ok(PgValue(v, exact, lossless))
     }
 
     fn from_sql_null(_: &Type) -> Result<Self, Box<dyn Error + Sync + Send>> {
-        Ok(PgValue(Value::Null, true))
+        Ok(PgValue(Value::Null, true, true))
     }
 
     fn accepts(_: &Type) -> bool {
@@ -1204,41 +1327,169 @@ impl<'a> FromSql<'a> for PgValue {
     }
 }
 
-fn array<T: std::fmt::Display>(items: Vec<Option<T>>) -> Value {
-    let parts: Vec<String> = items
-        .into_iter()
-        .map(|v| v.map_or("NULL".into(), |v| v.to_string()))
-        .collect();
-    Value::Text(format!("{{{}}}", parts.join(",")))
-}
-
 fn hex(raw: &[u8]) -> String {
     raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Binary interval: microseconds (i64), days (i32), months (i32).
-fn interval(raw: &[u8]) -> String {
-    if raw.len() != 16 {
-        return hex(raw);
+/// Conservative check that cancelling `sql` once its page is read cannot undo
+/// anything: a single SELECT, TABLE or VALUES query (optionally WITH) without
+/// data-modifying keywords and without function calls other than well-known
+/// built-ins free of side effects. Anything else, a function that writes or
+/// DML with RETURNING, runs to completion; a false negative only costs reading
+/// the rest of the result.
+fn read_only_select(sql: &str) -> bool {
+    const WRITES: &[&str] = &[
+        "insert", "update", "delete", "merge", "into", "copy", "call", "do", "execute", "lock",
+        "notify", "listen", "refresh", "create", "alter", "drop", "truncate", "grant", "revoke",
+        "set", "vacuum", "analyze", "nextval", "setval",
+    ];
+    // Keywords that precede a parenthesis without calling a function, type
+    // names with a modifier, and built-in functions without side effects.
+    const BEFORE_PAREN: &[&str] = &[
+        "in", "exists", "any", "some", "all", "values", "as", "on", "using", "from", "join",
+        "where", "and", "or", "not", "select", "cast", "coalesce", "nullif", "greatest", "least",
+        "row", "array", "over", "filter", "within", "lateral", "by", "having", "limit", "offset",
+        "fetch", "union", "intersect", "except", "case", "when", "then", "else", "between",
+        "like", "ilike", "is", "distinct", "with", "recursive", "materialized", "table", "only",
+        "partition", "order", "group", "window", "rows", "range", "groups", "of", "cube",
+        "rollup", "grouping", "sets", "inner", "outer", "full", "cross", "natural", "extract",
+        "overlay", "position", "substring", "trim", "numeric", "decimal", "varchar", "char",
+        "character", "varying", "bit", "timestamp", "time", "interval", "float", "count", "sum",
+        "avg", "min", "max", "lower", "upper", "length", "char_length", "octet_length", "substr",
+        "replace", "concat", "concat_ws", "round", "trunc", "abs", "ceil", "ceiling", "floor",
+        "mod", "power", "sqrt", "sign", "date_trunc", "date_part", "date_bin", "age", "to_char",
+        "to_date", "to_timestamp", "to_number", "now", "string_agg", "array_agg", "json_agg",
+        "jsonb_agg", "json_object_agg", "jsonb_object_agg", "json_build_object",
+        "jsonb_build_object", "json_build_array", "jsonb_build_array", "to_json", "to_jsonb",
+        "row_to_json", "jsonb_typeof", "jsonb_array_elements", "json_array_elements",
+        "jsonb_each", "json_each", "row_number", "rank", "dense_rank", "percent_rank",
+        "cume_dist", "ntile", "lag", "lead", "first_value", "last_value", "nth_value",
+        "generate_series", "unnest", "split_part", "md5", "format", "array_length",
+        "array_to_string", "string_to_array", "cardinality", "bool_and", "bool_or", "every",
+        "left", "right", "lpad", "rpad", "starts_with", "strpos", "initcap", "reverse",
+        "repeat", "regexp_replace", "regexp_match", "regexp_matches", "make_date",
+        "percentile_cont", "percentile_disc", "mode", "stddev", "variance",
+    ];
+    #[derive(PartialEq)]
+    enum Token {
+        Word(String),
+        Quoted,
+        Open,
+        Dot,
+        End,
+        Other,
     }
-    let micros = i64::from_be_bytes(raw[0..8].try_into().unwrap());
-    let days = i32::from_be_bytes(raw[8..12].try_into().unwrap());
-    let months = i32::from_be_bytes(raw[12..16].try_into().unwrap());
-    let mut parts = Vec::new();
-    if months != 0 {
-        parts.push(format!("{} years {} mons", months / 12, months % 12));
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        match byte {
+            b if b.is_ascii_whitespace() => at += 1,
+            b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at += 2;
+                let mut depth = 1;
+                while depth > 0 {
+                    match bytes.get(at..at + 2) {
+                        Some(b"/*") => depth += 1,
+                        Some(b"*/") => depth -= 1,
+                        Some(_) => {
+                            at += 1;
+                            continue;
+                        }
+                        None => return false,
+                    }
+                    at += 2;
+                }
+            }
+            b'\'' | b'"' => {
+                at += 1;
+                loop {
+                    match bytes.get(at) {
+                        None => return false,
+                        // Escape-string rules are ambiguous here; give up.
+                        Some(b'\\') => return false,
+                        Some(&b) if b == byte => {
+                            at += 1;
+                            if bytes.get(at) != Some(&byte) {
+                                break;
+                            }
+                            at += 1;
+                        }
+                        Some(_) => at += 1,
+                    }
+                }
+                tokens.push(if byte == b'"' { Token::Quoted } else { Token::Other });
+            }
+            b'$' => {
+                let tag_end = bytes[at + 1..]
+                    .iter()
+                    .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+                    .map(|n| at + 1 + n);
+                match tag_end {
+                    Some(end) if bytes[end] == b'$' && !bytes.get(at + 1).is_some_and(u8::is_ascii_digit) => {
+                        let tag = &sql[at..=end];
+                        let Some(close) = sql[end + 1..].find(tag) else {
+                            return false;
+                        };
+                        at = end + 1 + close + tag.len();
+                        tokens.push(Token::Other);
+                    }
+                    _ => {
+                        at += 1;
+                        tokens.push(Token::Other);
+                    }
+                }
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                let start = at;
+                while at < bytes.len()
+                    && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] == b'$' || bytes[at] >= 0x80)
+                {
+                    at += 1;
+                }
+                tokens.push(Token::Word(sql[start..at].to_ascii_lowercase()));
+            }
+            b'(' => {
+                at += 1;
+                tokens.push(Token::Open);
+            }
+            b'.' => {
+                at += 1;
+                tokens.push(Token::Dot);
+            }
+            b';' => {
+                at += 1;
+                tokens.push(Token::End);
+            }
+            _ => {
+                at += 1;
+                tokens.push(Token::Other);
+            }
+        }
     }
-    if days != 0 {
-        parts.push(format!("{days} days"));
+    while tokens.last() == Some(&Token::End) {
+        tokens.pop();
     }
-    let secs = micros / 1_000_000;
-    parts.push(format!(
-        "{:02}:{:02}:{:02}",
-        secs / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    ));
-    parts.join(" ")
+    if !matches!(tokens.first(), Some(Token::Word(w)) if matches!(w.as_str(), "select" | "table" | "values" | "with")) {
+        return false;
+    }
+    tokens.iter().enumerate().all(|(i, token)| match token {
+        Token::End => false,
+        Token::Quoted => tokens.get(i + 1) != Some(&Token::Open),
+        Token::Word(word) => {
+            !WRITES.contains(&word.as_str())
+                && (tokens.get(i + 1) != Some(&Token::Open)
+                    || (BEFORE_PAREN.contains(&word.as_str())
+                        && (i == 0 || tokens[i - 1] != Token::Dot)))
+        }
+        _ => true,
+    })
 }
 
 /// tokio-postgres prints only "db error"; the Output log needs SQLSTATE,
@@ -1455,6 +1706,65 @@ mod mutation_tests {
         assert_eq!(json.0, Value::Text(text.into()));
         assert!(!json.1); // PostgreSQL JSON has no equality operator.
         assert!(PgValue::from_sql(&Type::JSONB, &[2, b'{', b'}']).is_err());
+    }
+
+    #[test]
+    fn values_without_a_typed_form_keep_the_server_text_or_say_they_are_lossy() {
+        let raw = numeric(31, &[0, 1234, 5678, 9012, 3456, 7890, 1234, 5678, 9010]);
+        let decoded = PgValue::from_sql(&Type::NUMERIC, &raw).unwrap();
+        assert_eq!(decoded.0, Value::Decimal("0.1234567890123456789012345678901".into()));
+        assert!(decoded.2);
+        let nan = PgValue::from_sql(&Type::NUMERIC, &[0, 0, 0, 0, 0xC0, 0, 0, 0]).unwrap();
+        assert_eq!(nan.0, Value::Text("NaN".into()));
+        assert!(!nan.1 && nan.2);
+        let mut array = Vec::new();
+        for part in [1i32, 0, 25, 1, 1] {
+            array.extend_from_slice(&part.to_be_bytes());
+        }
+        array.extend_from_slice(&3i32.to_be_bytes());
+        array.extend_from_slice(b"a,b");
+        let decoded = PgValue::from_sql(&Type::TEXT_ARRAY, &array).unwrap();
+        assert_eq!(decoded.0, Value::Text(r#"{"a,b"}"#.into()));
+        assert!(!decoded.1 && decoded.2);
+        // money depends on lc_monetary: never guessed, never exported.
+        let money = PgValue::from_sql(&Type::MONEY, &1234i64.to_be_bytes()).unwrap();
+        assert!(!money.1 && !money.2);
+        let infinity = PgValue::from_sql(&Type::TIMESTAMP, &i64::MAX.to_be_bytes()).unwrap();
+        assert_eq!(infinity.0, Value::Text("infinity".into()));
+        assert!(infinity.2);
+    }
+
+    #[test]
+    fn only_plain_reads_are_cancelled_after_their_page() {
+        for sql in [
+            "select * from big",
+            "SELECT id, lower(name) FROM t WHERE x IN (1, 2) ORDER BY id;",
+            "with a as (select generate_series(1, 10) g) select count(*) from a",
+            "table big",
+            "values (1), (2)",
+            "select 'insert', \"delete\" from t -- update\n",
+            "select $$ delete $$ /* update /* nested */ */ from t",
+            "SELECT * FROM \"public\".\"t\" WHERE id > 5\nLIMIT 501 OFFSET 0",
+        ] {
+            assert!(read_only_select(sql), "{sql}");
+        }
+        for sql in [
+            "insert into t values (1) returning id",
+            "with d as (delete from t returning *) select * from d",
+            "update t set a = 1 returning a",
+            "select my_func(id) from t",
+            "select pg_catalog.lower(name) from t",
+            "select \"lower\"(name) from t",
+            "select nextval('s') from t",
+            "select * from t for update",
+            "select E'it\\'s' from t",
+            "select 1; delete from t",
+            "explain analyze delete from t",
+            "call p()",
+            "select 'unterminated",
+        ] {
+            assert!(!read_only_select(sql), "{sql}");
+        }
     }
 }
 

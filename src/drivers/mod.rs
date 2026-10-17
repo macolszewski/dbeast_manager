@@ -776,6 +776,24 @@ pub fn select_all(driver: DriverKind, schema: Option<&str>, table: &str) -> Stri
     }
 }
 
+/// A table editor's SELECT limited on the server to one page, and the window
+/// to read from its result. It asks for one row more than the page to tell
+/// whether another page exists. `keys` order the rows when the user gave no
+/// ORDER BY. New lines end a trailing `--` comment in the user's filter.
+pub fn page_query(driver: DriverKind, sql: &str, keys: &[String], page: Page) -> (String, Page) {
+    if page.limit == usize::MAX {
+        return (sql.to_string(), page);
+    }
+    let q = if driver == DriverKind::MySql { '`' } else { '"' };
+    let mut out = sql.to_string();
+    if !keys.is_empty() {
+        let keys: Vec<String> = keys.iter().map(|key| quote_ident(key, q)).collect();
+        out.push_str(&format!("\nORDER BY {}", keys.join(", ")));
+    }
+    out.push_str(&format!("\nLIMIT {} OFFSET {}", page.limit + 1, page.skip));
+    (out, Page::first(page.limit))
+}
+
 /// Groups (schema, table, is_view, column, type) rows ordered by table into [`TableMeta`].
 fn group_meta(
     rows: impl Iterator<Item = (String, String, bool, Option<String>, Option<String>)>,
@@ -940,5 +958,36 @@ mod credential_tests {
             assert!(error.to_string().contains("credentials are unavailable"));
             assert!(!path.exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod page_query_tests {
+    use super::*;
+
+    #[test]
+    fn table_pages_are_limited_on_the_server_for_every_driver() {
+        let page = Page { skip: 1000, limit: 500 };
+        let keys = vec!["id".to_string(), "Part".to_string()];
+        let cases = [
+            (DriverKind::Postgres, r#"SELECT * FROM "public"."t""#, "\nORDER BY \"id\", \"Part\"\nLIMIT 501 OFFSET 1000"),
+            (DriverKind::MySql, "SELECT * FROM `shop`.`t`", "\nORDER BY `id`, `Part`\nLIMIT 501 OFFSET 1000"),
+            (DriverKind::Sqlite, r#"SELECT * FROM "t""#, "\nORDER BY \"id\", \"Part\"\nLIMIT 501 OFFSET 1000"),
+        ];
+        for (driver, base, tail) in cases {
+            let (sql, window) = page_query(driver, base, &keys, page);
+            assert_eq!(sql, format!("{base}{tail}"));
+            // The server already skipped: read the page and the one extra row.
+            assert_eq!(window, Page::first(500));
+        }
+        // The user's ORDER BY is kept; a trailing comment cannot swallow LIMIT.
+        let (sql, _) = page_query(
+            DriverKind::Postgres,
+            r#"SELECT * FROM "t" WHERE a > 1 -- recent ORDER BY b DESC"#,
+            &[],
+            Page::first(500),
+        );
+        assert_eq!(sql, "SELECT * FROM \"t\" WHERE a > 1 -- recent ORDER BY b DESC\nLIMIT 501 OFFSET 0");
+        assert_eq!(page_query(DriverKind::Sqlite, "SELECT 1", &[], Page::ALL), ("SELECT 1".into(), Page::ALL));
     }
 }

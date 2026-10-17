@@ -47,6 +47,10 @@ To sort in the database, use `ORDER BY` in your query or in the table editor's *
 
 Results are fetched one page at a time, 500 rows by default. Use ◀ and ▶ to move between pages, and the page size menu to change the number of rows. The range label shows `+` when more rows are available.
 
+A table opened from the Database Explorer asks the database for the current page only: DBeast adds `LIMIT` (one row more than the page, to know whether another page exists) and `OFFSET` to the table's SELECT, so a page at the end of a large table costs about as much as the first one. Without an **ORDER BY** in the table editor, rows are ordered by the primary key, so a page shows the same rows every time. **Export Data** still exports the whole table.
+
+A console query is run as written, and moving to another page runs it again. DBeast reads the page and the row after it, so an error in that row is never shown as a successful result. When more rows follow, a plain read (a SELECT without data-modifying statements and without calls to functions other than common built-in ones) outside a transaction is stopped on the server with a cancel request. Any other statement is read to the end and the extra rows are discarded: an error in a later row is reported, and a statement that changes data, such as `INSERT … RETURNING`, always runs to completion. On MySQL the rest of a console result is always read to the end.
+
 ## Transpose
 
 Click **Transpose** on the grid toolbar, or choose it in the cell context menu, to show columns as rows and records as columns. This is useful for wide tables with few rows.

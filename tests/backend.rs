@@ -1908,3 +1908,115 @@ fn mysql_implicit_commit_keeps_manual_transactions_real() {
         std::panic::resume_unwind(panic);
     }
 }
+
+fn table_page(
+    backend: &Backend,
+    ds: &DataSource,
+    table: &dbeast::backend::TablePage,
+    order: &str,
+    page: Page,
+) -> QueryResult {
+    let mut sql = dbeast::drivers::select_all(ds.driver, table.schema.as_deref(), &table.table);
+    if !order.is_empty() {
+        sql.push_str(&format!(" ORDER BY {order}"));
+    }
+    let mut request = req(40, ds, &[&sql], false);
+    request.page = page;
+    let table = dbeast::backend::TablePage { ordered: !order.is_empty(), ..table.clone() };
+    backend.run_table_page(request, table);
+    let (mut done, _) = collect_run(backend, 40);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].0, sql, "the result keeps the unpaged SQL for export and reloads");
+    done.remove(0).1.unwrap()
+}
+
+fn ids(result: &QueryResult) -> Vec<i64> {
+    result
+        .rows
+        .iter()
+        .map(|row| match row[0] {
+            Value::Int(id) => id,
+            ref other => panic!("unexpected id {other:?}"),
+        })
+        .collect()
+}
+
+/// Table editor pages come from the server (LIMIT/OFFSET) in primary key
+/// order, although the rows were stored in reverse order.
+#[test]
+fn table_pages_are_read_from_the_server_in_key_order() {
+    let name = format!("dbeast_pages_{}", std::process::id());
+    let dir = std::env::temp_dir().join(format!("dbeast_pages_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("pages.sqlite");
+    // INT (not INTEGER) PRIMARY KEY is no rowid alias, so storage order stays reversed.
+    rusqlite::Connection::open(&file)
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TABLE {name} (id INT PRIMARY KEY, note TEXT);
+             WITH RECURSIVE s(g) AS (SELECT 1200 UNION ALL SELECT g - 1 FROM s WHERE g > 1)
+             INSERT INTO {name} SELECT g, 'n' || g FROM s;"
+        ))
+        .unwrap();
+    let mut sqlite = DataSource::new(DriverKind::Sqlite);
+    sqlite.file = file.to_string_lossy().into_owned();
+    let mut sources = vec![(sqlite, None, Vec::new(), Vec::new())];
+    if let Some(ds) = pg() {
+        sources.push((
+            ds,
+            Some("public".to_string()),
+            vec![
+                format!("create table public.{name} (id int primary key, note text)"),
+                format!("insert into public.{name} select g, 'n' || g from generate_series(1200, 1, -1) g"),
+            ],
+            vec![format!("drop table public.{name}")],
+        ));
+    }
+    if let Some(ds) = mysql() {
+        sources.push((
+            ds,
+            Some("shop".to_string()),
+            vec![
+                format!("create table shop.{name} (id int primary key, note varchar(20))"),
+                "set session cte_max_recursion_depth = 2000".into(),
+                format!(
+                    "insert into shop.{name} with recursive s(g) as (select 1200 union all select g - 1 from s where g > 1) select g, concat('n', g) from s"
+                ),
+            ],
+            vec![format!("drop table shop.{name}")],
+        ));
+    }
+    let backend = Backend::new(egui::Context::default());
+    for (ds, schema, setup, teardown) in sources {
+        let label = ds.driver.label();
+        for sql in &setup {
+            let (done, _) = run(&backend, req(41, &ds, &[sql], false));
+            done[0].1.as_ref().unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+        let table = dbeast::backend::TablePage { schema, table: name.clone(), ordered: false };
+        let first = table_page(&backend, &ds, &table, "", Page::first(500));
+        assert_eq!(ids(&first), (1..=500).collect::<Vec<_>>(), "{label}");
+        assert!(first.truncated, "{label}");
+        let second = table_page(&backend, &ds, &table, "", Page { skip: 500, limit: 500 });
+        assert_eq!(ids(&second), (501..=1000).collect::<Vec<_>>(), "{label}");
+        assert!(second.truncated, "{label}");
+        // The same page twice is the same rows.
+        let again = table_page(&backend, &ds, &table, "", Page { skip: 500, limit: 500 });
+        assert_eq!(again.rows, second.rows, "{label}");
+        let exact = table_page(&backend, &ds, &table, "", Page { skip: 700, limit: 500 });
+        assert_eq!((exact.rows.len(), exact.truncated), (500, false), "{label}");
+        let last = table_page(&backend, &ds, &table, "", Page { skip: 1000, limit: 500 });
+        assert_eq!(ids(&last), (1001..=1200).collect::<Vec<_>>(), "{label}");
+        assert!(!last.truncated, "{label}");
+        let past = table_page(&backend, &ds, &table, "", Page { skip: 1500, limit: 500 });
+        assert_eq!((past.rows.len(), past.truncated), (0, false), "{label}");
+        // The user's ORDER BY wins over the key.
+        let user = table_page(&backend, &ds, &table, "note DESC", Page::first(3));
+        assert_eq!(ids(&user), vec![999, 998, 997], "{label}");
+        for sql in &teardown {
+            let (done, _) = run(&backend, req(41, &ds, &[sql], false));
+            assert!(done[0].1.is_ok(), "{label}: {:?}", done[0].1);
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

@@ -1380,7 +1380,20 @@ impl App {
             },
             bound_query: None,
         });
-        self.backend.run(RunRequest {
+        // The table editor's own SELECT is paged by the server; other
+        // statements are read up to the page from the full result.
+        let table_page = match (&tab.kind, kind) {
+            (TabKind::Table { schema, table, .. }, RunKind::Query | RunKind::Page(_)) => {
+                Some(crate::backend::TablePage {
+                    schema: schema.clone(),
+                    table: table.clone(),
+                    // A result's SQL may predate an edit of the ORDER BY field.
+                    ordered: statements.iter().any(|sql| sql.contains(" ORDER BY ")),
+                })
+            }
+            _ => None,
+        };
+        let request = RunRequest {
             console_id: tab.id,
             ds,
             statements,
@@ -1397,7 +1410,11 @@ impl App {
                     .and_then(|rs| rs.data.context.clone()),
                 _ => None,
             },
-        });
+        };
+        match table_page {
+            Some(table) => self.backend.run_table_page(request, table),
+            None => self.backend.run(request),
+        }
     }
 
     fn run_tab(&mut self, idx: usize, whole_script: bool) {

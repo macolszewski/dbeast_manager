@@ -262,6 +262,36 @@ fn record_edit_paging_and_view_preferences_survive_a_restart() {
     assert!(value.right() <= 1280.0 && value.bottom() <= 720.0);
     shot(&mut h, "29-record-view-narrow.png");
 
+    // The restored second page is read again from the server (LIMIT/OFFSET)
+    // before the first edit, and its edit is submitted to the right row.
+    record_value(&h, "Lena Wójcik").click();
+    h.run_steps(2);
+    h.key_press(Key::Enter);
+    wait_until(&mut h, "refreshed second page", |h| {
+        h.query_by_label_contains("Read-only:").is_none()
+            && h.query_by_label_contains("Checking whether").is_none()
+    });
+    assert!(h.query_by_label("3-3 of 3").is_some());
+    record_value(&h, "Lena Wójcik").click();
+    h.run_steps(2);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.get_all_by_role(egui::accesskit::Role::TextInput)
+        .find(|n| n.is_focused())
+        .expect("Record View cell editor")
+        .type_text("Lena Nowak");
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    h.get_by_label("Submit").click();
+    let stored = |id: i64| {
+        db.query_row("SELECT name FROM contacts WHERE id = ?1", [id], |row| row.get::<_, String>(0))
+            .unwrap()
+    };
+    wait_until(&mut h, "submitted second page edit", |_| stored(3) == "Lena Nowak");
+    assert_eq!(stored(1), "Ada Kowalska");
+    assert_eq!(stored(2), "Olek Lis");
+
     drop(h);
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();

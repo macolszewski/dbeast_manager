@@ -47,6 +47,25 @@ On macOS DBeast renders through wgpu with Metal, compiles only the Metal backend
 
 ## Results grid
 
+### Paging on the server
+
+Measured against the PostgreSQL 17 test container on Apple Silicon, debug build, best of five runs, page size 500:
+
+| Query | Read to the end | Limited on the server |
+|---|---|---|
+| Console `SELECT` of 2,000,000 rows | 974 ms | 25 ms (cancel request after the page) |
+| Console `SELECT` of 600 rows | 0.8 ms | 1.7 ms (cancel request after the page) |
+| Table page at offset 0 of 20,000 rows | 6.2 ms | 1.9 ms (`LIMIT 501 OFFSET 0`) |
+| Table page at offset 19,800 of 20,000 rows | 13.0 ms | 1.2 ms (`LIMIT 501 OFFSET 19800`) |
+| Table page past the end | 13.3 ms | 1.0 ms |
+
+```bash
+cargo test --test drivers postgres_paging_cost -- --ignored --nocapture
+```
+
+"Read to the end" is the time until the page is shown and the session is free for the next statement when the rest of the result is read and discarded. A cancel request costs about one millisecond locally and a few network round trips to a remote server, which is why a small result gains nothing from it; the gain grows with the size of the rest. See [Paging](../guide/results-grid.md#paging).
+
+
 ### Layout preparation
 
 Micro-benchmark of layout preparation, 1,000 repetitions, two columns, 14 October 2026. "Before" is the earlier algorithm for column widths and the row list; "after" uses cached widths and index access.

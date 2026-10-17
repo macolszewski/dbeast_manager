@@ -188,6 +188,7 @@ impl PgConn {
             initial_search_path: "pg_catalog".into(),
             update_statements: Default::default(),
             mcp_endpoint: Some((endpoint.host.clone(), endpoint.port, ds.host.clone())),
+            page_cancel: None,
         })
     }
 

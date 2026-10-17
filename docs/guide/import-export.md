@@ -40,6 +40,8 @@ Choose the target **File:** or, for several tables, the **Folder:**. The **Previ
 
 A grid result is executed again without the page limit, so the file contains the whole result and not only the fetched page. To copy only the fetched page to the clipboard in the same formats, use **Export ▸ Copy as …** in the grid.
 
+PostgreSQL values are written as PostgreSQL prints them: arrays keep their quoting, dimensions and lower bounds, numeric keeps all digits (also `NaN` and `Infinity`), and intervals keep microseconds and the sign of each part, so an exported SQL INSERT loads back into the same column types. If a column has a type DBeast cannot read exactly (for example `money` or `tsvector`), the export stops with an error that names the column and its type, instead of writing a placeholder.
+
 Exporting a whole result recreates its context on a separate connection. It is blocked inside an open transaction, and a PostgreSQL result that uses the temporary-table namespace is rejected. A MySQL export does not recreate temporary tables or other session settings.
 
 ### Safe writes and speed

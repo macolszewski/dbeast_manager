@@ -39,7 +39,7 @@ All drivers are built into DBeast as native libraries; no JDBC driver or Java ru
 
 | Database | Notes |
 |---|---|
-| PostgreSQL | Binary protocol. Decodes numeric, jsonb, uuid, inet, interval, arrays and enums, among others. Cancels queries with a cancel request. |
+| PostgreSQL | Binary protocol. Values without an exact typed form (numeric beyond 28 digits, arrays, intervals, ranges, composite, network and geometric types) are shown exactly as PostgreSQL prints them. A type DBeast cannot read exactly, such as `money` or `tsvector`, is shown as `<type: hex>` and stops an export. Cancels queries with a cancel request. |
 | MySQL | Distinguishes TEXT from BLOB by character set. Cancels queries with `KILL QUERY` from a second connection. |
 | SQLite | Embedded SQLite engine; opens a local file. Cancels queries with an interrupt. |
 

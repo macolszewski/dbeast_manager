@@ -781,3 +781,212 @@ async fn sqlite_paging_keys_meta_and_ddl() {
     );
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// Values without an exact typed form are shown exactly as PostgreSQL prints them.
+#[tokio::test]
+async fn postgres_values_match_the_server_text() {
+    let Some(mut conn) = open(&pg()).await else { return };
+    let expressions = [
+        r#"array['a,b', 'NULL', NULL, '', 'say "hi"', 'back\slash', '{x}', ' y ']"#,
+        "'{{1,2},{3,NULL}}'::int[]",
+        "'[0:1]={x,y}'::text[]",
+        "'{0.1,1e20,-Infinity,NaN}'::float8[]",
+        "'{1.5,1e10}'::float4[]",
+        "'{t,f}'::bool[]",
+        "'{2024-01-02,infinity}'::date[]",
+        r#"'{"2024-01-02 03:04:05.5"}'::timestamp[]"#,
+        "'{1 day,-00:00:01}'::interval[]",
+        "'{(1,2),(3,4);(5,6),(7,8)}'::box[]",
+        "'{a5d4e0a0-8b1c-4f3e-9a76-2d3c4b5a6f70}'::uuid[]",
+        r#"'{"\\x00ff"}'::bytea[]"#,
+        "1e40::numeric",
+        "'NaN'::numeric",
+        "'-Infinity'::numeric",
+        "0.1234567890123456789012345678901::numeric",
+        "'1 year 2 mons -3 days -00:00:00.5'::interval",
+        "'-1 hour -30 minutes'::interval",
+        "'1 2'::int2vector",
+        "'26 23'::oidvector",
+        "'x'::\"char\"",
+        "'abc'::name",
+        "'[1,5)'::int4range",
+        "'{[1,2),[5,6)}'::int4multirange",
+        r#"'["2024-01-01 00:00","2024-01-02 00:00")'::tsrange"#,
+        "'empty'::numrange",
+        "row(1, 'a b', NULL, '')",
+        "'(1.5,2)'::point",
+        "'((0,0),(1,1))'::box",
+        "'<(1,2),3>'::circle",
+        "'[(0,0),(1,1)]'::lseg",
+        "'[(0,0),(1,1),(2,0)]'::path",
+        "'((0,0),(1,1),(2,0))'::polygon",
+        "'{1,-1,0}'::line",
+        "'08:00:2b:01:02:03'::macaddr",
+        "'08:00:2b:01:02:03:04:05'::macaddr8",
+        "'10.0.0.1/8'::inet",
+        "'10.0.0.0/8'::cidr",
+        "'::1'::inet",
+        "B'101'",
+        "'1011'::varbit",
+        "'16/B374D848'::pg_lsn",
+        "'5'::xid8",
+        "'12:00:00+02'::timetz",
+        "'24:00:00'::time",
+        "'infinity'::date",
+        "'-infinity'::timestamp",
+        "'0044-03-15 12:00 BC'::timestamp",
+        "'$.a'::jsonpath",
+        "''::text",
+    ];
+    let sql = format!(
+        "select {}",
+        expressions
+            .iter()
+            // format() uses the type's output function; a cast to text may not (inet).
+            .map(|e| format!("{e}, pg_catalog.format('%s', {e})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let r = conn.execute_with_context(&sql, Page::first(1), None).await.unwrap();
+    for (i, expression) in expressions.iter().enumerate() {
+        let shown = match &r.rows[0][2 * i] {
+            Value::Text(text) | Value::Decimal(text) => text.clone(),
+            other => panic!("{expression}: {other:?}"),
+        };
+        assert_eq!(r.rows[0][2 * i + 1], Value::Text(shown), "{expression}");
+    }
+}
+
+/// Time until a page is ready and the session is free again, with the server
+/// limiting the work and without it.
+#[tokio::test]
+#[ignore = "measurement against the test PostgreSQL: cargo test --test drivers postgres_paging_cost -- --ignored --nocapture"]
+async fn postgres_paging_cost() {
+    let Some(mut conn) = open(&pg()).await else { return };
+    let page = Page::first(500);
+    let time = async |conn: &mut Connection, sql: &str, page: Page| {
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            conn.execute_with_context(sql, page, None).await.unwrap();
+            best = best.min(started.elapsed());
+        }
+        best
+    };
+    // The qualified call is not cancelled: the session reads all 2 million rows.
+    let full = time(&mut conn, "select pg_catalog.generate_series(1, 2000000) as g", page).await;
+    let stopped = time(&mut conn, "select generate_series(1, 2000000) as g", page).await;
+    eprintln!("console page of a 2 million row SELECT: {full:?} read to the end, {stopped:?} stopped after the page");
+    for rows in [600, 5000] {
+        let full = time(&mut conn, &format!("select pg_catalog.generate_series(1, {rows}) as g"), page).await;
+        let stopped = time(&mut conn, &format!("select generate_series(1, {rows}) as g"), page).await;
+        eprintln!("console page of a {rows} row SELECT: {full:?} read to the end, {stopped:?} with a cancel request");
+    }
+    conn.execute("create table dbeast_paging_cost (id int primary key, note text)", Page::first(0)).await.unwrap();
+    conn.execute(
+        "insert into dbeast_paging_cost select g, md5(g::text) from generate_series(1, 20000) g",
+        Page::first(0),
+    )
+    .await
+    .unwrap();
+    let base = r#"SELECT * FROM "public"."dbeast_paging_cost""#;
+    for skip in [0, 19_800, 25_000] {
+        let window = Page { skip, limit: 500 };
+        let client = time(&mut conn, base, window).await;
+        let (sql, server_window) = dbeast::drivers::page_query(DriverKind::Postgres, base, &["id".into()], window);
+        let server = time(&mut conn, &sql, server_window).await;
+        eprintln!("table page at offset {skip} of 20000 rows: {client:?} skipped by the client, {server:?} with LIMIT/OFFSET");
+    }
+    conn.execute("drop table dbeast_paging_cost", Page::first(0)).await.unwrap();
+}
+
+/// Errors in, at and after the page boundary (page size 500) fail the
+/// statement, in autocommit and inside a transaction block.
+#[tokio::test]
+async fn postgres_errors_after_the_page_are_never_reported_as_success() {
+    let Some(mut conn) = open(&pg()).await else { return };
+    let page = Page::first(500);
+    for n in [300, 500, 501, 800, 1001] {
+        // A qualified call is never cancelled after the page: the whole result is read.
+        let sql = format!("select g, 1 / (g - {n}) from pg_catalog.generate_series(1, 1200) g");
+        let error = conn.execute_with_context(&sql, page, None).await.unwrap_err();
+        assert!(error.to_string().contains("division by zero"), "row {n}: {error}");
+        // Inside a block the plain read is not cancelled either.
+        conn.execute("BEGIN", Page::first(0)).await.unwrap();
+        let sql = format!("select g, 1 / (g - {n}) from generate_series(1, 1200) g");
+        let error = conn.execute_with_context(&sql, page, None).await.unwrap_err();
+        assert!(error.to_string().contains("division by zero"), "row {n} in a block: {error}");
+        conn.execute("ROLLBACK", Page::first(0)).await.unwrap();
+    }
+    for n in [300, 500, 501] {
+        // Rows up to the one after the page are always read.
+        let sql = format!("select g, 1 / (g - {n}) from generate_series(1, 1200) g");
+        let error = conn.execute_with_context(&sql, page, None).await.unwrap_err();
+        assert!(error.to_string().contains("division by zero"), "cancellable, row {n}: {error}");
+    }
+    let r = conn
+        .execute_with_context("select g, 1 / (g - 5000) from pg_catalog.generate_series(1, 1200) g", page, None)
+        .await
+        .unwrap();
+    assert_eq!((r.rows.len(), r.truncated), (500, true));
+    let r = conn
+        .execute_with_context("select g from generate_series(1, 500) g", page, None)
+        .await
+        .unwrap();
+    assert_eq!((r.rows.len(), r.truncated), (500, false));
+}
+
+/// A plain read stops on the server once its page is read; DML with RETURNING
+/// always runs to completion, and no late cancel hits the next statement.
+#[tokio::test]
+async fn postgres_stops_only_plain_reads_after_their_page() {
+    let Some(mut conn) = open(&pg()).await else { return };
+    let page = Page::first(500);
+    let started = std::time::Instant::now();
+    let r = conn
+        .execute_with_context("select generate_series(1, 300000000) as g", page, None)
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    eprintln!("first page of a 300 million row SELECT: {elapsed:?}");
+    assert_eq!((r.rows.len(), r.truncated), (500, true));
+    assert!(elapsed < std::time::Duration::from_secs(10), "the server kept producing rows: {elapsed:?}");
+    // Statements that end right after their page race with the cancel request.
+    for _ in 0..30 {
+        let r = conn
+            .execute_with_context("select generate_series(1, 520) as g", page, None)
+            .await
+            .unwrap();
+        assert_eq!((r.rows.len(), r.truncated), (500, true));
+        conn.execute_with_context("select pg_catalog.pg_sleep(0.002)", Page::first(1), None)
+            .await
+            .unwrap();
+    }
+    conn.execute("create temp table dbeast_returning_page (id int)", Page::first(0))
+        .await
+        .unwrap();
+    let r = conn
+        .execute_with_context(
+            "insert into dbeast_returning_page select generate_series(1, 3000) returning id",
+            page,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!((r.rows.len(), r.truncated), (500, true));
+    let r = conn
+        .execute_with_context(
+            "with d as (delete from dbeast_returning_page where id > 1000 returning id) select id from d",
+            page,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!((r.rows.len(), r.truncated), (500, true));
+    let count = conn
+        .execute_with_context("select count(*) from dbeast_returning_page", Page::first(1), None)
+        .await
+        .unwrap();
+    assert_eq!(count.rows[0][0], Value::Int(1000));
+    conn.execute("drop table dbeast_returning_page", Page::first(0)).await.unwrap();
+}

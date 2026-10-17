@@ -52,7 +52,9 @@ Only a simple `SELECT` from a single table that includes the full real primary k
 - MySQL temporary tables, views and non-InnoDB tables,
 - SQLite virtual tables.
 
-PostgreSQL `NUMERIC` values outside the decoder's lossless range, MySQL `FLOAT` and unsupported types are read-only.
+PostgreSQL `NUMERIC` values with more than 28 significant digits or a scale above 28, `NaN` and infinities, MySQL `FLOAT` and unsupported types are read-only. They are still shown and exported exactly.
+
+A PostgreSQL value of a type DBeast cannot read exactly (for example `money`, `tsvector` or a type from an extension) is shown as `<type: hex>`. Exporting it to a file fails with an error, but **Export ▸ Copy as …** copies the placeholder as shown.
 
 ## Related Rows
 

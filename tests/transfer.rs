@@ -600,3 +600,120 @@ fn a_failed_pg_dump_reports_the_error_and_leaves_no_file() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     std::fs::remove_dir_all(dir).ok();
 }
+
+fn export_to(backend: &Backend, id: u64, ds: &DataSource, query: &str, table: TableName, options: ExportOptions, path: &Path) {
+    backend.export_data(
+        id,
+        ExportJob {
+            items: vec![ExportItem {
+                ds: ds.clone(),
+                query: BoundQuery { sql: query.into(), params: Vec::new() },
+                context: None,
+                table,
+                path: path.into(),
+            }],
+            options,
+        },
+    );
+    let (result, _) = outcome(backend, id, Duration::from_secs(30));
+    result.unwrap();
+}
+
+/// Arrays, NUMERIC and INTERVAL values leave through SQL INSERT, CSV and JSON
+/// exactly as PostgreSQL prints them, and the INSERT file loads back into an
+/// equal table.
+#[test]
+fn postgres_values_survive_export_unchanged() {
+    use dbeast::model::Value;
+    let Some(ds) = pg() else { return };
+    let src = format!("dbeast_values_src_{}", std::process::id());
+    let dst = format!("dbeast_values_dst_{}", std::process::id());
+    sql(&ds, &[
+        &format!("drop table if exists public.{src}, public.{dst}"),
+        &format!("create table public.{src} (id int primary key, ta text[], ia int[], fa float8[], na numeric[], n numeric, iv interval)"),
+        &format!(
+            r#"insert into public.{src} values
+             (1, array['a,b', 'NULL', NULL, '', 'say "hi"', 'back\slash', '{{braces}}', ' padded ', 'tab	x'], NULL,
+              '{{0.1,1e20,-Infinity,NaN}}', '{{1e40,NaN,0.10}}', 1e40, '1 day 02:03:04.123456'),
+             (2, '{{{{a,b}},{{c,d}}}}', '{{{{1,2}},{{3,NULL}}}}', NULL, NULL,
+              12345678901234567890123456789012345.123, '-1 hour -30 minutes'),
+             (3, '[0:1]={{x,y}}', '[0:1]={{5,6}}', '{{}}', '{{}}', 0.1234567890123456789012345678901, '-1 days +02:00:00.000001'),
+             (4, '{{}}', '{{}}', NULL, NULL, 'NaN', '1 year 2 mons -3 days -00:00:00.5')"#
+        ),
+        &format!("create table public.{dst} (like public.{src})"),
+    ]);
+    let query = format!("select * from public.{src} order by id");
+    let dir = temp_dir("pg_values");
+    let backend = Backend::new(egui::Context::default());
+
+    let mut options = ExportOptions::with_format(ExportFormat::SqlInsert);
+    options.qualify_table = true;
+    let insert = dir.join("values.sql");
+    export_to(&backend, 30, &ds, &query, TableName { schema: Some("public".into()), table: dst.clone() }, options, &insert);
+    let script = std::fs::read_to_string(&insert).unwrap();
+    assert!(!script.contains("<numeric>") && !script.contains("<error"), "{script}");
+    let statements: Vec<String> = dbeast::splitter::split(&script, DriverKind::Postgres)
+        .into_iter()
+        .map(|statement| statement.text)
+        .collect();
+    let statements: Vec<&str> = statements.iter().map(String::as_str).collect();
+    sql(&ds, &statements);
+    let differences = sql(&ds, &[&format!(
+        "select count(*) from public.{src} s full join public.{dst} d on s.id = d.id
+          where not (row(s.*) is not distinct from row(d.*)) or row(s.*)::text is distinct from row(d.*)::text"
+    )]);
+    assert_eq!(differences, vec![vec![Value::Int(0)]], "{script}");
+
+    // CSV and JSON carry the server's own text.
+    let expected: Vec<Vec<Option<String>>> = sql(&ds, &[&format!(
+        "select id::text, ta::text, ia::text, fa::text, na::text, n::text, iv::text from public.{src} order by id"
+    )])
+    .into_iter()
+    .map(|row| row.into_iter().map(|v| match v { Value::Text(t) => Some(t), Value::Null => None, other => panic!("{other:?}") }).collect())
+    .collect();
+    let csv_path = dir.join("values.csv");
+    export_to(&backend, 31, &ds, &query, TableName::new("values"), ExportOptions::default(), &csv_path);
+    let mut reader = csv::Reader::from_path(&csv_path).unwrap();
+    let csv_rows: Vec<Vec<String>> = reader.records().map(|r| r.unwrap().iter().map(str::to_owned).collect()).collect();
+    for (row, expected) in csv_rows.iter().zip(&expected) {
+        let expected: Vec<String> = expected.iter().map(|v| v.clone().unwrap_or_default()).collect();
+        assert_eq!(row, &expected);
+    }
+    let json_path = dir.join("values.json");
+    export_to(&backend, 32, &ds, &query, TableName::new("values"), ExportOptions::with_format(ExportFormat::Json), &json_path);
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    for (row, expected) in json.as_array().unwrap().iter().zip(&expected) {
+        for (key, expected) in ["id", "ta", "ia", "fa", "na", "n", "iv"].iter().zip(expected) {
+            let value = match &row[key] {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(text) => Some(text.clone()),
+                number => Some(number.to_string()),
+            };
+            assert_eq!(&value, expected, "{key}");
+        }
+    }
+    sql(&ds, &[&format!("drop table public.{src}, public.{dst}")]);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A value DBeast can only show as a placeholder stops the export instead of
+/// being written in place of the stored value.
+#[test]
+fn postgres_export_stops_at_a_value_it_cannot_read_exactly() {
+    let Some(ds) = pg() else { return };
+    let dir = temp_dir("pg_lossy");
+    let target = dir.join("money.csv");
+    let backend = Backend::new(egui::Context::default());
+    backend.export_data(
+        33,
+        ExportJob {
+            items: vec![item(&ds, "select 1 as id, 12.5::money as price", "t", &target)],
+            options: ExportOptions::default(),
+        },
+    );
+    let (result, _) = outcome(&backend, 33, Duration::from_secs(20));
+    let error = result.unwrap_err();
+    assert!(error.contains("\"price\"") && error.contains("money"), "{error}");
+    assert!(!target.exists());
+    std::fs::remove_dir_all(dir).ok();
+}

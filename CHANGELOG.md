@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsupported column type, generated column) and say that the whole table is
   checked, including columns the query does not select.
 - In-app window title bars on macOS show the close button on the left.
+- Table editor pages are read with `LIMIT`/`OFFSET` on the server and, without
+  an ORDER BY, in primary key order, so each page shows the same rows.
+- A plain PostgreSQL console SELECT outside a transaction is stopped on the
+  server once its page is read; other statements are read to the end.
 
 ### Security
 
@@ -51,3 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the file is written on a background thread.
 - The integrated macOS title bar keeps room for the window buttons at every
   Zoom IDE level.
+- PostgreSQL arrays, numeric and interval values are shown and exported
+  exactly as PostgreSQL prints them: quoted array elements, multi-dimensional
+  arrays and lower bounds, all numeric digits, NaN, infinities, interval
+  microseconds and negative parts. Exports stop with an error instead of
+  writing a placeholder for a value that cannot be read exactly.
+- A PostgreSQL query that fails at or after the end of the fetched page is
+  reported as an error, not as a successful page.
