@@ -6,7 +6,12 @@ Keyboard shortcuts in this guide use macOS symbols. On Linux and Windows, ⌘ is
 
 ## Install DBeast
 
-DBeast is a native application with built-in drivers for PostgreSQL, MySQL and SQLite. It does not need a Java runtime or any separate database client libraries.
+Download the package for your system from the [latest GitHub release](https://github.com/macolszewski/dbeast_manager/releases/latest): a zip with `DBeast.app` for macOS on Apple Silicon, a `.tar.gz` for Linux x86-64 and a zip with `DBeast.exe` for Windows x86-64. The release page has install notes and checksums.
+
+!!! note
+    The builds are not code-signed yet. On macOS, right-click the application and choose **Open** the first time. On Windows, SmartScreen may ask you to choose **More info**, then **Run anyway**.
+
+To build DBeast yourself, follow the steps below. DBeast is a native application with built-in drivers for PostgreSQL, MySQL and SQLite; it needs no Java runtime or separate database client libraries.
 
 ### macOS
 

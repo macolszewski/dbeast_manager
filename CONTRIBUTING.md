@@ -62,6 +62,16 @@ cargo test                     # tests that need a database are skipped without 
 - Add a line to the `Unreleased` section of [CHANGELOG.md](./CHANGELOG.md)
   for user-visible changes.
 
+## Releases
+
+Releases are built by the **Release** workflow when a version tag is pushed:
+
+1. Set the new `version` in `Cargo.toml` (run `cargo build` to update `Cargo.lock`).
+2. Rename the `Unreleased` section of `CHANGELOG.md` to `## [x.y.z] - YYYY-MM-DD` and start a new empty `Unreleased` section.
+3. Commit, then tag and push: `git tag vX.Y.Z && git push origin master vX.Y.Z`.
+
+The workflow builds macOS, Linux and Windows packages, attaches them with checksums to a GitHub release and uses the changelog section as the release notes.
+
 ## Project layout
 
 The architecture overview, module map and coding rules are in

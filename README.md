@@ -20,6 +20,7 @@ results smoothly, with the tools you expect from a professional database IDE.
 
 [Features](#features) ·
 [Screenshots](#screenshots) ·
+[Download](#download) ·
 [Building from source](#building-from-source) ·
 [AI agents](#ai-agents-and-mcp) ·
 [Documentation](https://macolszewski.github.io/dbeast_manager/) ·
@@ -147,10 +148,16 @@ that never waits for the network.
 
 More in the [user guide](https://macolszewski.github.io/dbeast_manager/).
 
+## Download
+
+Ready-to-run builds for macOS (Apple Silicon), Linux (x86-64) and Windows (x86-64) are
+attached to every [GitHub release](https://github.com/macolszewski/dbeast_manager/releases/latest),
+with install notes and SHA-256 checksums. The builds are not code-signed yet: macOS asks for
+a right-click and **Open** on the first start, and Windows SmartScreen for **Run anyway**.
+
 ## Building from source
 
-DBeast does not publish prebuilt binaries yet. You need a recent stable
-[Rust toolchain](https://rustup.rs/).
+You need a recent stable [Rust toolchain](https://rustup.rs/).
 
 ### macOS
 
@@ -276,7 +283,7 @@ Preview it locally with `pip install -r docs/requirements.txt && mkdocs serve`.
 
 ## Roadmap
 
-- Prebuilt, signed releases for macOS, Linux and Windows.
+- Code-signed and notarized releases, and an Intel macOS build.
 - More drivers and formats (DuckDB, Parquet).
 - Schema comparison beyond a single object and entity relationship diagrams.
 - Broader editing of console results and multi-record Related Rows.
