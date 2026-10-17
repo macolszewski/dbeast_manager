@@ -764,6 +764,11 @@ impl App {
                     page,
                     result,
                 } => self.statement_done(console_id, sql, page, result),
+                Event::Notice { console_id, text } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == console_id) {
+                        tab.log(LogKind::Info, text);
+                    }
+                }
                 Event::RunFinished {
                     console_id,
                     in_tx,

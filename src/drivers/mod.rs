@@ -550,6 +550,18 @@ impl Connection {
         }
     }
 
+    /// Transaction status after the last successful statement, without a
+    /// round trip: MySQL reports it in every OK packet (DDL commits
+    /// implicitly), SQLite in its autocommit mode. PostgreSQL ends a
+    /// transaction only through explicit SQL, which is tracked.
+    pub async fn transaction_state(&mut self) -> Result<bool> {
+        match &mut self.kind {
+            Kind::Postgres(_) => Ok(self.in_tx),
+            Kind::MySql(c) => Ok(c.last_known_in_transaction()),
+            Kind::Sqlite(c) => c.has_open_transaction().await,
+        }
+    }
+
     /// Explicitly reapplies even an unchanged selection, allowing Default to
     /// undo a manually typed SET/USE without reconnecting the console.
     pub async fn change_schema(&mut self, selection: &SchemaSelection) -> Result<ResolvedContext> {

@@ -59,6 +59,11 @@ pub enum Event {
         page: Page,
         result: Result<QueryResult, String>,
     },
+    /// An informational line for the console's Output log.
+    Notice {
+        console_id: u64,
+        text: String,
+    },
     RunFinished {
         console_id: u64,
         /// Whether the console session is inside an open transaction afterwards.
@@ -909,19 +914,53 @@ impl Backend {
                         });
                         return;
                     }
-                    let mut queue: Vec<String> = Vec::new();
-                    if manual_tx && !state.in_tx {
-                        queue.push(begin_statement(ds.driver).to_string());
-                    }
-                    queue.extend(statements);
-
-                    for sql in queue {
+                    // The server's state decides, not the statements seen so far:
+                    // MySQL commits implicitly before DDL and similar statements.
+                    let mut open = match state.conn(&ds).await {
+                        Ok(conn) => conn.transaction_state().await.unwrap_or(state.in_tx),
+                        Err(_) => state.in_tx,
+                    };
+                    state.in_tx = open;
+                    // Whether an implicit commit could make earlier changes permanent.
+                    let mut tx_has_work = open;
+                    for (index, sql) in statements.into_iter().enumerate() {
+                        let control = tx_effect(&sql);
+                        // Manual mode keeps every statement in a transaction, also
+                        // after one ended in the middle of a script.
+                        if manual_tx && !open && (index == 0 || control.is_none()) {
+                            let begin = begin_statement(ds.driver);
+                            let result = async { state.conn(&ds).await?.execute(begin, page).await }.await;
+                            match result {
+                                Ok(result) if index == 0 => send(Event::StatementDone {
+                                    console_id,
+                                    sql: begin.to_string(),
+                                    page,
+                                    result: Ok(result),
+                                }),
+                                Ok(_) => send(Event::Notice {
+                                    console_id,
+                                    text: format!("{begin}: the remaining statements run in a new transaction"),
+                                }),
+                                Err(error) => {
+                                    send(Event::StatementDone {
+                                        console_id,
+                                        sql: begin.to_string(),
+                                        page,
+                                        result: Err(fmt_err(error)),
+                                    });
+                                    break;
+                                }
+                            }
+                            open = true;
+                            state.in_tx = true;
+                            tx_has_work = false;
+                        }
                         let result = async {
                             let conn = state.conn(&ds).await?;
                             if let Some(h) = conn.cancel_handle() {
                                 cancels.lock().unwrap().insert(console_id, h);
                             }
-                            if tx_effect(&sql).is_some() {
+                            if control.is_some() {
                                 conn.execute(&sql, page).await
                             } else {
                                 conn.execute_with_context(&sql, page, expected_context.as_ref())
@@ -929,11 +968,22 @@ impl Backend {
                             }
                         }
                         .await;
-                        if result.is_ok()
-                            && let Some(open) = tx_effect(&sql)
-                        {
-                            state.in_tx = open;
-                        }
+                        // An error packet carries no MySQL status, so ask the server.
+                        let reported = match (&result, state.conn.as_mut()) {
+                            (Ok(_), Some(conn)) => conn.transaction_state().await.ok(),
+                            (Err(_), Some(conn)) => conn.has_open_transaction().await.ok(),
+                            _ => None,
+                        };
+                        let after = reported.unwrap_or(match (&result, control) {
+                            (Ok(_), Some(opened)) => opened,
+                            _ => open,
+                        });
+                        let ended_implicitly = open && !after && control != Some(false) && tx_has_work;
+                        tx_has_work = after
+                            && control.is_none()
+                            && (tx_has_work || result.as_ref().map_or(true, |result| !result.has_result_set()));
+                        open = after;
+                        state.in_tx = after;
                         if result
                             .as_ref()
                             .map_or(true, |result| !result.has_result_set())
@@ -948,6 +998,12 @@ impl Backend {
                             page,
                             result: result.map_err(fmt_err),
                         });
+                        if ended_implicitly {
+                            send(Event::Notice {
+                                console_id,
+                                text: implicit_end_notice(ds.driver, failed).into(),
+                            });
+                        }
                         if failed {
                             break;
                         }
@@ -1318,6 +1374,17 @@ fn context_source(ds: DataSource, context: &ExecutionContext) -> DataSource {
     match (ds.driver, context.database.as_deref()) {
         (DriverKind::Postgres, Some(database)) => ds.with_database(database),
         _ => ds,
+    }
+}
+
+/// Why the transaction open before a statement is gone after it, although the
+/// statement was not COMMIT or ROLLBACK.
+fn implicit_end_notice(driver: DriverKind, failed: bool) -> &'static str {
+    match (driver, failed) {
+        (DriverKind::MySql, false) => "Transaction committed implicitly by this statement (MySQL commits before DDL and similar statements). Earlier changes can no longer be rolled back.",
+        (DriverKind::MySql, true) => "The open transaction ended on the server with this error. MySQL commits before DDL even when it fails and rolls back after a deadlock; check which earlier changes were kept.",
+        (_, false) => "The open transaction ended with this statement.",
+        (_, true) => "The open transaction ended on the server with this error and its changes were rolled back.",
     }
 }
 

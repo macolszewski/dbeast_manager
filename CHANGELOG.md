@@ -25,5 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MySQL: after DDL commits a transaction implicitly, the console no longer
+  shows a stale open transaction. Tx: Manual opens a new transaction before
+  the next statement, so Rollback undoes it, and the Output log reports the
+  implicit commit.
 - The integrated macOS title bar keeps room for the window buttons at every
   Zoom IDE level.

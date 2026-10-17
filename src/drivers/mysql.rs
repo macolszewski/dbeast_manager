@@ -608,14 +608,21 @@ impl MyConn {
             .await?)
     }
 
-    pub async fn has_open_transaction(&mut self) -> Result<bool> {
-        // A fresh read refreshes protocol status even after manually typed SQL.
-        self.resolved_context().await?;
-        Ok(self.conn.last_ok_packet().is_some_and(|packet| {
+    /// Transaction status from the last OK packet, without a round trip.
+    /// An error packet carries no status, so after an error use
+    /// [`Self::has_open_transaction`].
+    pub fn last_known_in_transaction(&self) -> bool {
+        self.conn.last_ok_packet().is_some_and(|packet| {
             packet
                 .status_flags()
                 .contains(StatusFlags::SERVER_STATUS_IN_TRANS)
-        }))
+        })
+    }
+
+    pub async fn has_open_transaction(&mut self) -> Result<bool> {
+        // A fresh read refreshes protocol status even after manually typed SQL.
+        self.resolved_context().await?;
+        Ok(self.last_known_in_transaction())
     }
 
     pub async fn change_schema(&mut self, selection: &SchemaSelection) -> Result<ResolvedContext> {

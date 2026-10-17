@@ -1800,3 +1800,111 @@ fn disconnect_releases_unresponsive_explorer_connection() {
         "disconnected metadata must not publish late results"
     );
 }
+
+fn mysql() -> Option<DataSource> {
+    if let Err(error) = std::net::TcpStream::connect("127.0.0.1:53306") {
+        eprintln!("skipping MySQL transaction test: TCP probe failed: {error}");
+        return None;
+    }
+    let mut ds = DataSource::new(DriverKind::MySql);
+    ds.host = "127.0.0.1".into();
+    ds.port = 53306;
+    ds.user = "dbeast".into();
+    ds.password = "dbeast".into();
+    ds.database = "dbeast".into();
+    Some(ds)
+}
+
+/// Like [`run`], also collecting the console's Output notices.
+fn run_noticed(backend: &Backend, req: RunRequest) -> (Statements, Vec<String>, bool) {
+    let console_id = req.console_id;
+    backend.run(req);
+    let (mut done, mut notices) = (Vec::new(), Vec::new());
+    loop {
+        match backend.rx.recv_timeout(Duration::from_secs(10)).expect("backend event") {
+            Event::StatementDone { console_id: c, sql, result, .. } if c == console_id => done.push((sql, result)),
+            Event::Notice { console_id: c, text } if c == console_id => notices.push(text),
+            Event::RunFinished { console_id: c, in_tx } if c == console_id => return (done, notices, in_tx),
+            _ => {}
+        }
+    }
+}
+
+/// MySQL DDL commits implicitly. The console must follow the server's real
+/// transaction state, so Manual mode never runs a later change in autocommit
+/// and Rollback really undoes it.
+#[test]
+fn mysql_implicit_commit_keeps_manual_transactions_real() {
+    let Some(ds) = mysql() else { return };
+    let backend = Backend::new(egui::Context::default());
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let (data, ddl_a, ddl_b) = (
+        format!("dbeast_tx_{suffix}"),
+        format!("dbeast_tx_a_{suffix}"),
+        format!("dbeast_tx_b_{suffix}"),
+    );
+    // Read through another console, which has its own connection.
+    let committed = || scalar(&backend, &ds, &format!("SELECT v FROM {data} WHERE id = 1"));
+    let test = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(&backend, req(700, &ds, &[
+            &format!("CREATE TABLE {data} (id integer PRIMARY KEY, v integer NOT NULL) ENGINE=InnoDB"),
+            &format!("INSERT INTO {data} VALUES (1, 0)"),
+        ], false));
+
+        // A: DDL alone ends the transaction it was given; the next run opens a new one.
+        let (done, notices, in_tx) = run_noticed(&backend, req(701, &ds, &[&format!("CREATE TABLE {ddl_a} (id integer) ENGINE=InnoDB")], true));
+        assert!(done.iter().all(|(_, result)| result.is_ok()), "{done:?}");
+        assert!(!in_tx, "the DDL committed the transaction");
+        assert!(notices.is_empty(), "an empty transaction is not reported: {notices:?}");
+        let (done, _, in_tx) = run_noticed(&backend, req(701, &ds, &[&format!("UPDATE {data} SET v = 1 WHERE id = 1")], true));
+        assert_eq!(done[0].0, "START TRANSACTION");
+        assert!(in_tx);
+        assert_eq!(committed(), Value::Int(0));
+        let (_, in_tx) = run(&backend, req(701, &ds, &["ROLLBACK"], false));
+        assert!(!in_tx);
+        assert_eq!(committed(), Value::Int(0), "Rollback undid the UPDATE");
+
+        // B: DDL and a change in one script; the change gets a new transaction.
+        let (done, notices, in_tx) = run_noticed(&backend, req(702, &ds, &[
+            &format!("ALTER TABLE {ddl_a} ADD COLUMN c integer"),
+            &format!("UPDATE {data} SET v = 2 WHERE id = 1"),
+        ], true));
+        assert!(done.iter().all(|(_, result)| result.is_ok()), "{done:?}");
+        assert!(in_tx);
+        assert!(notices.iter().any(|n| n.starts_with("START TRANSACTION: the remaining statements run in a new transaction")), "{notices:?}");
+        assert_eq!(committed(), Value::Int(0));
+        let (_, in_tx) = run(&backend, req(702, &ds, &["ROLLBACK"], false));
+        assert!(!in_tx);
+        assert_eq!(committed(), Value::Int(0), "Rollback undid the UPDATE");
+
+        // C: DDL commits an UPDATE made earlier in the app's transaction; the
+        // console reports it and shows no open transaction.
+        let (_, _, in_tx) = run_noticed(&backend, req(703, &ds, &[&format!("UPDATE {data} SET v = 3 WHERE id = 1")], true));
+        assert!(in_tx);
+        assert_eq!(committed(), Value::Int(0));
+        let (done, notices, in_tx) = run_noticed(&backend, req(703, &ds, &[&format!("CREATE TABLE {ddl_b} (id integer) ENGINE=InnoDB")], true));
+        assert!(done.len() == 1 && done[0].1.is_ok(), "{done:?}");
+        assert!(!in_tx, "the server has no open transaction");
+        assert!(notices.iter().any(|n| n.starts_with("Transaction committed implicitly by this statement")), "{notices:?}");
+        assert_eq!(committed(), Value::Int(3));
+
+        // Work, DDL and more work in one script: only the last change rolls back.
+        let (_, notices, in_tx) = run_noticed(&backend, req(703, &ds, &[
+            &format!("UPDATE {data} SET v = 4 WHERE id = 1"),
+            &format!("DROP TABLE {ddl_b}"),
+            &format!("UPDATE {data} SET v = 5 WHERE id = 1"),
+        ], true));
+        assert!(in_tx);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert_eq!(committed(), Value::Int(4));
+        let (_, in_tx) = run(&backend, req(703, &ds, &["ROLLBACK"], false));
+        assert!(!in_tx);
+        assert_eq!(committed(), Value::Int(4));
+    }));
+    for table in [&data, &ddl_a, &ddl_b] {
+        let _ = run(&backend, req(700, &ds, &[&format!("DROP TABLE IF EXISTS {table}")], false));
+    }
+    if let Err(panic) = test {
+        std::panic::resume_unwind(panic);
+    }
+}

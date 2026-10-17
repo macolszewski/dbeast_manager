@@ -160,6 +160,12 @@ Choose the transaction mode in the **Tx** menu on the console toolbar:
 
 While a transaction is open, the console tab shows a dot after its name, the toolbar shows **transaction open**, and the status bar shows `Tx: open`. Closing the tab rolls the transaction back; DBeast warns you first.
 
+The transaction indicator follows the server's real state after every statement. MySQL commits implicitly before DDL (`CREATE`, `ALTER`, `DROP`, `TRUNCATE` and similar statements), so:
+
+- When such a statement commits a transaction that contained changes, the Output log says **Transaction committed implicitly by this statement**, and the console no longer shows an open transaction. Those changes can no longer be rolled back.
+- In **Tx: Manual**, the next statement opens a new transaction, also in the middle of a script; the Output log notes it. **Rollback** therefore always undoes the changes made after the implicit commit.
+- When a statement fails and the server ends the transaction (for example after a deadlock), the Output log says so as well.
+
 ## Output log
 
 The **Output** tab in Services keeps a readable log of everything the console runs:
