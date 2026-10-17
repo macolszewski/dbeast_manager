@@ -94,6 +94,14 @@ Every batch has a savepoint; only a batch that fails is retried row by row. Prog
 
 A failed or stopped import leaves nothing in the table, and a newly created table is dropped.
 
+### Non-transactional MySQL tables
+
+MyISAM, MEMORY, CSV, ARCHIVE and other MySQL engines without transactions write every row immediately, so nothing can be rolled back. Before changing anything, DBeast reads the engine of the target table (for a new table, the server's default engine) and, if it is not transactional:
+
+- refuses **Delete existing rows before import** and **Stop and roll back** with an error, without touching the table. Convert the table with `ALTER TABLE … ENGINE=InnoDB`, or choose **Skip row** without deleting existing rows;
+- in **Skip row** mode inserts the rows one at a time, without savepoints, so every row is attempted exactly once and the imported and skipped counts are exact. This is slower than batched loading;
+- if the import stops early (too many errors, or **Stop**), rows imported up to that point stay in an existing table, and the error says so.
+
 ## PostgreSQL dump and restore tools
 
 For PostgreSQL data sources, the **Import/Export** menu in the Database Explorer also offers:

@@ -2,7 +2,8 @@
 //! the file into batches; the async side writes each batch under a savepoint
 //! inside one transaction. A failed batch is split in halves until the bad
 //! rows are found exactly; they either stop the import or are skipped and
-//! logged, and the good rows around them still go in.
+//! logged, and the good rows around them still go in. MySQL tables without
+//! rollback (MyISAM and others) are written row by row and only in Skip mode.
 
 use super::transfer::{PROGRESS_INTERVAL, Progress, TaskId, elapsed_text, rows_text};
 use super::{Backend, Event, fmt_err};
@@ -89,6 +90,28 @@ impl Backend {
                 columns: job.columns.clone(),
             };
             let qualified = crate::import::qualified(driver, job.schema.as_deref(), &job.table);
+            // ROLLBACK and savepoints undo nothing in MyISAM and other
+            // non-transactional MySQL engines: rows are written at once.
+            let engine = match driver {
+                DriverKind::MySql => match non_transactional_engine(&mut conn, &job).await {
+                    Ok(None) => None,
+                    Ok(Some(engine)) if job.clear || job.on_error == OnError::Abort => {
+                        if job.create.is_some() {
+                            let _ = conn.execute(&format!("DROP TABLE {qualified}"), Page::first(0)).await;
+                        }
+                        anyhow::bail!(refusal(&job, &engine));
+                    }
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        if job.create.is_some() {
+                            let _ = conn.execute(&format!("DROP TABLE {qualified}"), Page::first(0)).await;
+                        }
+                        return Err(error);
+                    }
+                },
+                _ => None,
+            };
+            let transactional = engine.is_none();
             let read_bytes = Arc::new(AtomicU64::new(0));
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Batch>(4);
             let reader = {
@@ -163,10 +186,21 @@ impl Backend {
                     };
                     // A failed range is split in halves, left first so rows go in
                     // file order; only the halves that fail are tried again.
+                    // Without rollback a failed batch may be partly written, so
+                    // every row goes in alone and is attempted exactly once.
                     let mut ranges = Vec::with_capacity(32);
-                    ranges.push(0..rows.len());
+                    if transactional {
+                        ranges.push(0..rows.len());
+                    } else {
+                        ranges.extend((0..rows.len()).rev().map(|row| row..row + 1));
+                    }
                     while let Some(range) = ranges.pop() {
-                        match insert_batch(&mut conn, &target, &rows.values[range.clone()]).await {
+                        let inserted = if transactional {
+                            insert_batch(&mut conn, &target, &rows.values[range.clone()]).await
+                        } else {
+                            conn.insert_text_rows(&target, &rows.values[range.clone()]).await
+                        };
+                        match inserted {
                             Ok(()) => imported += range.len() as u64,
                             Err(error) if range.len() == 1 => {
                                 let (line, message) = (rows.lines[range.start], fmt_err(error));
@@ -217,6 +251,11 @@ impl Backend {
                     if job.create.is_some() {
                         // The new table was created before the transaction began.
                         let _ = conn.execute(&format!("DROP TABLE {qualified}"), Page::first(0)).await;
+                    } else if let Some(engine) = &engine {
+                        return Err(error.context(format!(
+                            "Rows imported before this point stay in {}: the {engine} engine cannot roll them back",
+                            job.table
+                        )));
                     }
                     Err(error)
                 }
@@ -245,6 +284,39 @@ impl Backend {
             send(Event::ImportPreview { request, result: result.map_err(fmt_err) });
         });
     }
+}
+
+/// The engine of a MySQL target when it cannot roll back. A new table has
+/// already been created, so the server's default engine shows up here too.
+async fn non_transactional_engine(conn: &mut Connection, job: &ImportJob) -> anyhow::Result<Option<String>> {
+    let query = BoundQuery {
+        sql: "SELECT t.ENGINE, e.TRANSACTIONS FROM information_schema.TABLES t LEFT JOIN information_schema.ENGINES e ON e.ENGINE = t.ENGINE WHERE t.TABLE_SCHEMA = COALESCE(?, DATABASE()) AND t.TABLE_NAME = ?".into(),
+        params: vec![job.schema.as_ref().map_or(Value::Null, |s| Value::Text(s.clone())), Value::Text(job.table.clone())],
+    };
+    let data = conn.execute_bound_query(&query, Page::ALL, None).await?;
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(s)) => Some(s.clone()),
+        Some(Value::Bytes(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    };
+    // A view (no engine) or a missing table is left to the INSERT itself.
+    let Some(row) = data.rows.first() else { return Ok(None) };
+    let Some(engine) = text(row.first()) else { return Ok(None) };
+    let transactional = text(row.get(1)).is_some_and(|t| t.eq_ignore_ascii_case("YES"))
+        || ["InnoDB", "ndbcluster", "NDB"].iter().any(|e| engine.eq_ignore_ascii_case(e));
+    Ok((!transactional).then_some(engine))
+}
+
+fn refusal(job: &ImportJob, engine: &str) -> String {
+    let option = if job.clear { "Delete existing rows before import" } else { "Stop and roll back" };
+    let (subject, fix) = if job.create.is_some() {
+        (format!("New tables get the server's default engine {engine}"), "set default_storage_engine to InnoDB")
+    } else {
+        (format!("Table {} uses the {engine} engine", job.table), "convert the table with ALTER TABLE ... ENGINE=InnoDB")
+    };
+    format!(
+        "{subject}, which cannot roll back changes, so \"{option}\" could leave the table partly changed. Nothing was changed. To import, {fix}, or choose \"Skip row\" without deleting existing rows."
+    )
 }
 
 /// One batch under a savepoint, so a failure leaves earlier batches in place.

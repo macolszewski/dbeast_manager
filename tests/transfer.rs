@@ -386,6 +386,78 @@ fn mysql_import_into_a_new_table() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// InnoDB rolls back a failed import; MyISAM cannot, so options that rely on
+/// rollback are refused before any change and Skip mode writes row by row.
+#[test]
+fn mysql_import_respects_non_transactional_engines() {
+    use dbeast::backend::OnError;
+    use dbeast::model::Value;
+    let Some(ds) = mysql() else { return };
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let (innodb, myisam, keyless) = (format!("import_innodb_{suffix}"), format!("import_myisam_{suffix}"), format!("import_keyless_{suffix}"));
+    let dir = temp_dir("import_engines");
+    let file = dir.join("data.csv");
+    // Line 4 repeats id 2.
+    std::fs::write(&file, "id,label\n1,a\n2,b\n2,dup\n3,c\n").unwrap();
+    let count = |table: &str| sql(&ds, &[&format!("SELECT count(*) FROM {table}")])[0][0].clone();
+    let backend = Backend::new(egui::Context::default());
+    let mut next_id = 30;
+    let mut import = |table: &str, clear: bool, on_error: OnError| {
+        let mut job = import_job(&ds, &file, table);
+        job.columns = vec!["id".into(), "label".into()];
+        job.sources = vec![0, 1];
+        job.clear = clear;
+        job.on_error = on_error;
+        next_id += 1;
+        backend.import_data(next_id, job);
+        outcome(&backend, next_id, Duration::from_secs(20))
+    };
+    let test = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (table, engine) in [(&innodb, "InnoDB"), (&myisam, "MyISAM")] {
+            sql(&ds, &[
+                &format!("CREATE TABLE {table} (id integer PRIMARY KEY, label varchar(10)) ENGINE={engine}"),
+                &format!("INSERT INTO {table} VALUES (99, 'old')"),
+            ]);
+        }
+
+        // Control: InnoDB rolls back the delete and the partial import.
+        let (result, _) = import(&innodb, true, OnError::Abort);
+        let error = result.unwrap_err();
+        assert!(error.starts_with("line 4:"), "{error}");
+        assert_eq!(count(&innodb), Value::Int(1));
+
+        for (clear, on_error) in [(true, OnError::Abort), (false, OnError::Abort), (true, OnError::Skip { max: 10 })] {
+            let (result, _) = import(&myisam, clear, on_error);
+            let error = result.unwrap_err();
+            assert!(error.contains("MyISAM engine, which cannot roll back") && error.contains("Nothing was changed"), "{error}");
+            assert_eq!(sql(&ds, &[&format!("SELECT id FROM {myisam}")]), vec![vec![Value::Int(99)]], "the old row stays");
+        }
+
+        let (result, log) = import(&myisam, false, OnError::Skip { max: 10 });
+        let summary = result.unwrap();
+        assert!(summary.starts_with("3 rows imported") && summary.contains("1 row skipped"), "{summary}");
+        let errors: Vec<&String> = log.iter().filter(|line| line.starts_with("line ")).collect();
+        assert!(errors.len() == 1 && errors[0].starts_with("line 4:"), "{log:?}");
+        assert_eq!(count(&myisam), Value::Int(4));
+
+        // Without a key nothing deduplicates a retried row: each goes in once.
+        sql(&ds, &[&format!("CREATE TABLE {keyless} (id integer NOT NULL, label varchar(3)) ENGINE=MyISAM")]);
+        std::fs::write(&file, "id,label\n1,a\n2,b\n3,too long\n4,d\n").unwrap();
+        let (result, log) = import(&keyless, false, OnError::Skip { max: 10 });
+        let summary = result.unwrap();
+        assert!(summary.starts_with("3 rows imported") && summary.contains("1 row skipped"), "{summary}");
+        assert!(log.iter().any(|line| line.starts_with("line 4:")), "{log:?}");
+        assert_eq!(sql(&ds, &[&format!("SELECT count(*), count(DISTINCT id) FROM {keyless}")])[0], vec![Value::Int(3), Value::Int(3)]);
+    }));
+    for table in [&innodb, &myisam, &keyless] {
+        sql(&ds, &[&format!("DROP TABLE IF EXISTS {table}")]);
+    }
+    std::fs::remove_dir_all(dir).ok();
+    if let Err(panic) = test {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// A million records load through COPY. Prints the throughput.
 #[test]
 fn large_import_uses_copy() {

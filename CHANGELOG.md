@@ -29,5 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows a stale open transaction. Tx: Manual opens a new transaction before
   the next statement, so Rollback undoes it, and the Output log reports the
   implicit commit.
+- MySQL import into MyISAM and other non-transactional tables: "Delete
+  existing rows" and "Stop and roll back" are refused before any change, and
+  Skip mode inserts row by row, so rows are no longer written twice and the
+  reported counts and line numbers are correct.
 - The integrated macOS title bar keeps room for the window buttons at every
   Zoom IDE level.
