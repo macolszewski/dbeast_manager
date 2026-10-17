@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All documentation, comments and project files are in English.
 - In-app window title bars on macOS show the close button on the left.
 
+### Security
+
+- Narrowing what is shared with an AI agent connection (a lower database or
+  table level, a table set to Not Shared, or a removed connection entry)
+  revokes that connection's session permissions on the source and its waiting,
+  running and finished requests there. Results are released and automatic
+  execution starts only while a session permission or standing access still
+  covers the request.
+
 ### Fixed
 
 - MySQL: after DDL commits a transaction implicitly, the console no longer

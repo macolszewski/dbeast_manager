@@ -100,6 +100,10 @@ struct Request {
     expected_table_identity: Option<String>,
     eligible_table: Option<TableRef>,
     authorizing_grant_id: Option<String>,
+    /// Single target of a Full SQL write, so standing table access can be checked again.
+    write_target: Option<TableRef>,
+    /// The SQL was regenerated for a table write share; only then may that share alone authorize it.
+    regenerated: bool,
     /// SQL shown in the activity log; document text is never copied there.
     audit_sql: Option<Arc<str>>,
 }
@@ -181,6 +185,51 @@ fn cancel(request: &mut Request, status: &'static str) {
     request.finished = Some(Instant::now());
 }
 impl State {
+    /// Whether `request` may still start or release its result. Automatic
+    /// authorizations must be backed by a session grant or standing access that
+    /// is valid now, not only when the request was submitted.
+    fn authorized_now(&self, request: &Request) -> bool {
+        let Some(session) = self.sessions.get(&request.session_id) else {
+            return false;
+        };
+        let source_id = match &request.operation {
+            Operation::ReadFile { file_id, .. } => return self.files.contains_key(file_id),
+            op => op.source_id().unwrap_or_default(),
+        };
+        let Some(shared) = self.sources.get(source_id) else {
+            return false;
+        };
+        let Some(access) = shared.access_for(&session.client_id) else {
+            return false;
+        };
+        if request.authorizing_grant_id.is_none() {
+            // The user approved this exact request; narrowing sharing cancels it.
+            return true;
+        }
+        matching_grant(session, &request.operation, request.eligible_table.as_ref()).is_some()
+            || shared_access_grant(
+                source_id,
+                &shared.source,
+                &access,
+                &request.operation,
+                request.eligible_table.as_ref(),
+                request.write_target.as_ref(),
+            )
+            .is_some_and(|(_, table_write_only)| !table_write_only || request.regenerated)
+    }
+    /// Revokes a completed result whose authorization is gone, so it is never
+    /// handed over. Returns whether anything changed.
+    fn withhold_unauthorized(&mut self, id: &str) -> bool {
+        let Some(request) = self.requests.get(id) else {
+            return false;
+        };
+        if request.status != "completed" || self.authorized_now(request) {
+            return false;
+        }
+        cancel(self.requests.get_mut(id).unwrap(), "revoked");
+        self.record(id, "result", "revoked: access changed");
+        true
+    }
     fn cancel_session(&mut self, id: &str) {
         self.sessions.remove(id);
         for request in self.requests.values_mut().filter(|r| r.session_id == id) {
@@ -608,6 +657,36 @@ impl McpController {
                 .get(source_id)
                 .is_some_and(|shared: &SharedSource| shared.access_for(client_id).is_some())
         };
+        // Any narrowing for a connection ends its session grants and requests on
+        // that source; only widening keeps them.
+        let mut narrowed_pairs = Vec::new();
+        for (session_id, session) in &s.sessions {
+            for (source_id, old) in &s.sources {
+                if narrowed(old, next_sources.get(source_id), &session.client_id) {
+                    narrowed_pairs.push((session_id.clone(), source_id.clone()));
+                }
+            }
+        }
+        for (session_id, source_id) in &narrowed_pairs {
+            if let Some(session) = s.sessions.get_mut(session_id) {
+                session.grants.retain(|g| &g.source_id != source_id);
+            }
+        }
+        let mut narrowed_requests = Vec::new();
+        for (request_id, r) in s.requests.iter_mut() {
+            if matches!(r.status, "pending" | "running" | "completed")
+                && narrowed_pairs.iter().any(|(session_id, source_id)| {
+                    &r.session_id == session_id
+                        && r.operation.source_id() == Some(source_id.as_str())
+                })
+            {
+                cancel(r, "revoked");
+                narrowed_requests.push(request_id.clone());
+            }
+        }
+        for request_id in narrowed_requests {
+            s.record(&request_id, "sharing", "revoked: access narrowed");
+        }
         for session in s.sessions.values_mut() {
             let client_id = session.client_id.clone();
             session
@@ -765,7 +844,8 @@ impl McpController {
                     "The request key was already used with different parameters.",
                 ));
             }
-            return Ok(request_status(&s, request_id));
+            let request_id = request_id.clone();
+            return Ok(self.release(&mut s, &request_id));
         }
         if s.sessions[&session_id].keys.len() >= MAX_KEYS || s.requests.len() >= MAX_REQUESTS {
             return Err(ApiError::new(
@@ -899,7 +979,8 @@ impl McpController {
                     "The request key was already used with different parameters.",
                 ));
             }
-            return Ok(request_status(&s, request_id));
+            let request_id = request_id.clone();
+            return Ok(self.release(&mut s, &request_id));
         }
         if s.sessions[&session_id].keys.len() >= MAX_KEYS
             || s.requests.len() >= MAX_REQUESTS
@@ -939,7 +1020,9 @@ impl McpController {
         });
         // A table write share runs the SQL regenerated from the checked AST, not
         // the submitted text, and the audit shows exactly that SQL.
+        let mut regenerated = false;
         let grant = grant.map(|(grant, table_write_only)| {
+            regenerated = table_write_only;
             if table_write_only
                 && let (Some((_, normalized)), Operation::Sql { sql, .. }) =
                     (&write, &mut operation)
@@ -986,6 +1069,8 @@ impl McpController {
                 expected_table_identity: expected,
                 eligible_table,
                 authorizing_grant_id: grant.as_ref().map(|g| g.id.clone()),
+                write_target: write.map(|(table, _)| table),
+                regenerated,
                 audit_sql,
             },
         );
@@ -995,8 +1080,16 @@ impl McpController {
         if grant.is_some() {
             let _ = self.approve_reserved(&request_id, Approval::Once, permits);
         }
-        let s = self.inner.lock().unwrap();
-        Ok(request_status(&s, &request_id))
+        let mut s = self.inner.lock().unwrap();
+        Ok(self.release(&mut s, &request_id))
+    }
+
+    /// Status for the agent, checked against the authorization valid now.
+    fn release(&self, s: &mut State, request_id: &str) -> Value {
+        if s.withhold_unauthorized(request_id) {
+            self.publish(s);
+        }
+        request_status(s, request_id)
     }
 
     pub fn approve(&self, request_id: &str, decision: Approval) -> Result<(), String> {
@@ -1047,6 +1140,13 @@ impl McpController {
         }
         if !s.sessions.contains_key(&request.session_id) {
             return Err("The session has expired.".into());
+        }
+        if !s.authorized_now(request) {
+            let r = s.requests.get_mut(request_id).unwrap();
+            cancel(r, "revoked");
+            s.record(request_id, "approval", "revoked: access changed");
+            self.publish(&mut s);
+            return Err("Access to this resource changed. The request was revoked.".into());
         }
         if decision == Approval::ReadTableForSession && request.eligible_table.is_none()
             || decision == Approval::ReadSourceForSession
@@ -1130,6 +1230,15 @@ impl McpController {
         if r.status != "running" || r.cancellation.is_cancelled() {
             return;
         }
+        if !s.authorized_now(&s.requests[request_id]) {
+            cancel(s.requests.get_mut(request_id).unwrap(), "revoked");
+            s.record(request_id, "result", "revoked: access changed");
+            self.publish(&mut s);
+            return;
+        }
+        let Some(r) = s.requests.get_mut(request_id) else {
+            return;
+        };
         let sid = r.session_id.clone();
         let operation = r.operation.clone();
         let decision = r.grant_on_success;
@@ -1233,7 +1342,7 @@ impl McpController {
                 "Request is unavailable.",
             ));
         }
-        Ok(request_status(&s, request_id))
+        Ok(self.release(&mut s, request_id))
     }
     pub(super) fn cancel_request(
         &self,
@@ -1310,6 +1419,32 @@ fn shared_access_grant(
             full && !source_allows,
         )
     })
+}
+
+/// Whether `client_id` lost anything it had on `old`: the source itself, or
+/// for any audience entry that applied to it (all agents or this connection)
+/// the entry, its database level, or any of its tables or their levels.
+fn narrowed(old: &SharedSource, new: Option<&SharedSource>, client_id: &str) -> bool {
+    let applies = |audience: &Option<String>| audience.as_deref().is_none_or(|id| id == client_id);
+    old.audiences
+        .iter()
+        .filter(|(audience, _)| applies(audience))
+        .any(|(audience, before)| {
+            let after: Vec<&ShareAccess> = new
+                .into_iter()
+                .flat_map(|new| &new.audiences)
+                .filter(|(a, _)| a == audience)
+                .map(|(_, access)| access)
+                .collect();
+            let source = after.iter().map(|a| a.source).max();
+            source.is_none_or(|source| source < before.source)
+                || before.tables.iter().any(|(table, level)| {
+                    !after
+                        .iter()
+                        .flat_map(|a| &a.tables)
+                        .any(|(t, l)| t == table && l >= level)
+                })
+        })
 }
 
 fn matching_grant(
@@ -2185,6 +2320,249 @@ mod tests {
         );
         assert!(controller.snapshot().requests.is_empty());
         drop(held);
+    }
+
+    fn items() -> TableRef {
+        TableRef {
+            schema: "main".into(),
+            name: "items".into(),
+        }
+    }
+    fn shared(audiences: Vec<(Option<String>, ShareAccess)>) -> SharedSource {
+        let mut source = DataSource::new(DriverKind::Sqlite);
+        source.id = "narrowing-source".into();
+        source.file = "/private/narrowing.db".into();
+        SharedSource {
+            alias: "Narrowing source".into(),
+            source,
+            audiences,
+        }
+    }
+    fn access(source: SourceAccess, tables: Vec<(TableRef, TableAccess)>) -> ShareAccess {
+        ShareAccess { source, tables }
+    }
+    /// Shares a source and adds a session grant as if the user had approved it.
+    fn share_with_grant(
+        c: &McpController,
+        sid: &str,
+        audiences: Vec<(Option<String>, ShareAccess)>,
+        scope: GrantScope,
+    ) -> String {
+        c.update_resources(vec![shared(audiences)], Vec::new());
+        let mut state = c.inner.lock().unwrap();
+        let source_id = state.sources.keys().next().unwrap().clone();
+        state.sessions.get_mut(sid).unwrap().grants.push(Grant {
+            id: id(),
+            source_id: source_id.clone(),
+            scope,
+        });
+        source_id
+    }
+    fn table_grant() -> GrantScope {
+        GrantScope::ReadTable {
+            table: items(),
+            identity: "items-identity".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unsharing_a_table_revokes_its_session_grant() {
+        let (c, p, token, sid) = setup();
+        let source_id = share_with_grant(
+            &c,
+            &sid,
+            vec![(
+                None,
+                access(SourceAccess::Ask, vec![(items(), TableAccess::Read)]),
+            )],
+            table_grant(),
+        );
+        c.update_resources(
+            vec![shared(vec![(None, access(SourceAccess::Ask, Vec::new()))])],
+            Vec::new(),
+        );
+        assert!(c.snapshot().sessions[0].grants.is_empty());
+        let request = c
+            .submit(
+                &p,
+                &token,
+                &id(),
+                Operation::DescribeTable {
+                    source_id,
+                    table: items(),
+                },
+            )
+            .unwrap();
+        assert_eq!(request["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn lowering_database_access_revokes_full_sql_session_grant() {
+        let (c, p, token, sid) = setup();
+        let source_id = share_with_grant(
+            &c,
+            &sid,
+            vec![(None, access(SourceAccess::ReadWrite, Vec::new()))],
+            GrantScope::FullSql,
+        );
+        c.update_resources(
+            vec![shared(vec![(None, access(SourceAccess::Read, Vec::new()))])],
+            Vec::new(),
+        );
+        assert!(c.snapshot().sessions[0].grants.is_empty());
+        let request = c
+            .submit(
+                &p,
+                &token,
+                &id(),
+                Operation::Sql {
+                    source_id,
+                    sql: "DELETE FROM main.items".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(request["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn removing_a_specific_recipient_revokes_grants_despite_all_agents_entry() {
+        let (c, p, _, sid) = setup();
+        share_with_grant(
+            &c,
+            &sid,
+            vec![
+                (
+                    Some(p.client_id.clone()),
+                    access(SourceAccess::Ask, Vec::new()),
+                ),
+                (None, access(SourceAccess::Ask, Vec::new())),
+            ],
+            GrantScope::ReadSource,
+        );
+        c.update_resources(
+            vec![shared(vec![(None, access(SourceAccess::Ask, Vec::new()))])],
+            Vec::new(),
+        );
+        assert!(c.snapshot().sessions[0].grants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn widening_or_unrelated_refresh_keeps_grants_and_results() {
+        let (c, p, token, sid) = setup();
+        let source_id = share_with_grant(
+            &c,
+            &sid,
+            vec![(None, access(SourceAccess::Ask, Vec::new()))],
+            table_grant(),
+        );
+        let rid = completed_request(&c, &p, &token, &source_id, Some(SHARED_ACCESS_GRANT));
+        c.update_resources(
+            vec![shared(vec![(
+                None,
+                access(SourceAccess::Read, vec![(items(), TableAccess::ReadWrite)]),
+            )])],
+            Vec::new(),
+        );
+        assert_eq!(c.snapshot().sessions[0].grants.len(), 1);
+        // The request was authorized by standing access that exists only now;
+        // what matters is that widening did not cancel it.
+        assert_eq!(c.get_request(&p, &token, &rid).unwrap()["status"], "completed");
+    }
+
+    /// A finished read on `source_id` authorized by `grant`, with a result to release.
+    fn completed_request(
+        c: &McpController,
+        p: &Principal,
+        token: &str,
+        source_id: &str,
+        grant: Option<&str>,
+    ) -> String {
+        let request = c
+            .submit(
+                p,
+                token,
+                &id(),
+                Operation::ListTables {
+                    source_id: source_id.into(),
+                },
+            )
+            .unwrap();
+        let rid = request["request_id"].as_str().unwrap().to_owned();
+        let mut state = c.inner.lock().unwrap();
+        let r = state.requests.get_mut(&rid).unwrap();
+        r.status = "completed";
+        r.result = Some(json!({"rows":[["private row"]]}));
+        r.finished = Some(Instant::now());
+        r.authorizing_grant_id = grant.map(str::to_owned);
+        rid
+    }
+
+    #[tokio::test]
+    async fn narrowing_standing_access_withholds_completed_results() {
+        let (c, p, token, _) = setup();
+        c.update_resources(
+            vec![shared(vec![(None, access(SourceAccess::Read, Vec::new()))])],
+            Vec::new(),
+        );
+        let source_id = c.inner.lock().unwrap().sources.keys().next().unwrap().clone();
+        let rid = completed_request(&c, &p, &token, &source_id, Some(SHARED_ACCESS_GRANT));
+        c.update_resources(
+            vec![shared(vec![(None, access(SourceAccess::Ask, Vec::new()))])],
+            Vec::new(),
+        );
+        let status = c.get_request(&p, &token, &rid).unwrap();
+        assert_ne!(status["status"], "completed");
+        assert!(status["result"].is_null());
+    }
+
+    #[tokio::test]
+    async fn results_are_released_only_while_their_authorization_is_valid() {
+        let (c, p, token, sid) = setup();
+        let source_id = share_with_grant(
+            &c,
+            &sid,
+            vec![(None, access(SourceAccess::Ask, Vec::new()))],
+            GrantScope::ReadSource,
+        );
+        let grant_id = c.inner.lock().unwrap().sessions[&sid].grants[0].id.clone();
+        let rid = completed_request(&c, &p, &token, &source_id, Some(&grant_id));
+        assert_eq!(c.get_request(&p, &token, &rid).unwrap()["status"], "completed");
+        // Removed without going through a revocation path that cancels requests.
+        c.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&sid)
+            .unwrap()
+            .grants
+            .clear();
+        let status = c.get_request(&p, &token, &rid).unwrap();
+        assert_eq!(status["status"], "revoked");
+        assert!(status["result"].is_null());
+    }
+
+    #[tokio::test]
+    async fn automatic_execution_rechecks_its_authorization_before_starting() {
+        let (c, p, token, _) = setup();
+        c.update_resources(
+            vec![shared(vec![(None, access(SourceAccess::Ask, Vec::new()))])],
+            Vec::new(),
+        );
+        let source_id = c.inner.lock().unwrap().sources.keys().next().unwrap().clone();
+        let request = c
+            .submit(&p, &token, &id(), Operation::ListTables { source_id })
+            .unwrap();
+        let rid = request["request_id"].as_str().unwrap();
+        // As if standing access had authorized it and was narrowed before start.
+        c.inner
+            .lock()
+            .unwrap()
+            .requests
+            .get_mut(rid)
+            .unwrap()
+            .authorizing_grant_id = Some(SHARED_ACCESS_GRANT.into());
+        assert!(c.approve(rid, Approval::Once).is_err());
+        assert_ne!(c.get_request(&p, &token, rid).unwrap()["status"], "running");
     }
 
     #[tokio::test]

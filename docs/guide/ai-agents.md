@@ -57,6 +57,8 @@ For a single table or view:
 
 Triggers and foreign key actions defined on the table still run. Anything beyond the chosen level still triggers an approval prompt, and a data source marked **Read-only** never accepts writes. Open documents are shared with all connections. The agent's catalog reports the access level in the `shared_access` and `shared_tables` fields.
 
+Lowering access takes effect at once. When you lower a database or table level, set a table to Not Shared or remove a connection's own entry (even if All Agents still has access), that connection loses the session permissions it was granted on the source, and its waiting, running and finished requests there are revoked, so their results are no longer handed to the agent. A write already sent keeps the status `outcome_unknown`. Raising access revokes nothing.
+
 Up to 128 databases and 128 documents can be shared, with shared document text limited to 16 MiB in total.
 
 ![Sharing a source with different access per agent connection](../images/90-mcp-sharing-access.png)
