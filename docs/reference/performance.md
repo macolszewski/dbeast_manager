@@ -165,7 +165,7 @@ cargo test --release --test ui_editor_performance -- --ignored --nocapture --tes
 
 The first UI construction for 1 MB of SQL with AccessKit dropped from 724 to 267 ms. This is measured inside the application's UI function, not as application startup. The accessibility tree remains expensive in egui, so measurements without it do not prove smoothness with a screen reader. GPU time and process memory were not measured here.
 
-The cache keeps a single text layout and compact indexes of line starts and fold offsets; it does not map every character to a source position. SQL analysis, highlighting and assembling the visible text happen only after changes. The current egui API requires copying and hashing the cached layout job once per UI pass to keep its paragraph cache; this is a known trade-off that needs further work. The standard egui text editor also makes its own copies and keeps its own text history. Saving the configuration and session is a separate cost still to be moved off the interface thread.
+The cache keeps a single text layout and compact indexes of line starts and fold offsets; it does not map every character to a source position. SQL analysis, highlighting and assembling the visible text happen only after changes. The current egui API requires copying and hashing the cached layout job once per UI pass to keep its paragraph cache; this is a known trade-off that needs further work. The standard egui text editor also makes its own copies and keeps its own text history. Saving the configuration is a separate cost still to be moved off the interface thread; the session is saved in the background (see [Session saving](#session-saving)).
 
 ## Database Explorer
 
@@ -383,6 +383,23 @@ Autosave covers cloning the configuration, JSON, locking, `fsync` of the file an
 
 ```sh
 cargo test --release --lib persistence::tests::benchmark_config_and_credential_persistence -- --ignored --nocapture
+```
+
+## Session saving
+
+The session is checked for changes every 2 seconds. The check hashes tab metadata, console text, cursors, folds, logs and the explorer tree, while each result contributes only the identity of its JSON, which is serialized once per result and shared with the snapshot instead of copied. Nothing is serialized or written when the hash is unchanged. A changed snapshot goes to a single writer thread that serializes it and writes it atomically (temporary file with `0600` permissions, then rename); saves queued behind a slow write are replaced by the newest one, and exit waits for the last write.
+
+17 October 2026, release build, synthetic results of 500 rows x 20 columns per tab (integers, floats, decimals, bytes, text), medians of 21 saves, time spent on the interface thread:
+
+| Tabs (session size) | Before: unchanged / changed | After: unchanged / changed | Final write at exit |
+|---|---|---|---|
+| 10 (5.0 MB) | 3.9 ms / 4.4 ms | 0.009 ms / 0.008 ms | 1.2 ms |
+| 30 (15.1 MB) | 13.0 ms / 15.4 ms | 0.028 ms / 0.023 ms | 7.0 ms |
+
+The first save after a result arrives also serializes that result once on the interface thread.
+
+```sh
+cargo test --release --lib ui::session::tests::benchmark_session_save -- --ignored --exact --nocapture
 ```
 
 ## TLS connections

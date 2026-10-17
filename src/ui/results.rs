@@ -128,7 +128,7 @@ pub struct ResultSet {
     pub geo: Option<GeoState>,
     geo_columns: Option<Vec<usize>>,
     /// `data` as JSON for the saved session; rows never change after fetching.
-    data_json: std::cell::OnceCell<String>,
+    data_json: std::cell::OnceCell<Option<super::session::ResultJson>>,
 }
 
 /// Geo Viewer of a result set: chosen column, SRID override and map position.
@@ -211,9 +211,15 @@ impl ResultSet {
         }
     }
 
-    pub fn data_json(&self) -> &str {
+    pub(super) fn data_json(&self) -> Option<&super::session::ResultJson> {
         self.data_json
-            .get_or_init(|| serde_json::to_string(&self.data).unwrap_or_default())
+            .get_or_init(|| super::session::ResultJson::of(&self.data))
+            .as_ref()
+    }
+
+    /// Reuses the JSON a restored result was read from.
+    pub(super) fn set_data_json(&mut self, json: super::session::ResultJson) {
+        self.data_json = Some(json).into();
     }
 
     /// Columns holding geometries, detected once per result.

@@ -33,5 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing rows" and "Stop and roll back" are refused before any change, and
   Skip mode inserts row by row, so rows are no longer written twice and the
   reported counts and line numbers are correct.
+- Saving the session no longer blocks the interface: unchanged sessions are
+  detected without serializing results, results are shared instead of copied,
+  and the file is written on a background thread.
 - The integrated macOS title bar keeps room for the window buttons at every
   Zoom IDE level.

@@ -2379,7 +2379,7 @@ impl App {
         if !self.config_loaded {
             return;
         }
-        self.save_session(true);
+        self.finish_session();
         for f in &self.files {
             f.close();
         }
