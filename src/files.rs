@@ -521,6 +521,8 @@ mod tests {
             std::fs::read_to_string(&csv).unwrap(),
             "id;name;code;score;note\n1;Ann;007;1.50;\"a;b\"\n2;Zoë;010;2;\n3;New;;;\n"
         );
+        // Windows cannot delete a database file that is still open.
+        drop(conn);
         opened.close();
         assert!(!opened.db_path.exists());
         std::fs::remove_dir_all(dir).ok();

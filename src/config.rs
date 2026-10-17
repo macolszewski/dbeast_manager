@@ -270,6 +270,30 @@ impl Config {
     }
 }
 
+/// Renames `temp` over `path`; `Ok(false)` means the rename happened but its
+/// durability is not confirmed, so callers keep both credential revisions
+/// until a later durable save succeeds.
+#[cfg(not(windows))]
+fn replace_durably(temp: &std::path::Path, path: &std::path::Path, parent: &std::path::Path) -> Result<bool, String> {
+    std::fs::rename(temp, path).map_err(|_| "Cannot replace configuration".to_string())?;
+    Ok(std::fs::File::open(parent).and_then(|dir| dir.sync_all()).is_ok())
+}
+
+/// A directory cannot be opened and flushed on Windows; MOVEFILE_WRITE_THROUGH
+/// returns only after the rename reached the disk.
+#[cfg(windows)]
+fn replace_durably(temp: &std::path::Path, path: &std::path::Path, _: &std::path::Path) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let wide = |p: &std::path::Path| p.as_os_str().encode_wide().chain([0]).collect::<Vec<u16>>();
+    let (from, to) = (wide(temp), wide(path));
+    // SAFETY: both arguments are NUL-terminated UTF-16 paths that outlive the call.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err("Cannot replace configuration".to_string());
+    }
+    Ok(true)
+}
+
 /// Write with restrictive permissions before the first byte; never truncate the old file.
 pub(crate) fn atomic_write<T: Serialize>(
     path: &std::path::Path,
@@ -296,12 +320,7 @@ pub(crate) fn atomic_write<T: Serialize>(
         file.write_all(&data)
             .and_then(|_| file.sync_all())
             .map_err(|_| "Cannot write configuration".to_string())?;
-        std::fs::rename(&temp, path).map_err(|_| "Cannot replace configuration".to_string())?;
-        // After rename, failure is ambiguous: the new file is visible. Keep both
-        // credential revisions until a later durable save succeeds.
-        Ok(std::fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .is_ok())
+        replace_durably(&temp, path, parent)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temp);

@@ -70,7 +70,7 @@ secret-service = { version = "5.2", default-features = false, features = ["rt-as
 
 # Passwords on Windows are encrypted with DPAPI for the current user.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11"] }
