@@ -7,31 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [0.2.0] - 2026-10-17
 
-- First public release: SQL console, result grid with editing, Database
-  Explorer, query plans, data import and export, PostgreSQL client tools,
-  Activity Monitor, Geo Viewer, Depth View, Database Graph and a local MCP
-  server for AI agents, for PostgreSQL, MySQL and SQLite.
-- About DBeast screen with theme music.
-- Documentation site at <https://macolszewski.github.io/dbeast_manager/>, built with
-  MkDocs from `docs/`.
-- Continuous integration on Linux (clippy and unit tests); the full test suite runs locally.
+### Added
 
 - Windows 10 and 11 (x86-64) support: passwords encrypted with DPAPI, ssh-agent
   through the OpenSSH named pipe or Pageant, PostgreSQL client tools found in
   Program Files, Show in Explorer, an embedded icon and no console window.
   `scripts/build-windows.sh` cross-compiles a zip, and an on-demand workflow
   builds and tests on Windows.
+- Release workflow: pushing a version tag publishes ready-to-run macOS, Linux and
+  Windows packages with checksums as a GitHub release.
 
 ### Changed
 
-- All documentation, comments and project files are in English.
 - MySQL and PostgreSQL strict reads give a separate reason for each refusal
   (missing table, view, storage engine, partitioning, too many columns,
   unsupported column type, generated column) and say that the whole table is
   checked, including columns the query does not select.
-- In-app window title bars on macOS show the close button on the left.
 - Table editor pages are read with `LIMIT`/`OFFSET` on the server and, without
   an ORDER BY, in primary key order, so each page shows the same rows.
 - A plain PostgreSQL console SELECT outside a transaction is stopped on the
@@ -59,8 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Saving the session no longer blocks the interface: unchanged sessions are
   detected without serializing results, results are shared instead of copied,
   and the file is written on a background thread.
-- The integrated macOS title bar keeps room for the window buttons at every
-  Zoom IDE level.
 - PostgreSQL arrays, numeric and interval values are shown and exported
   exactly as PostgreSQL prints them: quoted array elements, multi-dimensional
   arrays and lower bounds, all numeric digits, NaN, infinities, interval
@@ -68,3 +59,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writing a placeholder for a value that cannot be read exactly.
 - A PostgreSQL query that fails at or after the end of the fetched page is
   reported as an error, not as a successful page.
+
+## [0.1.0] - 2026-10-17
+
+First public version (source only).
+
+### Added
+
+- SQL console, result grid with editing, Database Explorer, query plans, data
+  import and export, PostgreSQL client tools, Activity Monitor, Geo Viewer,
+  Depth View, Database Graph and a local MCP server for AI agents, for
+  PostgreSQL, MySQL and SQLite.
+- About DBeast screen with theme music.
+- Documentation site at <https://macolszewski.github.io/dbeast_manager/>, built with
+  MkDocs from `docs/`.
+- Continuous integration on Linux (clippy and unit tests); the full test suite runs locally.
+
+### Changed
+
+- All documentation, comments and project files are in English.
+- In-app window title bars on macOS show the close button on the left.
+
+### Fixed
+
+- The integrated macOS title bar keeps room for the window buttons at every
+  Zoom IDE level.
