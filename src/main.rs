@@ -1,3 +1,6 @@
+// Release builds are GUI applications on Windows: no console window behind them.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use dbeast::ui;
 
 fn main() -> eframe::Result {

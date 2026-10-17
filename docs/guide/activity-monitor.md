@@ -4,7 +4,7 @@ The Activity Monitor is a live view of a PostgreSQL server built on `pg_stat_act
 
 ## Opening the monitor
 
-In the Database Explorer, right-click a PostgreSQL data source or database and choose **Activity Monitor**. The action is also available in Find Action (`⌘⇧A`, Ctrl+Shift+A on Linux).
+In the Database Explorer, right-click a PostgreSQL data source or database and choose **Activity Monitor**. The action is also available in Find Action (`⌘⇧A`, Ctrl+Shift+A on Linux and Windows).
 
 The monitor opens as a non-modal window, so you can keep working in consoles while it refreshes.
 

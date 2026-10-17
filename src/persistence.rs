@@ -63,6 +63,11 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 const LOCK_ATTEMPTS: u32 = 25;
 
 fn lock_file(path: &Path) -> Result<std::fs::File, String> {
+    // Without O_NOFOLLOW, refuse a lock path that is a link (Windows symlink or junction).
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("Invalid password persistence lock".into());
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]

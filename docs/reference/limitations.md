@@ -15,7 +15,7 @@ Planned directions:
 
 ## Platforms and drivers
 
-- DBeast runs on macOS and Linux. Windows is not a supported platform yet; in particular, there is no system password store on Windows, so passwords can only be kept with **Until restart**.
+- DBeast runs on macOS, Linux and Windows 10 or later (x86-64). The Windows code is checked on every change by cross-compiling, and the on-demand Windows workflow runs the unit tests; the Windows build has had less hands-on use than the macOS and Linux builds, and no signed installer is published yet.
 - Supported databases are PostgreSQL, MySQL and SQLite, plus CSV, TSV and Data Package files opened as temporary sources. MariaDB is not specifically supported (for example by Explain Analyse).
 - The macOS application bundle is signed ad hoc and not notarized. macOS may ask for keychain access again after the application is rebuilt or a different executable is run.
 

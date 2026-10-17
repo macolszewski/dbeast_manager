@@ -2,7 +2,7 @@
 
 The query console is where you write and run SQL. Each console is a tab with its own database session, so a long-running query in one console never blocks browsing the schema or working in another console.
 
-Shortcuts use macOS symbols; on Linux, ⌘ is Ctrl and ⌥ is Alt.
+Shortcuts use macOS symbols; on Linux and Windows, ⌘ is Ctrl and ⌥ is Alt.
 
 ## Open a console
 

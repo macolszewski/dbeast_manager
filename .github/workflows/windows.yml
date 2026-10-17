@@ -1,0 +1,39 @@
+name: Windows
+
+# Runs on demand only: Windows runners are slower, and the code is also
+# checked by cross-compiling (scripts/build-windows.sh).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: Windows (clippy, unit tests, release build)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets
+      - run: cargo test --lib
+      - run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          $dist = "DBeast-windows-x86_64"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item target/release/dbeast.exe "$dist/DBeast.exe"
+          Copy-Item LICENSE, NOTICE, README.md $dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: DBeast-windows-x86_64
+          path: DBeast-windows-x86_64

@@ -47,6 +47,10 @@ earcut = "0.4.11"
 # About window theme: Ogg Vorbis playback only.
 rodio = { version = "=0.22.2", default-features = false, features = ["playback", "vorbis"] }
 
+# Embeds the icon and version information in the Windows executable.
+[build-dependencies]
+winresource = "=0.1.31"
+
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe", "snapshot", "wgpu"] }
 rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
@@ -63,6 +67,10 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 # Passwords on Linux go to the Secret Service (GNOME Keyring, KWallet) over D-Bus.
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }
+
+# Passwords on Windows are encrypted with DPAPI for the current user.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11"] }

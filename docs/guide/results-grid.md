@@ -2,7 +2,7 @@
 
 Query results and table data are shown in the results grid. The grid draws only the visible rows, so scrolling stays smooth on large pages. This page covers browsing, searching, filtering, editing and comparing data in the grid.
 
-Shortcuts use macOS symbols; on Linux, ⌘ is Ctrl.
+Shortcuts use macOS symbols; on Linux and Windows, ⌘ is Ctrl.
 
 ## Where results appear
 

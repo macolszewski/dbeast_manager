@@ -106,6 +106,8 @@ When the Docker containers are not running, tests that need them print a skip me
 
 Tests on local SQLite files, unit tests and most UI tests still run. TLS, Secret Service and native Keychain tests always need their explicit opt-in.
 
-## Linux builds
+## Linux and Windows builds
 
 DBeast builds and runs on Linux. The build is checked in a Linux container to make sure that platform-specific code compiles on both systems. See [Getting started](../guide/getting-started.md) for the packages needed to build on Debian and Ubuntu.
+
+The Windows code is checked by cross-compiling from macOS or Linux (`cargo clippy --target x86_64-pc-windows-gnu --all-targets`, with the mingw-w64 toolchain). The **Windows** workflow on GitHub Actions runs on demand: clippy, the unit tests and a release build on `windows-latest`, with the executable as a downloadable artifact.

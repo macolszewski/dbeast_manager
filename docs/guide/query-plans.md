@@ -11,7 +11,7 @@ DBeast shows how the database executes a query. **Explain Plan** asks the planne
 ## Explain Plan
 
 1. In a console, place the cursor in a statement or select the text you want to plan.
-2. Click **Explain Plan** on the console toolbar. The action is also in the editor context menu and in Find Action (`⌘⇧A`, Ctrl+Shift+A on Linux).
+2. Click **Explain Plan** on the console toolbar. The action is also in the editor context menu and in Find Action (`⌘⇧A`, Ctrl+Shift+A on Linux and Windows).
 3. The plan opens in the **Query Plan** tab of the Services panel. Existing result tabs stay open.
 
 The plan is created in the console's own session, with its schema, temporary tables and transaction. Inside an open transaction, DBeast wraps planning in its own `SAVEPOINT`, so an error or cancellation never affects your earlier changes. Explain Plan does not open a transaction just because the console is in `Tx: Manual` mode. The SQL is validated and sent as a single prepared statement without `ANALYZE`, so it is not executed.

@@ -47,6 +47,7 @@ The configuration (`config.json`) stores data sources, query history, recently u
 |---|---|
 | macOS | `~/Library/Application Support/dev.dbeast.dbeast/config.json` |
 | Linux | `~/.config/dbeast/config.json` |
+| Windows | `%APPDATA%\dbeast\dbeast\config\config.json` |
 
 The file is written with 0600 permissions. If a configuration from an earlier version of the application exists at its older location, DBeast keeps using that path, because saved passwords in the system keychain are bound to the location of the file.
 

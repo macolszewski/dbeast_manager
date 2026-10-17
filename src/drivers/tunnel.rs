@@ -108,6 +108,55 @@ async fn connect(ssh: &SshConfig, db_host: &str, db_port: u16) -> Result<Tunnel>
     })
 }
 
+#[cfg(unix)]
+async fn agent_authenticate(session: &mut client::Handle<HostKeyCheck>, user: &str) -> Result<bool> {
+    let agent = keys::agent::client::AgentClient::connect_env()
+        .await
+        .context("cannot reach ssh-agent (is SSH_AUTH_SOCK set?)")?;
+    try_agent_keys(session, user, agent).await
+}
+
+/// The Windows OpenSSH agent listens on a named pipe (or `SSH_AUTH_SOCK` when
+/// set to one); Pageant is the other common agent there.
+#[cfg(windows)]
+async fn agent_authenticate(session: &mut client::Handle<HostKeyCheck>, user: &str) -> Result<bool> {
+    use keys::agent::client::AgentClient;
+    let pipe = std::env::var_os("SSH_AUTH_SOCK")
+        .unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into());
+    match AgentClient::connect_named_pipe(&pipe).await {
+        Ok(agent) => try_agent_keys(session, user, agent).await,
+        Err(_) => {
+            let agent = AgentClient::connect_pageant()
+                .await
+                .context("cannot reach ssh-agent (start the OpenSSH Authentication Agent service or Pageant)")?;
+            try_agent_keys(session, user, agent).await
+        }
+    }
+}
+
+async fn try_agent_keys<S>(
+    session: &mut client::Handle<HostKeyCheck>,
+    user: &str,
+    mut agent: keys::agent::client::AgentClient<S>,
+) -> Result<bool>
+where
+    S: keys::agent::client::AgentStream + Unpin + Send + 'static,
+{
+    let identities = agent.request_identities().await?;
+    let hash = session.best_supported_rsa_hash().await?.flatten();
+    for identity in identities {
+        if let keys::agent::AgentIdentity::PublicKey { key, .. } = identity
+            && session
+                .authenticate_publickey_with(user, key, hash, &mut agent)
+                .await?
+                .success()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 async fn authenticate(session: &mut client::Handle<HostKeyCheck>, ssh: &SshConfig) -> Result<()> {
     let who = format!("{}@{}", ssh.user, ssh.host);
     let ok = match ssh.auth {
@@ -126,26 +175,7 @@ async fn authenticate(session: &mut client::Handle<HostKeyCheck>, ssh: &SshConfi
                 .await?
                 .success()
         }
-        SshAuth::Agent => {
-            let mut agent = keys::agent::client::AgentClient::connect_env()
-                .await
-                .context("cannot reach ssh-agent (is SSH_AUTH_SOCK set?)")?;
-            let identities = agent.request_identities().await?;
-            let hash = session.best_supported_rsa_hash().await?.flatten();
-            let mut ok = false;
-            for identity in identities {
-                if let keys::agent::AgentIdentity::PublicKey { key, .. } = identity
-                    && session
-                        .authenticate_publickey_with(&ssh.user, key, hash, &mut agent)
-                        .await?
-                        .success()
-                {
-                    ok = true;
-                    break;
-                }
-            }
-            ok
-        }
+        SshAuth::Agent => agent_authenticate(session, &ssh.user).await?,
     };
     if !ok {
         bail!("SSH authentication failed for {who} ({})", ssh.auth.label());

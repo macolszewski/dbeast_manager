@@ -93,7 +93,7 @@ for the methodology and per-feature measurements.
 ## Platforms and databases
 
 - **macOS** with an integrated title bar and Metal rendering.
-- **Linux** with OpenGL rendering and the system title bar.
+- **Linux** and **Windows** with OpenGL rendering and the system title bar.
 - **PostgreSQL**, **MySQL** and **SQLite** through native Rust drivers, plus CSV, TSV,
   Data Package and SQLite files opened as temporary sources.
 

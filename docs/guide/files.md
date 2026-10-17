@@ -2,7 +2,7 @@
 
 DBeast can open data files directly, without adding a permanent data source. An opened file becomes a temporary data source: you browse it in the grid, query it in a SQL console, filter, transpose and export it like any database table.
 
-Shortcuts use macOS symbols; on Linux, ⌘ is Ctrl.
+Shortcuts use macOS symbols; on Linux and Windows, ⌘ is Ctrl.
 
 ## Supported files
 

@@ -6,7 +6,7 @@ This page describes the feature from the user's side. The complete technical con
 
 ## Starting the server
 
-Open the settings with the **MCP** button on the toolbar, or with **MCP Server** in Find Action (`⌘⇧A`, Ctrl+Shift+A on Linux). The **Settings** window has four sections: **Server**, **Sharing**, **Sessions** and **Activity**.
+Open the settings with the **MCP** button on the toolbar, or with **MCP Server** in Find Action (`⌘⇧A`, Ctrl+Shift+A on Linux and Windows). The **Settings** window has four sections: **Server**, **Sharing**, **Sessions** and **Activity**.
 
 On the **Server** page:
 

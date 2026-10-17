@@ -293,7 +293,7 @@ impl App {
                             ui,
                             t.target_exists,
                             "🗀",
-                            if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" },
+                            if cfg!(target_os = "macos") { "Reveal in Finder" } else if cfg!(windows) { "Show in Explorer" } else { "Open Containing Folder" },
                         )
                         .clicked()
                     {
@@ -430,7 +430,13 @@ fn progress_bar(ui: &mut Ui, t: &Transfer) {
 fn reveal(path: &std::path::Path) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(path);
+        let _ = std::process::Command::new("explorer").arg(select).spawn();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let folder = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
         let _ = std::process::Command::new("xdg-open").arg(folder).spawn();

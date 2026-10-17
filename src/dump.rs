@@ -66,12 +66,31 @@ fn candidate_dirs() -> Vec<PathBuf> {
     ];
     dirs.extend(fixed.iter().map(PathBuf::from));
     // Debian and Ubuntu keep one folder per major version; prefer the newest.
-    if let Ok(entries) = std::fs::read_dir("/usr/lib/postgresql") {
-        let mut versions: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path().join("bin")).collect();
-        versions.sort();
-        dirs.extend(versions.into_iter().rev());
+    dirs.extend(version_dirs(PathBuf::from("/usr/lib/postgresql")));
+    // The Windows installer uses C:\Program Files\PostgreSQL\<major>\bin.
+    #[cfg(windows)]
+    for root in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(root) {
+            dirs.extend(version_dirs(PathBuf::from(root).join("PostgreSQL")));
+        }
     }
     dirs
+}
+
+/// `<root>/<version>/bin` folders, newest major version first.
+fn version_dirs(root: PathBuf) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<(u32, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let major = e.file_name().to_string_lossy().split('.').next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            (major, e.path().join("bin"))
+        })
+        .collect();
+    versions.sort();
+    versions.into_iter().rev().map(|(_, dir)| dir).collect()
 }
 
 /// The configured tool if it exists, otherwise the first one found.
@@ -83,7 +102,7 @@ pub fn find_tool(tool: Tool, configured: &str) -> Option<PathBuf> {
     }
     candidate_dirs()
         .into_iter()
-        .map(|dir| dir.join(tool.binary()))
+        .map(|dir| dir.join(format!("{}{}", tool.binary(), std::env::consts::EXE_SUFFIX)))
         .find(|path| path.is_file())
 }
 

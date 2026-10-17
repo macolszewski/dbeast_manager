@@ -2,8 +2,8 @@
 
 Shortcuts are written with macOS symbols: `⌘` Command, `⌥` Option, `⌃` Control, `⇧` Shift, `↵` Return, `⌫` Delete.
 
-!!! note "Linux"
-    On Linux every shortcut is the same, with Ctrl in place of `⌘` and Alt in place of `⌥`. For example, `⌘⇧L` is Ctrl+Shift+L and `⌥⌘L` is Ctrl+Alt+L. Tooltips and menus in the application show shortcuts in this form.
+!!! note "Linux and Windows"
+    On Linux and Windows every shortcut is the same, with Ctrl in place of `⌘` and Alt in place of `⌥`. For example, `⌘⇧L` is Ctrl+Shift+L and `⌥⌘L` is Ctrl+Alt+L. Tooltips and menus in the application show shortcuts in this form.
 
 Most commands are also available by name in **Find Action** (`⌘⇧A`), which shows each command's shortcut next to it.
 
@@ -35,7 +35,7 @@ Database Explorer and Files share the left panel, so opening one replaces the ot
 | `⌃⌥⇧-` | Zoom Out IDE |
 | `⌃⌥⇧0` | Reset IDE Zoom |
 
-On Linux these are Ctrl+Alt+Shift with the same keys. They match the physical key. See [Appearance](../guide/appearance.md#zoom-ide).
+On Linux and Windows these are Ctrl+Alt+Shift with the same keys. They match the physical key. See [Appearance](../guide/appearance.md#zoom-ide).
 
 ## SQL console
 

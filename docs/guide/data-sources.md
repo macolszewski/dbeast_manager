@@ -2,7 +2,7 @@
 
 A data source is a saved connection to a database server or a database file. This page covers creating and editing data sources, the supported drivers, secure connections, password storage and how DBeast behaves when a connection breaks.
 
-Shortcuts use macOS symbols; on Linux, ⌘ is Ctrl.
+Shortcuts use macOS symbols; on Linux and Windows, ⌘ is Ctrl.
 
 ## The Data Sources and Drivers dialog
 
@@ -144,7 +144,8 @@ Test Connection and the server description show exactly what was verified:
 DBeast never writes passwords to `config.json`. The database password, SSH password, SSH key passphrase and TLS identity password of a data source are stored together, in one protected record per configuration file:
 
 - on macOS, in the Keychain;
-- on Linux, in the system credential store through Secret Service (GNOME Keyring, KWallet, KeePassXC and others) on the session D-Bus. The desktop may ask you to unlock it.
+- on Linux, in the system credential store through Secret Service (GNOME Keyring, KWallet, KeePassXC and others) on the session D-Bus. The desktop may ask you to unlock it;
+- on Windows, in a file under the configuration folder (`credentials\`), encrypted with DPAPI for your Windows account, so another account or another computer cannot decrypt it. Credential Manager is not used because it limits one secret to 2.5 KB.
 
 ![General tab of a data source with the Save option set to Forever](../images/80-password-storage.png)
 
@@ -158,7 +159,7 @@ The **Save** option applies to all four secrets of the data source:
 Things to know:
 
 - At startup, DBeast reads the credential record once, regardless of the number of data sources.
-- On Linux without a Secret Service provider, saving with **Forever** fails with a message; choose **Until restart** instead. On Windows the system credential store is not supported yet; use **Until restart**.
+- On Linux without a Secret Service provider, saving with **Forever** fails with a message; choose **Until restart** instead.
 - If access to the credential store is denied, DBeast never falls back to storing passwords in plain text. The dialog offers **Retry password loading** and **Replace unavailable passwords**. The second option replaces all four passwords of the source, including with empty values. A data source with unavailable passwords does not connect, also from a restored console.
 - If saving fails, **Reload settings and discard changes** reloads the saved settings. Your unsaved changes are kept unless the reload succeeds. Changed or removed data sources are disconnected and not reconnected automatically.
 - When you close the window, DBeast waits for a pending configuration save to finish. **Exit without waiting** closes the application without that guarantee.

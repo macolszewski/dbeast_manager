@@ -12,7 +12,7 @@ results smoothly, with the tools you expect from a professional database IDE.
 [![CI](https://img.shields.io/github/actions/workflow/status/macolszewski/dbeast_manager/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/macolszewski/dbeast_manager/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-2563eb?style=flat-square)](./LICENSE)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-b7410e?style=flat-square&logo=rust&logoColor=white)](./Cargo.toml)
-[![Platforms](https://img.shields.io/badge/platforms-macOS_%7C_Linux-4b5563?style=flat-square)](#building-from-source)
+[![Platforms](https://img.shields.io/badge/platforms-macOS_%7C_Linux_%7C_Windows-4b5563?style=flat-square)](#building-from-source)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169e1?style=flat-square&logo=postgresql&logoColor=white)](https://macolszewski.github.io/dbeast_manager/guide/data-sources/)
 [![MySQL](https://img.shields.io/badge/MySQL-4479a1?style=flat-square&logo=mysql&logoColor=white)](https://macolszewski.github.io/dbeast_manager/guide/data-sources/)
 [![SQLite](https://img.shields.io/badge/SQLite-003b57?style=flat-square&logo=sqlite&logoColor=white)](https://macolszewski.github.io/dbeast_manager/guide/files/)
@@ -109,8 +109,8 @@ that never waits for the network.
   files open as temporary sources.
 - **SSH tunnel** (password, key or agent) written in Rust, **TLS** with CA, client
   certificates and host verification.
-- Passwords in the **macOS Keychain** or the Linux **Secret Service**, never in plain
-  text.
+- Passwords in the **macOS Keychain**, the Linux **Secret Service** or encrypted with
+  Windows **DPAPI**, never in plain text.
 
 </td>
 <td valign="top">
@@ -181,15 +181,38 @@ On Linux DBeast renders with OpenGL and uses the system title bar. Saved passwor
 Secret Service (GNOME Keyring, KWallet, KeePassXC); without one, choose *Until restart*.
 Shortcuts use Ctrl in place of ⌘ and Alt in place of ⌥.
 
+### Windows
+
+DBeast runs on Windows 10 and 11 (x86-64). On Windows, install Rust from
+[rustup.rs](https://rustup.rs/) with the Visual Studio Build Tools, then:
+
+```powershell
+cargo build --release
+.\target\release\dbeast.exe
+```
+
+To build a Windows zip from macOS or Linux, install the mingw-w64 toolchain
+(`brew install mingw-w64` or `apt install mingw-w64`) and run:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+./scripts/build-windows.sh         # target/dist/DBeast-<version>-windows-x86_64.zip
+```
+
+The executable needs no extra DLLs. Saved passwords are encrypted with DPAPI for your Windows
+account, and SSH agent authentication works with the OpenSSH Authentication Agent service or
+Pageant. Shortcuts use Ctrl in place of ⌘ and Alt in place of ⌥.
+
 ### Configuration
 
-| | macOS | Linux |
-|---|---|---|
-| Configuration | `~/Library/Application Support/dev.dbeast.dbeast/config.json` | `~/.config/dbeast/config.json` |
-| Working session | `session.json` next to the configuration | same |
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Configuration | `~/Library/Application Support/dev.dbeast.dbeast/config.json` | `~/.config/dbeast/config.json` | `%APPDATA%\dbeast\dbeast\config\config.json` |
+| Working session | `session.json` next to the configuration | same | same |
 
 Set `DBEAST_CONFIG` to use another configuration file, for example a throwaway one while
-testing. Both files are written with `0600` permissions and never contain passwords.
+testing. Neither file ever contains passwords; on macOS and Linux both are written with `0600`
+permissions, on Windows they live in your user profile.
 
 ## Quick start
 
@@ -253,8 +276,7 @@ Preview it locally with `pip install -r docs/requirements.txt && mkdocs serve`.
 
 ## Roadmap
 
-- Prebuilt, signed releases for macOS and Linux.
-- Windows support, including the system credential store.
+- Prebuilt, signed releases for macOS, Linux and Windows.
 - More drivers and formats (DuckDB, Parquet).
 - Schema comparison beyond a single object and entity relationship diagrams.
 - Broader editing of console results and multi-record Related Rows.

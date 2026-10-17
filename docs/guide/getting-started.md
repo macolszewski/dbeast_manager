@@ -2,7 +2,7 @@
 
 This page walks you through installing DBeast, launching it for the first time, finding your way around the main window and connecting to your first database.
 
-Keyboard shortcuts in this guide use macOS symbols. On Linux, ⌘ is Ctrl and ⌥ is Alt, and the application shows shortcuts in that form (for example, Ctrl+Shift+L).
+Keyboard shortcuts in this guide use macOS symbols. On Linux and Windows, ⌘ is Ctrl and ⌥ is Alt, and the application shows shortcuts in that form (for example, Ctrl+Shift+L).
 
 ## Install DBeast
 
@@ -40,6 +40,24 @@ cargo run --release
 
 On Linux the window uses the system title bar and draws with OpenGL.
 
+### Windows
+
+DBeast runs on Windows 10 and 11 (x86-64). Build it on Windows with the Rust toolchain for MSVC (install Rust from [rustup.rs](https://rustup.rs/) together with the Visual Studio Build Tools):
+
+```powershell
+cargo build --release
+.\target\release\dbeast.exe
+```
+
+Or cross-compile a zip from macOS or Linux with the mingw-w64 toolchain:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+./scripts/build-windows.sh    # target/dist/DBeast-<version>-windows-x86_64.zip
+```
+
+On Windows the window uses the system title bar and draws with OpenGL. Saved passwords are encrypted with DPAPI for your Windows account. For SSH agent authentication, start the OpenSSH Authentication Agent service or Pageant.
+
 For full build instructions, see Building from source in the [README on GitHub](https://github.com/macolszewski/dbeast_manager#building-from-source).
 
 ### Where settings are stored
@@ -48,6 +66,7 @@ For full build instructions, see Building from source in the [README on GitHub](
 |---|---|
 | macOS | `~/Library/Application Support/dev.dbeast.dbeast/config.json` |
 | Linux | `~/.config/dbeast/config.json` |
+| Windows | `%APPDATA%\dbeast\dbeast\config\config.json` |
 
 The file is created with owner-only permissions (0600) and never contains passwords; those go to the system credential store (see [Data sources](data-sources.md#password-storage)). To use a different configuration file, set the `DBEAST_CONFIG` environment variable to its path.
 

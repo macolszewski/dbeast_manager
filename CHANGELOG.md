@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MkDocs from `docs/`.
 - Continuous integration on Linux (clippy and unit tests); the full test suite runs locally.
 
+- Windows 10 and 11 (x86-64) support: passwords encrypted with DPAPI, ssh-agent
+  through the OpenSSH named pipe or Pageant, PostgreSQL client tools found in
+  Program Files, Show in Explorer, an embedded icon and no console window.
+  `scripts/build-windows.sh` cross-compiles a zip, and an on-demand workflow
+  builds and tests on Windows.
+
 ### Changed
 
 - All documentation, comments and project files are in English.

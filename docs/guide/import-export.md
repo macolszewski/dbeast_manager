@@ -143,7 +143,7 @@ Click **Run**. The tool runs in the background in the Run window, with its `--ve
 
 ## Run tool window
 
-The Run window collects background tasks: exports, imports, dumps and restores. Open it with `⌘4` (Ctrl+4 on Linux) or the ▷ button on the left sidebar. Run and Services share the bottom part of the window.
+The Run window collects background tasks: exports, imports, dumps and restores. Open it with `⌘4` (Ctrl+4 on Linux and Windows) or the ▷ button on the left sidebar. Run and Services share the bottom part of the window.
 
 Each task has its own tab with:
 

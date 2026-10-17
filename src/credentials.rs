@@ -218,16 +218,135 @@ mod linux {
         HashMap::from([("application", "dbeast"), ("service", service), ("account", account)])
     }
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+impl CredentialStore for SystemStore {
+    fn read(&mut self, service: &str, account: &str) -> Result<Option<Vec<u8>>, String> {
+        windows::read(service, account)
+    }
+    fn write(&mut self, service: &str, account: &str, value: &[u8]) -> Result<(), String> {
+        windows::write(service, account, value)
+    }
+    fn delete(&mut self, service: &str, account: &str) -> Result<(), String> {
+        windows::delete(service, account)
+    }
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 impl CredentialStore for SystemStore {
     fn read(&mut self, _: &str, _: &str) -> Result<Option<Vec<u8>>, String> {
-        Err("System password storage is supported on macOS and Linux. Choose Until restart.".into())
+        Err("System password storage is supported on macOS, Linux and Windows. Choose Until restart.".into())
     }
     fn write(&mut self, _: &str, _: &str, _: &[u8]) -> Result<(), String> {
-        Err("System password storage is supported on macOS and Linux. Choose Until restart.".into())
+        Err("System password storage is supported on macOS, Linux and Windows. Choose Until restart.".into())
     }
     fn delete(&mut self, _: &str, _: &str) -> Result<(), String> {
-        Err("System password storage is supported on macOS and Linux.".into())
+        Err("System password storage is supported on macOS, Linux and Windows.".into())
+    }
+}
+
+/// Windows keeps each secret in a file under the configuration folder,
+/// encrypted with DPAPI for the current user account. Credential Manager is
+/// not used because it limits a secret to 2.5 KB, and the vault holding every
+/// source's passwords can be larger.
+#[cfg(windows)]
+mod windows {
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+
+    fn path(service: &str, account: &str) -> PathBuf {
+        let name: String = Sha256::digest(format!("{service}\0{account}"))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        crate::config::Config::data_dir().join("credentials").join(format!("{name}.dpapi"))
+    }
+
+    /// Binds a secret to its service and account, so a file copied over
+    /// another entry does not decrypt.
+    fn entropy(service: &str, account: &str) -> Vec<u8> {
+        format!("dbeast\0{service}\0{account}").into_bytes()
+    }
+
+    fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
+        CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 }
+    }
+
+    /// Copies a blob allocated by DPAPI and frees it.
+    fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        // SAFETY: DPAPI returned a LocalAlloc buffer of cbData bytes, freed once here.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+            LocalFree(out.pbData.cast());
+            bytes
+        }
+    }
+
+    pub(super) fn read(service: &str, account: &str) -> Result<Option<Vec<u8>>, String> {
+        let sealed = match std::fs::read(path(service, account)) {
+            Ok(sealed) => sealed,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Cannot read the saved password file.".into()),
+        };
+        let entropy = entropy(service, account);
+        let (input, extra) = (blob(&sealed), blob(&entropy));
+        let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        // SAFETY: the input blobs point to live buffers; DPAPI fills `out`.
+        let ok = unsafe {
+            CryptUnprotectData(&input, std::ptr::null_mut(), &extra, std::ptr::null(), std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        };
+        if ok == 0 {
+            return Err("Saved passwords cannot be decrypted by this Windows account. Enter them again.".into());
+        }
+        Ok(Some(take(out)))
+    }
+
+    pub(super) fn write(service: &str, account: &str, value: &[u8]) -> Result<(), String> {
+        let entropy = entropy(service, account);
+        let (input, extra) = (blob(value), blob(&entropy));
+        let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        // SAFETY: the input blobs point to live buffers; DPAPI fills `out`.
+        let ok = unsafe {
+            CryptProtectData(&input, std::ptr::null(), &extra, std::ptr::null(), std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        };
+        if ok == 0 {
+            return Err("Windows could not encrypt the password (DPAPI).".into());
+        }
+        let sealed = take(out);
+        let path = path(service, account);
+        let dir = path.parent().expect("credentials folder");
+        std::fs::create_dir_all(dir).map_err(|_| "Cannot create the password folder.".to_string())?;
+        // Write and rename, so an interrupted save keeps the previous secret.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &sealed).map_err(|_| "Cannot save the password file.".to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|_| "Cannot save the password file.".to_string())
+    }
+
+    pub(super) fn delete(service: &str, account: &str) -> Result<(), String> {
+        match std::fs::remove_file(path(service, account)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("Cannot delete the saved password file.".into()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn secrets_round_trip_and_stay_bound_to_their_entry() {
+            let service = format!("dbeast-test-{}", uuid::Uuid::new_v4());
+            assert_eq!(super::read(&service, "a").unwrap(), None);
+            super::write(&service, "a", b"secret").unwrap();
+            assert_eq!(super::read(&service, "a").unwrap().as_deref(), Some(&b"secret"[..]));
+            std::fs::copy(super::path(&service, "a"), super::path(&service, "b")).unwrap();
+            assert!(super::read(&service, "b").is_err(), "entropy binds the file to its entry");
+            for account in ["a", "b"] {
+                super::delete(&service, account).unwrap();
+            }
+            assert_eq!(super::read(&service, "a").unwrap(), None);
+        }
     }
 }
 
