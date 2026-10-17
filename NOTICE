@@ -1,0 +1,49 @@
+DBeast
+Copyright 2026 Maciej Olszewski
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Bundled assets
+--------------
+
+- Inter (assets/fonts/Inter-*.ttf), Copyright The Inter Project Authors,
+  licensed under the SIL Open Font License 1.1 (assets/fonts/Inter-LICENSE.txt).
+- JetBrains Mono (assets/fonts/JetBrainsMono-Regular.ttf), Copyright The
+  JetBrains Mono Project Authors, licensed under the SIL Open Font License 1.1
+  (assets/fonts/JetBrainsMono-OFL.txt).
+- "Copper Byte" (assets/audio/copper-byte-loop.ogg), the About screen theme,
+  and the DBeast logo and icons (assets/branding/) are original works
+  distributed with DBeast under the Apache License, Version 2.0.
+- The egui default fonts embedded by epaint_default_fonts (Hack, Ubuntu-Light,
+  Noto Emoji and emoji-icon-font) are distributed under their own licenses:
+  MIT OR Apache-2.0, the SIL Open Font License 1.1 and the Ubuntu Font Licence 1.0.
+
+Color scheme
+------------
+
+The interface and SQL syntax colors defined in src/ui/theme.rs are taken
+from the dark theme of the IntelliJ Platform
+(https://github.com/JetBrains/intellij-community), Copyright JetBrains s.r.o.
+and contributors, licensed under the Apache License, Version 2.0. Only color
+values are used; DBeast contains no IntelliJ Platform source code, icons,
+images or theme files.
+
+IntelliJ and JetBrains are trademarks of JetBrains s.r.o. DBeast is an
+independent project and is not affiliated with, sponsored or endorsed by
+JetBrains s.r.o.
+
+Third-party software
+--------------------
+
+DBeast depends on open source Rust crates listed in Cargo.lock, each
+distributed under its own license. Nearly all use permissive licenses (MIT,
+Apache-2.0, BSD, ISC, Zlib, Unicode-3.0, BSL-1.0, CC0-1.0 and similar).
+The following dependencies use other licenses and are used unmodified:
+
+- option-ext (MPL-2.0), through directories. Source:
+  https://github.com/soc/option-ext
+- self_cell (Apache-2.0 OR GPL-2.0-only), used under Apache-2.0.
+- webpki-roots (CDLA-Permissive-2.0), the Mozilla root certificate bundle
+  used by ureq for map tile downloads.
+
+The bundled SQLite (through rusqlite) is in the public domain.

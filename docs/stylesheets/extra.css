@@ -1,0 +1,65 @@
+/* Match the DBeast app: dark panels, blue accent. */
+:root,
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #2b2d30;
+  --md-primary-fg-color--light: #393b40;
+  --md-primary-fg-color--dark: #1e1f22;
+  --md-primary-bg-color: #dfe1e5;
+  --md-primary-bg-color--light: #868a91;
+  --md-accent-fg-color: #3574f0;
+  --md-typeset-a-color: #2a63d4;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 220;
+  --md-default-bg-color: #1e1f22;
+  --md-primary-fg-color: #2b2d30;
+  --md-primary-fg-color--light: #393b40;
+  --md-primary-fg-color--dark: #1e1f22;
+  --md-primary-bg-color: #dfe1e5;
+  --md-primary-bg-color--light: #868a91;
+  --md-accent-fg-color: #6b9bff;
+  --md-typeset-a-color: #6b9bff;
+}
+
+.md-header,
+.md-tabs {
+  border-bottom: 1px solid #1e1f22;
+  box-shadow: none;
+}
+
+.md-typeset img {
+  border-radius: 8px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+}
+
+.md-typeset kbd {
+  font-family: var(--md-code-font-family);
+}
+
+/* Landing page hero. */
+.dbeast-hero {
+  text-align: center;
+  margin: 1rem 0 2rem;
+}
+
+.dbeast-hero img.dbeast-logo {
+  width: 96px;
+  box-shadow: none;
+}
+
+.dbeast-hero .tagline {
+  font-size: 1.15rem;
+  opacity: 0.85;
+}
+
+.md-typeset .md-button--primary {
+  background-color: #3574f0;
+  border-color: #3574f0;
+  color: #ffffff;
+}
+
+.md-typeset .md-button:not(.md-button--primary) {
+  color: var(--md-typeset-a-color);
+  border-color: currentColor;
+}

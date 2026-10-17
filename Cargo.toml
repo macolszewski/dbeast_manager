@@ -1,0 +1,68 @@
+[package]
+name = "dbeast"
+version = "0.1.0"
+edition = "2024"
+description = "Fast native database client"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8.9"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6.0"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "persistence"] }
+egui = "0.36"
+futures-util = "0.3"
+egui_extras = "0.36"
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "native-tls-tls"] }
+native-tls = "0.2"
+pem = "3"
+# Client certificates given as PEM files become an in-memory PKCS#12 identity,
+# the format both native TLS backends and the MySQL driver accept.
+p12-keystore = { version = "0.4", default-features = false, features = ["pbes1"] }
+libc = "0.2"
+postgres-native-tls = "0.5"
+rfd = "0.17"
+rand = "0.9.5"
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata", "hooks", "limits"] }
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+schemars = "1"
+sha2 = "0.10"
+subtle = "2"
+sqlparser = { version = "0.63", features = ["visitor"] }
+rust_decimal = { version = "1.43", features = ["db-tokio-postgres"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision", "preserve_order", "raw_value"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "macros", "time", "net", "io-util", "process"] }
+tokio-util = "0.7"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+uuid = { version = "1.28", features = ["v4", "serde"] }
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
+csv = "1"
+proj4rs = { version = "0.2", features = ["crs-definitions"] }
+ureq = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+earcut = "0.4.11"
+# About window theme: Ogg Vorbis playback only.
+rodio = { version = "=0.22.2", default-features = false, features = ["playback", "vorbis"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe", "snapshot", "wgpu"] }
+rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+# macOS draws through Metal (OpenGL covered the window buttons of the integrated
+# title bar); other systems keep OpenGL. Only the backend in use is compiled.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features"] }
+egui-wgpu = { version = "0.36", default-features = false, features = ["macos-window-resize-jitter-fix"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+
+# Passwords on Linux go to the Secret Service (GNOME Keyring, KWallet) over D-Bus.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11"] }
