@@ -371,7 +371,7 @@ impl PgConn {
         if rows.len() > MAX_COLUMNS {
             return Err(error(
                 "unsupported_safe_read",
-                "Tables with more than 64 columns are not supported.",
+                "Tables with more than 64 columns are not supported. The whole table is checked, including columns the query does not select.",
             ));
         }
         let mut columns = Vec::with_capacity(rows.len());
@@ -389,13 +389,13 @@ impl PgConn {
             if type_oid >= 16384 || row.get::<_, String>(7) != "b" {
                 return Err(error(
                     "unsupported_safe_read",
-                    "A column uses a domain, enum, composite, range or extension type, which read-only access does not support.",
+                    "A column of this table uses a domain, enum, composite, range or extension type, which read-only access does not support. The whole table is checked, including columns the query does not select.",
                 ));
             }
             if !row.get::<_, String>(3).is_empty() {
                 return Err(error(
                     "unsupported_safe_read",
-                    "Tables with generated columns are not supported.",
+                    "Tables with generated columns are not supported. The whole table is checked, including columns the query does not select.",
                 ));
             }
             let name: String = row.get(0);

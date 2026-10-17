@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - All documentation, comments and project files are in English.
+- MySQL and PostgreSQL strict reads give a separate reason for each refusal
+  (missing table, view, storage engine, partitioning, too many columns,
+  unsupported column type, generated column) and say that the whole table is
+  checked, including columns the query does not select.
 - In-app window title bars on macOS show the close button on the left.
 
 ### Security

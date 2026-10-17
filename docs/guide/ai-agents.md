@@ -110,10 +110,10 @@ A denied `query_sql` never upgrades to Full SQL automatically.
 
 The read-only check verifies the whole table, up to 64 columns.
 
-- **PostgreSQL** requires a primary server and the privilege to take a lock that stabilizes metadata during the read. It reads tables, materialized views and views. A view is accepted only if it uses built-in functions without side effects and every table beneath it passes the same check. CHECK constraints, expression and partial indexes, GIN indexes and `uuid`, `jsonb` and array columns are accepted as long as they use only built-in functions and types; typical Django tables pass. PostGIS columns and other extension types, enums, domains, row-level security, and indexes or CHECK constraints with user-defined functions are rejected.
-- **MySQL** requires InnoDB and existing `LOCK TABLES` and `PROCESS` privileges.
+- **PostgreSQL** requires a primary server and the privilege to take a lock that stabilizes metadata during the read, so a role with only `SELECT` on the table is refused. It reads tables, materialized views and views. A view is accepted only if it uses built-in functions without side effects and every table beneath it passes the same check. CHECK constraints, expression and partial indexes, GIN indexes and `uuid`, `jsonb` and array columns are accepted as long as they use only built-in functions and types; typical Django tables pass. PostGIS columns and other extension types, enums, domains, row-level security, and indexes or CHECK constraints with user-defined functions are rejected.
+- **MySQL** requires non-partitioned InnoDB tables without generated columns, the `LOCK TABLES` privilege and the global `PROCESS` privilege (needed to read the table identity from `information_schema.INNODB_TABLES`).
 
-A refusal gives a specific, safe reason in the response and in Activity. DBeast never changes the roles or privileges of the database user.
+The whole table is checked, including columns the query does not select. A refusal gives a specific, safe reason in the response and in Activity. DBeast never changes the roles or privileges of the database user.
 
 ### Execution and limits
 

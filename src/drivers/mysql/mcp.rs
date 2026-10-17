@@ -133,6 +133,27 @@ impl Drop for ManagedConn {
     }
 }
 
+/// Static reasons, one per cause, so the agent can tell why a strict read was
+/// refused without seeing anything it did not send.
+const MISSING_TABLE: &str = "Strict read could not find this table in the source database, or the account cannot see it.";
+const NOT_A_TABLE: &str = "Strict MySQL read supports physical tables only. Views and system views are not supported.";
+const NOT_INNODB: &str = "Strict MySQL read supports InnoDB tables only. This table uses another storage engine.";
+const PARTITIONED: &str = "Strict MySQL read does not support partitioned tables.";
+const TOO_MANY_COLUMNS: &str = "Strict read supports tables with at most 64 columns. The whole table is checked, including columns the query does not select.";
+const UNSUPPORTED_COLUMN_TYPE: &str = "Strict MySQL read does not support a column type in this table, for example spatial types such as POINT or GEOMETRY. The whole table is checked, including columns the query does not select.";
+const GENERATED_COLUMN: &str = "Strict MySQL read does not support tables with generated columns. The whole table is checked, including columns the query does not select.";
+
+/// Refusal for a row of `information_schema.TABLES` that is not a plain InnoDB table.
+fn table_kind_error(row: Option<(String, Option<String>)>) -> Option<crate::mcp::ExecutionError> {
+    let message = match row {
+        None => MISSING_TABLE,
+        Some((kind, _)) if kind != "BASE TABLE" => NOT_A_TABLE,
+        Some((_, engine)) if engine.as_deref() != Some("InnoDB") => NOT_INNODB,
+        Some(_) => return None,
+    };
+    Some(error("unsupported_safe_read", message))
+}
+
 pub(crate) const LIST_SQL: &str = "SELECT TABLE_SCHEMA,TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_TYPE='BASE TABLE' AND ENGINE='InnoDB' ORDER BY TABLE_NAME LIMIT 501";
 
 impl MyConn {
@@ -223,8 +244,8 @@ impl MyConn {
         // Avoid opening known unsupported objects. Post-lock validation below is
         // authoritative; the server/engine administrator is a trusted boundary.
         let row: Option<(String, Option<String>)> = self.conn.exec_first("SELECT TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", parameters).await.map_err(failed)?;
-        if !matches!(row, Some((kind,Some(engine))) if kind=="BASE TABLE" && engine=="InnoDB") {
-            return Err(unsupported());
+        if let Some(refusal) = table_kind_error(row) {
+            return Err(refusal);
         }
         // START TRANSACTION would release LOCK TABLES. The session READ ONLY +
         // autocommit=0 defaults apply to the transaction under this read lock.
@@ -232,21 +253,24 @@ impl MyConn {
             self.conn.query_drop(format!("LOCK TABLES {} READ",qualified(table,DriverKind::MySql))).await.map_err(|_| error("unsupported_safe_read", "Strict MySQL read requires LOCK TABLES and access to physical table identity metadata."))?;
         }
         let row: Option<(String,Option<String>)> = self.conn.exec_first("SELECT TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", parameters).await.map_err(failed)?;
-        if !matches!(row,Some((kind,Some(engine))) if kind=="BASE TABLE" && engine=="InnoDB") {
-            return Err(unsupported());
+        if let Some(refusal) = table_kind_error(row) {
+            return Err(refusal);
         }
         let partitions: Option<u64> = self.conn.exec_first("SELECT COUNT(*) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND PARTITION_NAME IS NOT NULL", parameters).await.map_err(failed)?;
         if partitions != Some(0) {
-            return Err(unsupported());
+            return Err(error("unsupported_safe_read", PARTITIONED));
         }
         // TABLE_ID survives rename and changes on replacement. CREATE_TIME and
         // SHOW CREATE alone cannot distinguish two equally defined tables.
         let innodb_name = format!("{}/{}", table.schema, table.name);
-        let physical: Option<u64> = self.conn.exec_first("SELECT TABLE_ID FROM information_schema.INNODB_TABLES WHERE NAME=?", (&innodb_name,)).await.map_err(|_| error("unsupported_safe_read", "Strict MySQL read requires PROCESS access to physical table identity metadata."))?;
-        let physical = physical.ok_or_else(unsupported)?;
+        let physical: Option<u64> = self.conn.exec_first("SELECT TABLE_ID FROM information_schema.INNODB_TABLES WHERE NAME=?", (&innodb_name,)).await.map_err(|_| error("unsupported_safe_read", "Strict MySQL read requires the global PROCESS privilege to read physical table identity metadata."))?;
+        let physical = physical.ok_or_else(|| error("unsupported_safe_read", "Strict MySQL read could not find the InnoDB identity of this table."))?;
         let rows: Vec<Row> = self.conn.exec("SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,EXTRA,GENERATION_EXPRESSION,ORDINAL_POSITION,COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION LIMIT 65", parameters).await.map_err(failed)?;
-        if rows.is_empty() || rows.len() > MAX_COLUMNS {
-            return Err(unsupported());
+        if rows.is_empty() {
+            return Err(error("unsupported_safe_read", MISSING_TABLE));
+        }
+        if rows.len() > MAX_COLUMNS {
+            return Err(error("unsupported_safe_read", TOO_MANY_COLUMNS));
         }
         let mut identity = format!("mysql:{innodb_name}:{physical}");
         let mut columns = Vec::with_capacity(rows.len());
@@ -290,11 +314,14 @@ impl MyConn {
                 "set",
             ]
             .contains(&kind.as_str())
-                || !generated.is_empty()
+            {
+                return Err(error("unsupported_safe_read", UNSUPPORTED_COLUMN_TYPE));
+            }
+            if !generated.is_empty()
                 || extra.contains("VIRTUAL GENERATED")
                 || extra.contains("STORED GENERATED")
             {
-                return Err(unsupported());
+                return Err(error("unsupported_safe_read", GENERATED_COLUMN));
             }
             identity.push_str(&format!(
                 ":{ordinal}:{name}:{type_name}:{extra}:{collation:?}"
@@ -334,12 +361,8 @@ impl MyConn {
             if !plan.mysql_locks.is_empty() {
                 for table in &plan.tables {
                     let kind:Option<(String,Option<String>)>=self.conn.exec_first("SELECT TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",(&table.schema,&table.name)).await.map_err(|failure|crate::mcp::executor::pinned_table_error(failed(failure),expected))?;
-                    if !matches!(kind,Some((kind,Some(engine))) if kind=="BASE TABLE" && engine=="InnoDB")
-                    {
-                        return Err(crate::mcp::executor::pinned_table_error(
-                            unsupported(),
-                            expected,
-                        ));
+                    if let Some(refusal) = table_kind_error(kind) {
+                        return Err(crate::mcp::executor::pinned_table_error(refusal, expected));
                     }
                 }
                 let locks = plan

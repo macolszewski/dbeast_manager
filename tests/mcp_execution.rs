@@ -371,6 +371,10 @@ async fn postgres_safe_reads_deny_executable_objects_and_preserve_identity() {
             .err()
             .unwrap();
         assert_eq!(error.code, "unsupported_safe_read", "{name}");
+        if name == "custom_type" {
+            // Only `id` is selected, but the refusal says the whole table counts.
+            assert!(error.message.contains("whole table"), "{}", error.message);
+        }
     }
     let output=execute(&source,read_sql(&source,&format!("WITH x AS (SELECT id,name FROM {schema}.items) SELECT lower(a.name),count(*) FROM x a JOIN {schema}.items b ON a.id=b.id GROUP BY a.name ORDER BY a.name")),first.table_identity.clone()).await.unwrap();
     assert_eq!(output.value["rows"][0], serde_json::json!(["alice", "1"]));
@@ -540,9 +544,45 @@ async fn mysql_safe_reads_verify_locks_identity_and_reject_generated_views() {
             "CREATE TABLE shop.{name}_generated(id int,g int GENERATED ALWAYS AS(id+1) STORED) ENGINE=InnoDB"
         ),
         format!("CREATE VIEW shop.{name}_view AS SELECT SLEEP(5) AS id"),
+        format!("CREATE TABLE shop.{name}_myisam(id int) ENGINE=MyISAM"),
+        format!(
+            "CREATE TABLE shop.{name}_part(id int) ENGINE=InnoDB PARTITION BY HASH(id) PARTITIONS 2"
+        ),
+        format!("CREATE TABLE shop.{name}_point(id int,p POINT) ENGINE=InnoDB"),
+        format!(
+            "CREATE TABLE shop.{name}_wide(id int,{}) ENGINE=InnoDB",
+            (1..=64).map(|i| format!("c{i} int")).collect::<Vec<_>>().join(",")
+        ),
     ] {
         sql(&mut connection, &statement).await;
     }
+    // Each cause has its own static reason that names nothing the agent did not send.
+    let mut reasons = Vec::new();
+    for (suffix, expected) in [
+        ("_generated", "generated columns"),
+        ("_view", "physical tables only"),
+        ("_myisam", "InnoDB tables only"),
+        ("_part", "partitioned"),
+        ("_point", "column type"),
+        ("_wide", "at most 64 columns"),
+        ("_missing", "could not find this table"),
+    ] {
+        let error = execute(
+            &source,
+            read(&source, "shop", &format!("{name}{suffix}"), &["id"]),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "unsupported_safe_read", "{suffix}");
+        assert!(error.message.contains(expected), "{suffix}: {}", error.message);
+        assert!(!error.message.contains(&name));
+        reasons.push(error.message);
+    }
+    reasons.sort();
+    reasons.dedup();
+    assert_eq!(reasons.len(), 7);
     let first = execute(&source, read(&source, "shop", &name, &["id", "name"]), None)
         .await
         .unwrap();
@@ -605,7 +645,9 @@ async fn mysql_safe_reads_verify_locks_identity_and_reject_generated_views() {
     );
     for statement in [
         format!("DROP VIEW shop.{name}_view"),
-        format!("DROP TABLE shop.{name},shop.{name}_generated"),
+        format!(
+            "DROP TABLE shop.{name},shop.{name}_generated,shop.{name}_myisam,shop.{name}_part,shop.{name}_point,shop.{name}_wide"
+        ),
     ] {
         sql(&mut connection, &statement).await;
     }
