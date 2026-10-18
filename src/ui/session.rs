@@ -537,7 +537,7 @@ impl App {
                     ServicesView::Result(i) => Some(i),
                     ServicesView::Output | ServicesView::Plan => None,
                 },
-                log: t.log[t.log.len().saturating_sub(LOG_LIMIT)..].to_vec(),
+                log: t.log.recent(LOG_LIMIT),
             })
             .collect();
         let active = self
@@ -611,7 +611,7 @@ impl App {
             tab.show_value_editor = saved.show_value_editor;
             tab.cursor = saved.cursor;
             tab.folds = saved.folds;
-            tab.log = saved.log;
+            tab.log = super::results::OutputLog::from_lines(saved.log);
             for r in saved.results {
                 let Ok(data) = serde_json::from_str::<QueryResult>(r.data.raw.get()) else {
                     continue;

@@ -2305,27 +2305,171 @@ pub struct LogLine {
     pub text: String,
 }
 
-pub fn output(ui: &mut Ui, log: &[LogLine]) {
+/// Messages a tab keeps; older ones are removed, with a note at the top.
+const LOG_ENTRIES: usize = 10_000;
+/// Text a tab's log keeps in total.
+const LOG_BYTES: usize = 8 << 20;
+/// Text kept of one message; the rest is replaced by a note.
+const LOG_ENTRY_BYTES: usize = 64 << 10;
+
+struct LogEntry {
+    line: LogLine,
+    /// "[time] " for Info and Error lines, formatted once.
+    stamp: String,
+    /// Display lines before this entry since the log was created.
+    top: u64,
+    rows: u32,
+}
+
+/// A tab's Output log, bounded by messages and bytes. Drawing lays out only
+/// the messages in view.
+#[derive(Default)]
+pub struct OutputLog {
+    entries: std::collections::VecDeque<LogEntry>,
+    bytes: usize,
+    removed: u64,
+    rows: u64,
+}
+
+impl OutputLog {
+    pub fn push(&mut self, mut line: LogLine) {
+        if line.text.len() > LOG_ENTRY_BYTES {
+            let mut end = LOG_ENTRY_BYTES;
+            while !line.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let rest = line.text.len() - end;
+            line.text.truncate(end);
+            line.text
+                .push_str(&format!("\n… {rest} more bytes of this message are not kept"));
+        }
+        let stamp = match line.kind {
+            LogKind::Sql => String::new(),
+            LogKind::Info | LogKind::Error => {
+                line.time.format("[%Y-%m-%d %H:%M:%S] ").to_string()
+            }
+        };
+        let rows = line.text.split('\n').count() as u32;
+        self.bytes += line.text.len();
+        self.entries.push_back(LogEntry {
+            line,
+            stamp,
+            top: self.rows,
+            rows,
+        });
+        self.rows += u64::from(rows);
+        while self.entries.len() > LOG_ENTRIES || self.bytes > LOG_BYTES {
+            let Some(entry) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= entry.line.text.len();
+            self.removed += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn last(&self) -> Option<&LogLine> {
+        self.entries.back().map(|entry| &entry.line)
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &LogLine> {
+        self.entries.iter().map(|entry| &entry.line)
+    }
+
+    /// The newest `count` messages, oldest first.
+    pub fn recent(&self, count: usize) -> Vec<LogLine> {
+        self.entries
+            .iter()
+            .skip(self.entries.len().saturating_sub(count))
+            .map(|entry| entry.line.clone())
+            .collect()
+    }
+
+    pub fn from_lines(lines: Vec<LogLine>) -> Self {
+        let mut log = Self::default();
+        for line in lines {
+            log.push(line);
+        }
+        log
+    }
+
+    /// Display lines from the first kept message to the end.
+    fn kept_rows(&self) -> u64 {
+        self.entries
+            .front()
+            .map_or(0, |first| self.rows - first.top)
+    }
+}
+
+pub fn output(ui: &mut Ui, log: &OutputLog) {
     if log.is_empty() {
         theme::empty_text(ui, "Nothing to show");
         return;
     }
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+    let notice = u64::from(log.removed > 0);
+    let base = log.entries.front().map_or(0, |first| first.top);
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
-        .show(ui, |ui| {
-            for line in log {
-                let ts = line.time.format("[%Y-%m-%d %H:%M:%S]").to_string();
-                let rt = match line.kind {
-                    LogKind::Sql => RichText::new(&line.text).color(theme::TEXT),
-                    LogKind::Info => {
-                        RichText::new(format!("{ts} {}", line.text)).color(theme::TEXT_MUTED)
-                    }
-                    LogKind::Error => {
-                        RichText::new(format!("{ts} {}", line.text)).color(theme::RED)
-                    }
+        .show_viewport(ui, |ui, viewport| {
+            let total = (notice + log.kept_rows()) as f32 * row_height;
+            ui.set_min_height(total);
+            let origin = ui.max_rect().min;
+            let place = |ui: &mut Ui, row: u64, label: egui::Label| {
+                let rect = egui::Rect::from_min_size(
+                    origin + egui::vec2(0.0, row as f32 * row_height),
+                    egui::vec2(ui.max_rect().width(), row_height),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(Layout::top_down(Align::Min)),
+                    |ui| ui.add(label.extend().selectable(true)),
+                );
+            };
+            if notice == 1 && viewport.min.y < row_height {
+                place(
+                    ui,
+                    0,
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{} earlier messages were removed. Output keeps the last {} messages, up to {} MiB.",
+                            log.removed,
+                            LOG_ENTRIES,
+                            LOG_BYTES >> 20
+                        ))
+                        .italics()
+                        .color(theme::TEXT_MUTED),
+                    ),
+                );
+            }
+            let first_row = ((viewport.min.y / row_height).floor().max(0.0) as u64)
+                .saturating_sub(notice);
+            let last_row = (viewport.max.y / row_height).ceil().max(0.0) as u64;
+            let start = log
+                .entries
+                .partition_point(|entry| entry.top - base + u64::from(entry.rows) <= first_row);
+            for entry in log.entries.range(start..) {
+                let row = notice + entry.top - base;
+                if row > last_row {
+                    break;
+                }
+                let line = &entry.line;
+                let color = match line.kind {
+                    LogKind::Sql => theme::TEXT,
+                    LogKind::Info => theme::TEXT_MUTED,
+                    LogKind::Error => theme::RED,
                 };
-                ui.add(egui::Label::new(rt.monospace()).selectable(true));
+                let mut job = egui::text::LayoutJob::default();
+                let format = egui::TextFormat::simple(font.clone(), color);
+                job.append(&entry.stamp, 0.0, format.clone());
+                job.append(&line.text, 0.0, format);
+                place(ui, row, egui::Label::new(job));
             }
         });
 }
@@ -2492,6 +2636,111 @@ mod tests {
                     toolbar: false,
                 },
             )
+    }
+
+    fn log_line(kind: LogKind, text: String) -> LogLine {
+        LogLine {
+            time: chrono::Local::now(),
+            kind,
+            text,
+        }
+    }
+
+    #[test]
+    fn output_log_keeps_bounded_messages_and_bytes() {
+        let mut log = OutputLog::default();
+        for i in 0..LOG_ENTRIES + 5 {
+            log.push(log_line(LogKind::Info, format!("message {i}")));
+        }
+        assert_eq!(log.entries.len(), LOG_ENTRIES);
+        assert_eq!(log.removed, 5);
+        assert_eq!(log.iter().next().unwrap().text, "message 5");
+        log.push(log_line(LogKind::Sql, format!("select '{}'", "ż".repeat(LOG_ENTRY_BYTES))));
+        let last = log.last().unwrap();
+        assert!(last.text.len() < LOG_ENTRY_BYTES + 100);
+        assert!(last.text.ends_with("bytes of this message are not kept"));
+        for _ in 0..200 {
+            log.push(log_line(LogKind::Sql, "x".repeat(LOG_ENTRY_BYTES)));
+        }
+        assert!(log.bytes <= LOG_BYTES);
+        assert_eq!(log.bytes, log.iter().map(|line| line.text.len()).sum::<usize>());
+        assert_eq!(log.recent(2).len(), 2);
+    }
+
+    #[test]
+    fn output_draws_only_visible_messages_and_follows_the_end() {
+        use egui_kittest::kittest::Queryable;
+        let mut log = OutputLog::default();
+        for i in 0..LOG_ENTRIES + 20 {
+            let text = if i % 3 == 0 {
+                format!("select {i}\nfrom t\nwhere x = {i}")
+            } else {
+                format!("message {i}")
+            };
+            log.push(log_line(if i % 3 == 0 { LogKind::Sql } else { LogKind::Info }, text));
+        }
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([600.0, 300.0])
+            .build_ui_state(|ui, log: &mut OutputLog| output(ui, log), log);
+        h.run_steps(4);
+        let last = format!("message {}", LOG_ENTRIES + 19);
+        assert!(h.query_by_label_contains(&last).is_some(), "sticks to the end");
+        let drawn = h.query_all_by_label_contains("message").count()
+            + h.query_all_by_label_contains("select").count();
+        assert!(drawn < 60, "{drawn} messages laid out");
+        assert!(h.query_by_label_contains("earlier messages were removed").is_none());
+        // The note about removed messages is the first row.
+        let mut short = OutputLog::default();
+        for i in 0..3 {
+            short.push(log_line(LogKind::Error, format!("failure {i}")));
+        }
+        short.removed = 20;
+        *h.state_mut() = short;
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("failure 0").is_some());
+        assert!(h.query_by_label_contains("20 earlier messages were removed").is_some());
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release --lib output_frame_cost -- --ignored --nocapture"]
+    fn output_frame_cost_benchmark() {
+        // The drawing loop before the log was bounded and virtualized.
+        fn old_output(ui: &mut Ui, log: &[LogLine]) {
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in log {
+                        let ts = line.time.format("[%Y-%m-%d %H:%M:%S]").to_string();
+                        let rt = match line.kind {
+                            LogKind::Sql => RichText::new(&line.text).color(theme::TEXT),
+                            _ => RichText::new(format!("{ts} {}", line.text)).color(theme::TEXT_MUTED),
+                        };
+                        ui.add(egui::Label::new(rt.monospace()).selectable(true));
+                    }
+                });
+        }
+        for count in [1_000, 10_000] {
+            let lines: Vec<LogLine> = (0..count)
+                .map(|i| log_line(if i % 3 == 0 { LogKind::Sql } else { LogKind::Info },
+                    if i % 3 == 0 { format!("select {i}\nfrom t\nwhere x = {i}") } else { format!("message {i}") }))
+                .collect();
+            let mut old = egui_kittest::Harness::builder()
+                .with_size([800.0, 400.0])
+                .build_ui_state(|ui, lines: &mut Vec<LogLine>| old_output(ui, lines), lines.clone());
+            let mut new = egui_kittest::Harness::builder()
+                .with_size([800.0, 400.0])
+                .build_ui_state(|ui, log: &mut OutputLog| output(ui, log), OutputLog::from_lines(lines));
+            let time = |step: &mut dyn FnMut()| {
+                for _ in 0..3 { step(); }
+                let start = std::time::Instant::now();
+                for _ in 0..10 { step(); }
+                start.elapsed() / 10
+            };
+            let before = time(&mut || old.step());
+            let after = time(&mut || new.step());
+            println!("{count} messages: before {before:?}/frame, after {after:?}/frame");
+        }
     }
 
     fn wide_harness(records: usize, columns: usize, transposed: bool) -> egui_kittest::Harness<'static, GridHarness> {

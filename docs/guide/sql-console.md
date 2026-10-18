@@ -180,6 +180,8 @@ my-source> select * from shop.missing
 Position: 15
 ```
 
+The log keeps the last 10,000 messages of a console, up to 8 MiB of text; a note at the top says how many earlier messages were removed. Of a single message, such as a very long statement, the first 64 KiB are kept. Long lines do not wrap: scroll sideways to read them. The last 500 messages are saved with the work session.
+
 - Each statement is prefixed with the data source name.
 - Each outcome has a timestamp: rows retrieved with the starting row and duration, rows affected, or `completed in … ms`.
 - Errors are shown in red with the SQLSTATE code and, when the server reports it, the position in the statement.
