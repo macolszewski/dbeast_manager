@@ -114,25 +114,7 @@ impl MyConn {
         mut result: mysql_async::QueryResult<'_, '_, P>,
         page: Page,
     ) -> Result<QueryResult> {
-        let origins = result
-            .columns_ref()
-            .iter()
-            .map(|column| {
-                let schema = std::str::from_utf8(column.schema_ref()).ok()?;
-                let table = std::str::from_utf8(column.org_table_ref()).ok()?;
-                let name = std::str::from_utf8(column.org_name_ref()).ok()?;
-                if schema.is_empty() || table.is_empty() || name.is_empty() {
-                    return None;
-                }
-                Some(ColumnOrigin {
-                    table: OriginTable::Named {
-                        schema: schema.into(),
-                        table: table.into(),
-                    },
-                    column: OriginColumn::Named(name.into()),
-                })
-            })
-            .collect();
+        let origins = column_origins(result.columns_ref());
         // Text protocol FLOAT rendering does not guarantee its full binary precision.
         let exact_columns = result
             .columns_ref()
@@ -271,6 +253,7 @@ impl MyConn {
             .iter()
             .map(|c| (c.column_type(), c.character_set() == 63, c.decimals()))
             .collect();
+        tx.send(super::RowBatch::Origins(column_origins(result.columns_ref()))).await.map_err(|_| super::stopped())?;
         tx.send(super::RowBatch::Columns(columns)).await.map_err(|_| super::stopped())?;
         let mut batch = Vec::with_capacity(super::STREAM_BATCH);
         let mut total = 0u64;
@@ -961,6 +944,27 @@ fn is_binary(t: ColumnType, binary_charset: bool) -> bool {
 
 /// The text protocol returns most values as bytes; the column type decides
 /// how to present them.
+fn column_origins(columns: &[mysql_async::Column]) -> Vec<Option<ColumnOrigin>> {
+    columns
+        .iter()
+        .map(|column| {
+            let schema = std::str::from_utf8(column.schema_ref()).ok()?;
+            let table = std::str::from_utf8(column.org_table_ref()).ok()?;
+            let name = std::str::from_utf8(column.org_name_ref()).ok()?;
+            if schema.is_empty() || table.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some(ColumnOrigin {
+                table: OriginTable::Named {
+                    schema: schema.into(),
+                    table: table.into(),
+                },
+                column: OriginColumn::Named(name.into()),
+            })
+        })
+        .collect()
+}
+
 fn row_values(row: Row, types: &[(ColumnType, bool, u8)]) -> Vec<Value> {
     row.unwrap()
         .into_iter()

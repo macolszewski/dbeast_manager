@@ -203,7 +203,7 @@ impl Backend {
                     items,
                     ..Progress::default()
                 };
-                let (rows, bytes) = export_item(conn, item, job.options.clone(), &sender, &token, base).await?;
+                let (rows, bytes) = export_item(conn, item, job.options.clone(), &sender, &token, base, None).await?;
                 total_rows += rows;
                 total_bytes += bytes;
             }
@@ -224,13 +224,19 @@ impl Backend {
     }
 }
 
-async fn export_item(
+/// Checks the physical column origins of a streamed read before any row is
+/// written; an error stops the export and leaves the target file untouched.
+pub(super) type OriginCheck =
+    Box<dyn FnOnce(&[Option<crate::model::ColumnOrigin>]) -> anyhow::Result<()> + Send>;
+
+pub(super) async fn export_item(
     conn: &mut Connection,
     item: ExportItem,
     options: ExportOptions,
     sender: &TaskSender,
     token: &CancellationToken,
     base: Progress,
+    mut check: Option<OriginCheck>,
 ) -> anyhow::Result<(u64, u64)> {
     let rows = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
@@ -251,7 +257,15 @@ async fn export_item(
             let mut writer = Writer::new(out, options, driver, table);
             while let Some(batch) = rx.blocking_recv() {
                 match batch {
-                    RowBatch::Columns(columns) => writer.begin(&columns)?,
+                    RowBatch::Origins(origins) => {
+                        if let Some(check) = check.take() {
+                            check(&origins)?;
+                        }
+                    }
+                    RowBatch::Columns(columns) => {
+                        anyhow::ensure!(check.is_none(), "The query did not report column origins.");
+                        writer.begin(&columns)?
+                    }
                     RowBatch::Rows(batch) => {
                         writer.rows(&batch)?;
                         rows.fetch_add(batch.len() as u64, Ordering::Relaxed);

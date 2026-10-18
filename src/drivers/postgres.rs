@@ -287,16 +287,7 @@ impl PgConn {
         context: Option<ResolvedContext>,
         stop_early: bool,
     ) -> Result<QueryResult> {
-        let origins = stmt
-            .columns()
-            .iter()
-            .map(|column| {
-                Some(ColumnOrigin {
-                    table: OriginTable::Postgres(column.table_oid()?),
-                    column: OriginColumn::Postgres(column.column_id()?),
-                })
-            })
-            .collect();
+        let origins = column_origins(stmt);
         let mut exact_columns = vec![true; stmt.columns().len()];
         let columns = stmt
             .columns()
@@ -387,6 +378,7 @@ impl PgConn {
                 type_name: c.type_().name().to_string(),
             })
             .collect();
+        tx.send(super::RowBatch::Origins(column_origins(&statement))).await.map_err(|_| super::stopped())?;
         tx.send(super::RowBatch::Columns(columns)).await.map_err(|_| super::stopped())?;
         let inputs: Vec<_> = query.params.iter().map(PgInput).collect();
         let stream = self
@@ -1216,6 +1208,19 @@ async fn finish_stream(
 
 /// Converts one row; `lossy` receives the first column whose value is a
 /// placeholder instead of the server's value.
+fn column_origins(statement: &Statement) -> Vec<Option<ColumnOrigin>> {
+    statement
+        .columns()
+        .iter()
+        .map(|column| {
+            Some(ColumnOrigin {
+                table: OriginTable::Postgres(column.table_oid()?),
+                column: OriginColumn::Postgres(column.column_id()?),
+            })
+        })
+        .collect()
+}
+
 fn row_values(row: &Row, exact_columns: &mut [bool], lossy: &mut Option<usize>) -> Vec<Value> {
     (0..row.len())
         .map(|i| match row.try_get::<_, PgValue>(i) {

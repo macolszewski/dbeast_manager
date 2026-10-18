@@ -22,8 +22,11 @@ pub async fn open_tunnel(ds: &DataSource) -> Result<std::sync::Arc<Tunnel>> {
     tunnel::open(ds).await.context("SSH tunnel")
 }
 
-/// Rows read by [`Connection::stream_rows`]: the columns once, then batches.
+/// Rows read by [`Connection::stream_rows`]: the column origins and columns
+/// once, then batches.
 pub enum RowBatch {
+    /// Physical origin of each column, sent before [`RowBatch::Columns`].
+    Origins(Vec<Option<crate::model::ColumnOrigin>>),
     Columns(Vec<crate::model::Column>),
     Rows(Vec<Vec<crate::model::Value>>),
 }

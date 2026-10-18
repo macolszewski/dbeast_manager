@@ -122,51 +122,30 @@ impl Backend {
         path: PathBuf,
     ) {
         self.spawn_task(task, move |sender, token| async move {
-            let work = async {
+            let setup = async {
                 validate_source(&ds, &query)?;
-                let bound =
-                    crate::sqlgen::related_query(ds.driver, &query).map_err(anyhow::Error::msg)?;
+                let bound = crate::sqlgen::related_query(ds.driver, &query).map_err(anyhow::Error::msg)?;
                 let mut conn = Connection::open(&ds).await?;
                 conn.apply_resolved_context(&query.context).await?;
                 validate_relation(&mut conn, &query).await?;
-                // Related results are validated as a whole before anything is written.
-                let data = conn
-                    .execute_bound_query(&bound, Page::ALL, Some(&query.context))
-                    .await?;
-                validate_output(&data, &query)?;
-                let rows = data.rows.len() as u64;
-                let driver = ds.driver;
-                let target = super::transfer::partial_path(&path);
-                let (partial, final_path) = (target.clone(), path.clone());
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&target)?);
-                    let mut writer = crate::export::Writer::new(file, options, driver, table);
-                    writer.begin(&data.columns)?;
-                    writer.rows(&data.rows)?;
-                    writer.finish()?;
-                    Ok(())
-                })
-                .await?
-                .and_then(|()| Ok(std::fs::rename(&partial, &final_path)?))
-                .inspect_err(|_| {
-                    let _ = std::fs::remove_file(&partial);
-                })?;
-                anyhow::Ok(rows)
+                anyhow::ensure!(
+                    conn.resolved_context().await? == query.context,
+                    "The related query's database context has changed. Reopen Related Rows from its source."
+                );
+                anyhow::Ok((conn, bound))
             };
-            let rows = tokio::select! {
-                result = work => result,
-                () = token.cancelled() => Err(crate::drivers::stopped()),
+            let (mut conn, bound) = tokio::select! {
+                result = setup => result?,
+                () = token.cancelled() => return Err(crate::drivers::stopped()),
             };
-            match rows {
-                Ok(rows) => {
-                    sender.log(format!("{} written to {}", super::rows_text(rows), path.display()));
-                    Ok(format!("{} exported to {}", super::rows_text(rows), path.display()))
-                }
-                Err(error) => {
-                    let _ = std::fs::remove_file(super::transfer::partial_path(&path));
-                    Err(error)
-                }
-            }
+            let item = super::transfer::ExportItem { ds, query: bound, context: None, table, path: path.clone() };
+            // Rows stream to disk in bounded batches; the origins of the query
+            // that actually runs are checked before the first row is written.
+            // export_item handles Stop itself and removes its partial file.
+            let check: super::transfer::OriginCheck = Box::new(move |origins| validate_origins(origins, &query));
+            let base = super::transfer::Progress { items: 1, ..Default::default() };
+            let (rows, _) = super::transfer::export_item(&mut conn, item, options, &sender, &token, base, Some(check)).await?;
+            Ok(format!("{} exported to {}", super::rows_text(rows), path.display()))
         });
     }
 }
@@ -250,19 +229,28 @@ async fn validate_relation(
 }
 
 fn validate_output(data: &QueryResult, query: &CapturedRelatedQuery) -> anyhow::Result<()> {
-    let table = match query.direction {
-        RelatedDirection::Referenced => &query.relation.target,
-        RelatedDirection::Referencing => &query.relation.source,
-    };
     let source = data
         .source
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Related Rows did not return physical column origins."))?;
     anyhow::ensure!(
-        source.columns.len() == data.columns.len()
-            && !source.columns.is_empty()
-            && source
-                .columns
+        source.columns.len() == data.columns.len(),
+        "The related query resolved to another physical table. Reopen Related Rows from its source."
+    );
+    validate_origins(&source.columns, query)
+}
+
+fn validate_origins(
+    origins: &[Option<crate::model::ColumnOrigin>],
+    query: &CapturedRelatedQuery,
+) -> anyhow::Result<()> {
+    let table = match query.direction {
+        RelatedDirection::Referenced => &query.relation.target,
+        RelatedDirection::Referencing => &query.relation.source,
+    };
+    anyhow::ensure!(
+        !origins.is_empty()
+            && origins
                 .iter()
                 .all(
                     |column| column.as_ref().is_some_and(|column| match &column.table {
@@ -276,4 +264,26 @@ fn validate_output(data: &QueryResult, query: &CapturedRelatedQuery) -> anyhow::
         "The related query resolved to another physical table. Reopen Related Rows from its source."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColumnOrigin, OriginColumn};
+
+    #[test]
+    fn streamed_exports_check_every_column_origin() {
+        let (data, relation, identity, context) = crate::related::tests::fixture();
+        let query = crate::related::capture(&data, 0, &relation, RelatedDirection::Referenced, identity, context).unwrap();
+        let origin = |table: &str| {
+            Some(ColumnOrigin {
+                table: OriginTable::Named { schema: "main".into(), table: table.into() },
+                column: OriginColumn::Named("id".into()),
+            })
+        };
+        assert!(validate_origins(&[origin("accounts"), origin("accounts")], &query).is_ok());
+        for origins in [vec![], vec![origin("accounts"), None], vec![origin("accounts"), origin("invoices")]] {
+            assert!(validate_origins(&origins, &query).is_err(), "{origins:?}");
+        }
+    }
 }

@@ -1405,3 +1405,137 @@ fn related_paging_cost() {
         drop_paging_tables(&runtime, &ds, &tables);
     }
 }
+
+fn export_outcome(backend: &Backend, task: u64) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Event::Task { id, event: dbeast::backend::TaskEvent::Finished(result) } = receive(backend, deadline)
+            && id == task
+        {
+            return result;
+        }
+    }
+}
+
+fn export(backend: &Backend, task: u64, ds: &DataSource, captured: &CapturedRelatedQuery, path: &std::path::Path) {
+    backend.export_related(
+        task,
+        ds.clone(),
+        Arc::new(captured.clone()),
+        ExportOptions::default(),
+        TableName::new("children"),
+        path.to_path_buf(),
+    );
+}
+
+fn children_capture(backend: &Backend, ds: &DataSource, parent: &str) -> CapturedRelatedQuery {
+    let parents = query(backend, SOURCE, ds, &format!("SELECT id FROM {parent} ORDER BY id"));
+    let keys = metadata(backend, metadata_request(ds, &parents, RelatedDirection::Referencing)).unwrap();
+    capture(ds, &parents, 0, &keys.keys[0], RelatedDirection::Referencing)
+}
+
+/// Exports more rows than one stream batch, keeps the previous file when the
+/// export fails or stops, and never leaves a partial file behind.
+fn exercise_related_export(ds: DataSource) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let backend = Backend::new(egui::Context::default());
+    let tables = create_paging_tables(&runtime, &ds, 2500);
+    let dir = std::env::temp_dir().join(format!("dbeast_related_export_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let captured = children_capture(&backend, &ds, &tables.parent);
+        let target = dir.join("children.csv");
+        export(&backend, 71, &ds, &captured, &target);
+        assert_eq!(export_outcome(&backend, 71).unwrap(), format!("2500 rows exported to {}", target.display()));
+        let csv = std::fs::read_to_string(&target).unwrap();
+        let mut ids: Vec<i64> = csv.lines().skip(1).map(|line| line.split(',').next().unwrap().parse().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, (1..=2500).collect::<Vec<_>>(), "every related row is written once");
+
+        std::fs::write(&target, "previous export\n").unwrap();
+        // Stop before the first row: the previous file stays.
+        export(&backend, 72, &ds, &captured, &target);
+        backend.stop_task(72);
+        assert_eq!(export_outcome(&backend, 72).unwrap_err(), "Stopped");
+        // A write error: the target is a directory that cannot be replaced.
+        let blocked = dir.join("blocked.csv");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), "x").unwrap();
+        export(&backend, 73, &ds, &captured, &blocked);
+        assert!(export_outcome(&backend, 73).is_err());
+        assert!(blocked.join("keep").exists());
+        // The relation now resolves to another physical table.
+        let mut moved = captured.clone();
+        moved.relation.source.name.push_str("_gone");
+        export(&backend, 74, &ds, &moved, &target);
+        assert!(export_outcome(&backend, 74).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "previous export\n");
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["blocked.csv", "children.csv"], "no partial files are left");
+    }));
+    drop(backend);
+    drop_paging_tables(&runtime, &ds, &tables);
+    std::fs::remove_dir_all(&dir).ok();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn sqlite_related_export_streams_and_keeps_previous_files() {
+    let local = LocalDatabase::new();
+    exercise_related_export(local.source.clone());
+}
+
+#[test]
+fn postgres_related_export_streams_and_keeps_previous_files() {
+    if let Some(ds) = server(DriverKind::Postgres) {
+        exercise_related_export(ds);
+    }
+}
+
+#[test]
+fn mysql_related_export_streams_and_keeps_previous_files() {
+    if let Some(ds) = server(DriverKind::MySql) {
+        exercise_related_export(ds);
+    }
+}
+
+/// A value DBeast cannot read exactly after the first stream batch fails the
+/// export and the rows already written never replace the previous file.
+#[test]
+fn postgres_related_export_error_after_batches_keeps_previous_file() {
+    let Some(ds) = server(DriverKind::Postgres) else { return };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
+    let (parent, child) = (format!("rel_exp_{suffix}_parent"), format!("rel_exp_{suffix}_child"));
+    runtime.block_on(async {
+        let mut conn = Connection::open(&ds).await.unwrap();
+        for sql in [
+            format!("CREATE TABLE {parent}(id INTEGER PRIMARY KEY)"),
+            format!("CREATE TABLE {child}(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {parent}(id), price money)"),
+            format!("INSERT INTO {parent} VALUES (1)"),
+            format!("INSERT INTO {child} SELECT n, 1, CASE WHEN n = 1500 THEN 2.5::money END FROM generate_series(1, 2000) n"),
+        ] {
+            conn.execute(&sql, Page::ALL).await.unwrap();
+        }
+    });
+    let backend = Backend::new(egui::Context::default());
+    let dir = std::env::temp_dir().join(format!("dbeast_related_export_{suffix}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("children.csv");
+    std::fs::write(&target, "previous export\n").unwrap();
+    let captured = children_capture(&backend, &ds, &parent);
+    export(&backend, 75, &ds, &captured, &target);
+    let error = export_outcome(&backend, 75).unwrap_err();
+    drop(backend);
+    runtime.block_on(async {
+        let mut conn = Connection::open(&ds).await.unwrap();
+        conn.execute(&format!("DROP TABLE {child}, {parent}"), Page::ALL).await.unwrap();
+    });
+    assert!(error.contains("\"price\""), "{error}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "previous export\n");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no partial file is left");
+    std::fs::remove_dir_all(&dir).ok();
+}

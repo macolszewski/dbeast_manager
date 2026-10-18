@@ -91,19 +91,7 @@ impl LiteConn {
                     type_name: c.decl_type().unwrap_or("").to_lowercase(),
                 })
                 .collect();
-            let origins = stmt
-                .columns_with_metadata()
-                .iter()
-                .map(|column| {
-                    Some(ColumnOrigin {
-                        table: OriginTable::Named {
-                            schema: column.database_name()?.to_string(),
-                            table: column.table_name()?.to_string(),
-                        },
-                        column: OriginColumn::Named(column.origin_name()?.to_string()),
-                    })
-                })
-                .collect();
+            let origins = column_origins(&stmt);
             let n = columns.len();
             let mut exact_columns = vec![true; n];
             let mut rows = Vec::new();
@@ -183,6 +171,7 @@ impl LiteConn {
                 })
                 .collect();
             let n = columns.len();
+            tx.blocking_send(super::RowBatch::Origins(column_origins(&stmt))).map_err(|_| super::stopped())?;
             tx.blocking_send(super::RowBatch::Columns(columns)).map_err(|_| super::stopped())?;
             let mut cursor = stmt.query(rusqlite::params_from_iter(&params))?;
             let mut batch = Vec::with_capacity(super::STREAM_BATCH);
@@ -634,6 +623,21 @@ fn related_metadata(
         table: physical(selected),
         keys,
     })
+}
+
+fn column_origins(stmt: &rusqlite::Statement<'_>) -> Vec<Option<ColumnOrigin>> {
+    stmt.columns_with_metadata()
+        .iter()
+        .map(|column| {
+            Some(ColumnOrigin {
+                table: OriginTable::Named {
+                    schema: column.database_name()?.to_string(),
+                    table: column.table_name()?.to_string(),
+                },
+                column: OriginColumn::Named(column.origin_name()?.to_string()),
+            })
+        })
+        .collect()
 }
 
 fn value(v: ValueRef<'_>) -> Value {
