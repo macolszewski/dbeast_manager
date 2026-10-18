@@ -146,13 +146,8 @@ pub struct GeoState {
     pub column: usize,
     srid_text: String,
     view: super::map::MapView,
-    /// Column and SRID override the prepared layer was built for.
-    prepared: Option<(
-        usize,
-        Option<u32>,
-        crate::geo::Layer,
-        Vec<super::map::MapFeature>,
-    )>,
+    /// Layer of the chosen column and SRID override, prepared off the UI thread when large.
+    layer: super::map::LayerLoader,
     fit: bool,
 }
 
@@ -162,7 +157,7 @@ impl GeoState {
             column,
             srid_text: String::new(),
             view: super::map::MapView::default(),
-            prepared: None,
+            layer: Default::default(),
             fit: true,
         }
     }
@@ -246,7 +241,7 @@ impl ResultSet {
     /// Keeps the viewer open with the same column and position when a page reloads.
     pub fn take_geo_from(&mut self, old: &mut ResultSet) {
         if let Some(mut g) = old.geo.take() {
-            g.prepared = None;
+            g.layer.reset();
             g.fit = false;
             self.geo = Some(g);
         }
@@ -2106,17 +2101,15 @@ fn geo_view(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) 
         state.column = columns.first().copied().unwrap_or(0);
     }
     let srid_override = state.srid_text.trim().parse::<u32>().ok();
-    let stale = state
-        .prepared
-        .as_ref()
-        .is_none_or(|p| (p.0, p.1) != (state.column, srid_override));
-    if stale {
-        let layer = crate::geo::build_layer(&rs.data.rows, state.column, srid_override);
-        let features = super::map::prepare(&layer);
-        state.prepared = Some((state.column, srid_override, layer, features));
-        state.fit = true;
-    }
-    let (_, _, layer, features) = state.prepared.as_ref().unwrap();
+    let (prepared, fresh) = state
+        .layer
+        .get(&rs.data, (state.column, srid_override), ui.ctx());
+    state.fit |= fresh;
+    let empty = super::map::MapLayer::default();
+    let (layer, features) = match prepared {
+        Some(p) => (Some(&p.info), &p.map),
+        None => (None, &empty),
+    };
 
     let mut fit = std::mem::take(&mut state.fit);
     ui.horizontal(|ui| {
@@ -2135,7 +2128,7 @@ fn geo_view(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) 
         ui.separator();
         ui.label(super::map::muted("SRID:"));
         let hint = layer
-            .srid
+            .and_then(|l| l.srid)
             .map_or_else(|| "?".to_string(), |s| s.to_string());
         ui.add(
             egui::TextEdit::singleline(&mut state.srid_text)
@@ -2148,10 +2141,17 @@ fn geo_view(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) 
         let source = if srid_override.is_some() {
             "set manually"
         } else {
-            layer.srid_source
+            layer.map_or("", |l| l.srid_source)
         };
-        ui.label(super::map::muted(format!("({source})")));
+        if !source.is_empty() {
+            ui.label(super::map::muted(format!("({source})")));
+        }
         ui.separator();
+        let Some(layer) = layer else {
+            ui.spinner();
+            ui.label(super::map::muted("Preparing geometries…"));
+            return;
+        };
         let objects = if features.len() == 1 {
             "1 object".to_string()
         } else {

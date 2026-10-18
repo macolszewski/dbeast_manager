@@ -38,21 +38,20 @@ impl Geometry {
             })
     }
 
-    fn map(&self, f: &mut dyn FnMut(Xy) -> Option<Xy>) -> Option<Vec<Shape>> {
-        fn ring(r: &[Xy], f: &mut dyn FnMut(Xy) -> Option<Xy>) -> Option<Vec<Xy>> {
-            r.iter().map(|&p| f(p)).collect()
-        }
-        let mut out = Vec::with_capacity(self.shapes.len());
-        for s in &self.shapes {
-            out.push(match s {
-                Shape::Point(p) => Shape::Point(f(*p)?),
-                Shape::Line(l) => Shape::Line(ring(l, f)?),
-                Shape::Polygon(rs) => {
-                    Shape::Polygon(rs.iter().map(|r| ring(r, f)).collect::<Option<_>>()?)
-                }
-            });
-        }
-        Some(out)
+    /// Transforms every coordinate in place; false when one cannot be transformed.
+    fn project(&mut self, f: &mut dyn FnMut(Xy) -> Option<Xy>) -> bool {
+        let mut apply = |p: &mut Xy| match f(*p) {
+            Some(q) => {
+                *p = q;
+                true
+            }
+            None => false,
+        };
+        self.shapes.iter_mut().all(|s| match s {
+            Shape::Point(p) => apply(p),
+            Shape::Line(l) => l.iter_mut().all(&mut apply),
+            Shape::Polygon(rs) => rs.iter_mut().flatten().all(&mut apply),
+        })
     }
 }
 
@@ -585,15 +584,30 @@ pub struct Layer {
 
 /// Decodes and reprojects one column. `srid_override` wins over the data.
 pub fn build_layer(rows: &[Vec<Value>], column: usize, srid_override: Option<u32>) -> Layer {
-    let parsed: Vec<(usize, Geometry)> = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| {
-            parse_value(r.get(column)?)
-                .filter(|g| !g.shapes.is_empty())
-                .map(|g| (i, g))
-        })
-        .collect();
+    build_layer_cancellable(rows, column, srid_override, &|| false)
+        .expect("never cancelled")
+}
+
+/// [`build_layer`] that stops with `None` once `cancelled` returns true.
+pub fn build_layer_cancellable(
+    rows: &[Vec<Value>],
+    column: usize,
+    srid_override: Option<u32>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Layer> {
+    let mut parsed: Vec<(usize, Geometry)> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if cancelled() {
+            return None;
+        }
+        if let Some(g) = r
+            .get(column)
+            .and_then(parse_value)
+            .filter(|g| !g.shapes.is_empty())
+        {
+            parsed.push((i, g));
+        }
+    }
     let mut layer = Layer {
         skipped: rows.len() - parsed.len(),
         ..Default::default()
@@ -611,10 +625,14 @@ pub fn build_layer(rows: &[Vec<Value>], column: usize, srid_override: Option<u32
             "coordinates are not longitude/latitude and the data has no SRID; enter the SRID"
                 .into(),
         );
-        return layer;
+        return Some(layer);
     };
     let mut projectors: HashMap<u32, Result<Projector, String>> = HashMap::new();
-    for (row, g) in parsed {
+    layer.features.reserve(parsed.len());
+    for (row, mut g) in parsed {
+        if cancelled() {
+            return None;
+        }
         // A row may carry its own SRID; the override applies to all rows.
         let row_srid = if srid_override.is_some() {
             srid
@@ -632,12 +650,17 @@ pub fn build_layer(rows: &[Vec<Value>], column: usize, srid_override: Option<u32
                 continue;
             }
         };
-        match g.map(&mut |xy| p.to_wgs84(xy)) {
-            Some(shapes) => layer.features.push(Feature { row, shapes }),
-            None => layer.skipped += 1,
+        // Reprojected in place, so the decoded coordinates are not held twice.
+        if g.project(&mut |xy| p.to_wgs84(xy)) {
+            layer.features.push(Feature {
+                row,
+                shapes: g.shapes,
+            });
+        } else {
+            layer.skipped += 1;
         }
     }
-    layer
+    Some(layer)
 }
 
 #[cfg(test)]
