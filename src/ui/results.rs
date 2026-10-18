@@ -2032,10 +2032,10 @@ fn geo_view(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) 
                     let value = if c == geo_column {
                         format!("<{}>", col.type_name)
                     } else {
-                        data.rows[row][c].to_cell()
+                        data.rows[row][c].cell_preview(60)
                     };
                     ui.label(super::map::muted(&col.name));
-                    ui.label(RichText::new(value.chars().take(60).collect::<String>()).monospace());
+                    ui.label(RichText::new(value).monospace());
                     ui.end_row();
                 }
             });
@@ -2076,20 +2076,28 @@ fn header_cell_bg(ui: &Ui) {
     );
 }
 
+/// More characters than the widest grid column can show; the label still
+/// truncates to the column width.
+const CELL_PREVIEW_CHARS: usize = 1024;
+
 fn cell(ui: &mut Ui, shown: Shown<'_>, deleted: bool, selected: bool) {
     let mut text = match shown {
         Shown::Value(v) => match v {
             Value::Null => RichText::new("<null>").italics().color(theme::TEXT_MUTED),
             Value::Bool(_) => RichText::new(v.to_cell()).color(theme::SQL_KEYWORD),
             Value::Bytes(_) => RichText::new(v.to_cell()).color(theme::TEXT_MUTED),
-            _ if v.is_numeric() => RichText::new(v.to_cell()).color(theme::SQL_NUMBER),
-            _ => RichText::new(v.to_cell()).color(theme::TEXT),
+            _ if v.is_numeric() => {
+                RichText::new(v.cell_preview(CELL_PREVIEW_CHARS)).color(theme::SQL_NUMBER)
+            }
+            _ => RichText::new(v.cell_preview(CELL_PREVIEW_CHARS)).color(theme::TEXT),
         },
         Shown::Edit(CellEdit::Null) => RichText::new("<null>").italics().color(theme::TEXT_MUTED),
         Shown::Edit(CellEdit::Default) => RichText::new("<default>")
             .italics()
             .color(theme::TEXT_MUTED),
-        Shown::Edit(CellEdit::Text(s)) => RichText::new(s.replace('\n', "↵")).color(theme::TEXT),
+        Shown::Edit(CellEdit::Text(s)) => {
+            RichText::new(crate::model::cell_preview(s, CELL_PREVIEW_CHARS)).color(theme::TEXT)
+        }
     };
     if selected {
         text = text.color(theme::TEXT);

@@ -382,6 +382,31 @@ impl Value {
             other => other.to_string(),
         }
     }
+
+    /// `to_cell` cut to at most `max_chars` characters before any copy is made,
+    /// so drawing a multi-megabyte cell costs the same as drawing a short one.
+    pub fn cell_preview(&self, max_chars: usize) -> String {
+        match self {
+            Value::Text(s) | Value::Decimal(s) => cell_preview(s, max_chars),
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Bytes(_) => {
+                cell_preview(&self.to_cell(), max_chars)
+            }
+        }
+    }
+}
+
+/// Single-line prefix of `text` with at most `max_chars` characters; newlines
+/// become "↵" and a cut is marked with "…".
+pub fn cell_preview(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_chars.saturating_mul(4)) + 3);
+    let mut chars = text.chars();
+    for c in chars.by_ref().take(max_chars) {
+        out.push(if c == '\n' { '↵' } else { c });
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
 }
 
 impl fmt::Display for Value {
@@ -815,5 +840,32 @@ mod identity_tests {
         }
         source.driver = DriverKind::Sqlite;
         assert!(source.identity().ssh.is_none());
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn cell_preview_cuts_on_char_boundaries_before_copying() {
+        assert_eq!(cell_preview("a\nb", 10), "a↵b");
+        assert_eq!(cell_preview("Łódź\nżółw", 6), "Łódź↵ż…");
+        assert_eq!(cell_preview("😀😀😀", 2), "😀😀…");
+        assert_eq!(cell_preview("", 4), "");
+        let decimal = Value::Decimal(format!("1.{}", "0".repeat(5000)));
+        assert_eq!(decimal.cell_preview(8), "1.000000…");
+        assert_eq!(Value::Int(42).cell_preview(8), "42");
+        let bytes = Value::Bytes(vec![0xAB; 100]);
+        assert_eq!(bytes.cell_preview(1024), bytes.to_cell());
+    }
+
+    #[test]
+    fn cell_preview_size_does_not_grow_with_the_value() {
+        let small = Value::Text("x\n".repeat(512)).cell_preview(1024);
+        let large = Value::Text("x\n".repeat(25 << 20)).cell_preview(1024);
+        assert_eq!(small.chars().count(), 1024);
+        assert_eq!(large.chars().count(), 1025);
+        assert!(large.capacity() <= 1024 * 4 + 3);
     }
 }
