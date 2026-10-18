@@ -2484,3 +2484,82 @@ fn explorer_expands_while_the_completion_catalog_loads() {
     assert!(cleanup.iter().all(|(_, result)| result.is_ok()));
 }
 
+/// Forwards connections to the test PostgreSQL and counts client messages
+/// that contain `needle`.
+fn pg_query_counting_proxy(needle: &'static [u8]) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = seen.clone();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(mut client) = client else { return };
+            let Ok(mut server) = std::net::TcpStream::connect("127.0.0.1:55432") else { continue };
+            let (mut server_in, mut client_out) = (server.try_clone().unwrap(), client.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut server_in, &mut client_out);
+                let _ = client_out.shutdown(std::net::Shutdown::Both);
+            });
+            let counter = counter.clone();
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 256 * 1024];
+                while let Ok(n) = client.read(&mut buffer) {
+                    if n == 0 || server.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                    let hits = buffer[..n].windows(needle.len()).filter(|w| *w == needle).count();
+                    counter.fetch_add(hits, std::sync::atomic::Ordering::SeqCst);
+                }
+                let _ = server.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// The primary key that orders table pages is read once for consecutive
+/// pages, and again after this console changes the table's key.
+#[test]
+fn table_pages_reuse_the_primary_key_until_ddl() {
+    let Some(direct) = pg() else { return };
+    let (port, lookups) = pg_query_counting_proxy(b"indnkeyatts");
+    let mut ds = direct.clone();
+    ds.id = uuid::Uuid::new_v4().to_string();
+    ds.host = "127.0.0.1".into();
+    ds.port = port;
+    let table = format!("dbeast_page_keys_{}", uuid::Uuid::new_v4().simple());
+    let backend = Backend::new(egui::Context::default());
+    let (setup, ..) = run(&backend, req(1, &direct, &[
+        &format!("create table public.{table} (id int primary key, other int not null unique)"),
+        &format!("insert into public.{table} select g, 1001 - g from generate_series(1, 1000) g order by g desc"),
+    ], false));
+    assert!(setup.iter().all(|(_, result)| result.is_ok()));
+    let page = |skip: usize| {
+        let mut request = req(2, &ds, &[&format!("SELECT * FROM public.{table}")], false);
+        request.page = Page { skip, limit: 100 };
+        backend.run_table_page(request, dbeast::backend::TablePage {
+            schema: Some("public".into()),
+            table: table.clone(),
+            ordered: false,
+        });
+        let (done, _) = collect_run(&backend, 2);
+        done[0].1.as_ref().unwrap().rows[0][0].clone()
+    };
+    assert_eq!(page(0), Value::Int(1));
+    assert_eq!(page(100), Value::Int(101));
+    assert_eq!(page(200), Value::Int(201));
+    assert_eq!(page(100), Value::Int(101));
+    let read = lookups.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(read, 1, "one key lookup for four pages");
+    // DDL in the same console: the next page reads the new key.
+    let (ddl, ..) = run(&backend, req(2, &ds, &[
+        &format!("alter table public.{table} drop constraint {table}_pkey, add primary key (other)"),
+    ], false));
+    assert!(ddl[0].1.is_ok());
+    assert_eq!(page(0), Value::Int(1000), "ordered by the new key");
+    assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 2);
+    backend.disconnect(&ds.id);
+    let (cleanup, ..) = run(&backend, req(1, &direct, &[&format!("drop table public.{table}")], false));
+    assert!(cleanup[0].1.is_ok());
+}

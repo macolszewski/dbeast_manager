@@ -140,6 +140,7 @@ impl Backend {
             if result.is_err() {
                 state.related_metadata.clear();
                 state.edit_metadata.clear();
+                state.page_keys.clear();
             }
             cancels.lock().unwrap().remove(&console_id);
             let in_tx = state.in_tx;

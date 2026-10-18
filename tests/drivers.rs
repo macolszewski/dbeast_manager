@@ -1312,3 +1312,59 @@ async fn mysql_console_page_cost() {
         conn.execute(&format!("drop table {table}"), Page::first(0)).await.unwrap();
     }
 }
+
+/// Table page cost by depth: LIMIT/OFFSET as generated today against a range
+/// read after the previous page's last key, on 1,000,000 rows, and the
+/// primary key lookup before each page over a link with 2 ms one-way delay.
+#[tokio::test]
+#[ignore = "manual measurement: cargo test --release --test drivers table_page_depth_cost -- --ignored --nocapture"]
+async fn table_page_depth_cost() {
+    if std::net::TcpStream::connect("127.0.0.1:55432").is_err() || std::net::TcpStream::connect("127.0.0.1:53306").is_err() {
+        eprintln!("skipping, PostgreSQL or MySQL unavailable");
+        return;
+    }
+    for ds in [pg(), mysql()] {
+        let mut conn = Connection::open(&ds).await.unwrap();
+        let table = format!("dbeast_depth_{}", uuid::Uuid::new_v4().simple());
+        let fill = match ds.driver {
+            DriverKind::Postgres => format!("insert into {table} select g, md5(g::text) from generate_series(1, 1000000) g"),
+            _ => format!("insert into {table} with recursive d(n) as (select 0 union all select n + 1 from d where n < 999) select a.n * 1000 + b.n + 1, md5(a.n * 1000 + b.n) from d a cross join d b"),
+        };
+        conn.execute(&format!("create table {table} (id int primary key, note varchar(40))"), Page::first(0)).await.unwrap();
+        if ds.driver == DriverKind::MySql {
+            conn.execute("set session cte_max_recursion_depth = 2000", Page::first(0)).await.unwrap();
+        }
+        conn.execute(&fill, Page::first(0)).await.unwrap();
+        let base = format!("SELECT * FROM {table}");
+        let keys = vec!["id".to_string()];
+        for skip in [0usize, 100_000, 990_000] {
+            let page = Page { skip, limit: 500 };
+            let (sql, window) = dbeast::drivers::page_query(ds.driver, &base, &keys, page);
+            let keyset = format!("{base} WHERE id > {skip} ORDER BY id LIMIT 501");
+            let (mut offset, mut range) = (std::time::Duration::MAX, std::time::Duration::MAX);
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                let r = conn.execute_limited_with_context(&sql, window, None).await.unwrap();
+                offset = offset.min(started.elapsed());
+                assert_eq!(r.rows.len(), 500);
+                let started = std::time::Instant::now();
+                let r = conn.execute_limited_with_context(&keyset, Page::first(500), None).await.unwrap();
+                range = range.min(started.elapsed());
+                assert_eq!(r.rows.len(), 500);
+            }
+            eprintln!("{:?} page at row {skip} of 1,000,000: LIMIT/OFFSET {offset:?}, after the last key {range:?}", ds.driver);
+        }
+        conn.execute(&format!("drop table {table}"), Page::first(0)).await.unwrap();
+    }
+    let mut ds = pg();
+    ds.host = "127.0.0.1".into();
+    ds.port = delaying_proxy(std::time::Duration::from_millis(2)).await;
+    let mut conn = Connection::open(&ds).await.unwrap();
+    let mut key = std::time::Duration::MAX;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        conn.primary_key(Some("shop"), "customers").await.unwrap();
+        key = key.min(started.elapsed());
+    }
+    eprintln!("PostgreSQL primary key lookup with 2 ms one-way delay: {key:?}");
+}

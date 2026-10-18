@@ -249,26 +249,39 @@ pub struct TablePage {
     pub ordered: bool,
 }
 
-/// The paged SQL and the window to read from its result. Without an ORDER BY
-/// consecutive reads could return the rows of a page in another order, or
-/// other rows, so the primary key gives a stable order when there is one.
-async fn table_page_query(
-    conn: &mut Connection,
-    driver: DriverKind,
-    table: &TablePage,
-    sql: &str,
-    page: Page,
-) -> (String, Page) {
+/// How long a table's primary key orders its pages before it is read again,
+/// also covering key changes made by other sessions.
+const PAGE_KEY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Columns that order a table page. Without an ORDER BY consecutive reads
+/// could return the rows of a page in another order, or other rows, so the
+/// primary key gives a stable order when there is one. It is read once per
+/// table and session, and read again after DDL or a failed page in this
+/// session, a reconnect, or [`PAGE_KEY_TTL`]. It only orders reads: saving
+/// edits validates keys separately, against fresh metadata.
+async fn table_page_keys(state: &mut SessionState, ds: &DataSource, table: &TablePage) -> Vec<String> {
     // An unqualified PostgreSQL table would be looked up in "public" only.
-    let keys = if table.ordered || (driver == DriverKind::Postgres && table.schema.is_none()) {
-        Vec::new()
-    } else {
-        // Without the key the page is still correct, only its order is not fixed.
-        conn.primary_key(table.schema.as_deref(), &table.table)
-            .await
-            .unwrap_or_default()
+    if table.ordered || (ds.driver == DriverKind::Postgres && table.schema.is_none()) {
+        return Vec::new();
+    }
+    let key = (table.schema.clone(), table.table.clone());
+    if let Some((keys, read)) = state.page_keys.get(&key)
+        && read.elapsed() < PAGE_KEY_TTL
+    {
+        return keys.clone();
+    }
+    let Ok(conn) = state.conn(ds).await else {
+        return Vec::new();
     };
-    crate::drivers::page_query(driver, sql, &keys, page)
+    // Without the key the page is still correct, only its order is not fixed.
+    let Ok(keys) = conn.primary_key(table.schema.as_deref(), &table.table).await else {
+        return Vec::new();
+    };
+    if state.page_keys.len() >= 256 {
+        state.page_keys.clear();
+    }
+    state.page_keys.insert(key, (keys.clone(), std::time::Instant::now()));
+    keys
 }
 
 #[derive(Default)]
@@ -281,6 +294,8 @@ struct SessionState {
     edit_metadata: HashMap<OriginTable, TableEditMetadata>,
     related_metadata:
         HashMap<(OriginTable, crate::model::RelatedDirection), crate::model::RelatedMetadata>,
+    /// Primary keys ordering table pages, with when they were read.
+    page_keys: HashMap<(Option<String>, String), (Vec<String>, std::time::Instant)>,
     /// A failed or ambiguous execution must never silently reconnect and retry.
     reconnect_required: Option<String>,
 }
@@ -299,6 +314,7 @@ impl SessionState {
         self.conn = None;
         self.in_tx = false;
         self.edit_metadata.clear();
+        self.page_keys.clear();
         self.related_metadata.clear();
     }
 
@@ -306,6 +322,7 @@ impl SessionState {
         self.conn = None;
         self.in_tx = false;
         self.edit_metadata.clear();
+        self.page_keys.clear();
         self.related_metadata.clear();
         self.reconnect_required = Some(reason);
     }
@@ -322,6 +339,7 @@ impl SessionState {
             self.configured_schema = SchemaSelection::Default;
             self.source_identity = Some(ds.identity());
             self.edit_metadata.clear();
+            self.page_keys.clear();
             self.related_metadata.clear();
         }
         anyhow::ensure!(
@@ -596,6 +614,7 @@ impl Backend {
                     .await?;
                 if state.edit_metadata.len() >= 256 {
                     state.edit_metadata.clear();
+                    state.page_keys.clear();
                 }
                 state.edit_metadata.insert(origin, metadata.clone());
                 anyhow::Ok(metadata)
@@ -624,6 +643,7 @@ impl Backend {
             self.rt.spawn(async move {
                 let mut state = session.lock().await;
                 state.edit_metadata.clear();
+                state.page_keys.clear();
                 state.related_metadata.clear();
             });
         }
@@ -1069,14 +1089,18 @@ impl Backend {
                             tx_has_work = false;
                         }
                         let result = async {
+                            let keys = match &table_page {
+                                Some(table) if control.is_none() => Some(table_page_keys(state, &ds, table).await),
+                                _ => None,
+                            };
                             let conn = state.conn(&ds).await?;
                             if let Some(h) = conn.cancel_handle() {
                                 cancels.lock().unwrap().insert(console_id, h);
                             }
                             if control.is_some() {
                                 conn.execute(&sql, page).await
-                            } else if let Some(table) = &table_page {
-                                let (paged, window) = table_page_query(conn, ds.driver, table, &sql, page).await;
+                            } else if let Some(keys) = keys {
+                                let (paged, window) = crate::drivers::page_query(ds.driver, &sql, &keys, page);
                                 conn.execute_limited_with_context(&paged, window, expected_context.as_ref())
                                     .await
                             } else {
@@ -1106,9 +1130,14 @@ impl Backend {
                             .map_or(true, |result| !result.has_result_set())
                         {
                             state.edit_metadata.clear();
+                            state.page_keys.clear();
                             state.related_metadata.clear();
                         }
                         let failed = result.is_err();
+                        if failed {
+                            // A key changed by another session may have broken the page.
+                            state.page_keys.clear();
+                        }
                         send(Event::StatementDone {
                             console_id,
                             sql,
@@ -1402,6 +1431,7 @@ async fn apply_update_batch(
         Ok(report) => Ok(report),
         Err(error) => {
             state.edit_metadata.clear();
+            state.page_keys.clear();
             state.related_metadata.clear();
             let mut cleanup_error = None;
             if let Some(conn) = state.conn.as_mut() {

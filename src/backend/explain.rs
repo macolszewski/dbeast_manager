@@ -112,6 +112,7 @@ impl Backend {
                     tokio::spawn(async move {
                         let mut state = session.lock().await;
                         state.edit_metadata.clear();
+                        state.page_keys.clear();
                         state.related_metadata.clear();
                         if let Some(conn) = state.conn.as_mut() {
                             conn.clear_prepared_updates();
@@ -235,6 +236,7 @@ async fn execute_plan(
             check_cancel(token)?;
             if request.mode == ExplainMode::Analyse {
                 state.edit_metadata.clear();
+                state.page_keys.clear();
                 state.related_metadata.clear();
                 state.conn.as_mut().unwrap().clear_prepared_updates();
             }
