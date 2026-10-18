@@ -66,9 +66,18 @@ pub struct EditState {
     show_preview: bool,
     editing_surface: CellSurface,
     editing_needs_focus: bool,
+    /// Changes whenever a staged value may have changed, so views built from
+    /// pending edits know they are stale.
+    revision: u64,
 }
 
+static NEXT_EDIT_REVISION: AtomicU64 = AtomicU64::new(1);
+
 impl EditState {
+    fn touch(&mut self) {
+        self.revision = NEXT_EDIT_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.changed.is_empty() && self.deleted.is_empty() && self.inserted.is_empty()
     }
@@ -277,6 +286,7 @@ impl ResultSet {
         }
     }
 
+    #[cfg(test)]
     pub fn selected_value(&self) -> Option<Value> {
         let (row, c) = self.valid_selection()?;
         Some(match self.cell(row, c) {
@@ -330,6 +340,7 @@ impl ResultSet {
         self.layout.clear_transposed();
         self.find.invalidate();
         self.local_filter.invalidate();
+        self.edits.touch();
         match row {
             GridRow::Data(i) => {
                 let original = &self.data.rows[i][col];
@@ -357,6 +368,7 @@ impl ResultSet {
         self.find.invalidate();
         self.local_filter.invalidate();
         self.pending_grid_focus = true;
+        self.edits.touch();
         self.edits
             .inserted
             .push(vec![CellEdit::Default; self.data.columns.len()]);
@@ -396,6 +408,7 @@ impl ResultSet {
                 }
             })
             .collect();
+        self.edits.touch();
         self.edits.inserted.push(values);
         let col = self.selected.map_or(0, |(_, c)| c);
         self.select_cell((GridRow::New(self.edits.inserted.len() - 1), col), false);
@@ -428,6 +441,7 @@ impl ResultSet {
                 }
             }
             GridRow::New(j) => {
+                self.edits.touch();
                 self.edits.inserted.remove(j);
                 if let Some((GridRow::New(index), _, _)) = &mut self.edits.editing
                     && *index > j
@@ -447,6 +461,7 @@ impl ResultSet {
         self.pending_grid_focus = true;
         self.layout.clear_transposed();
         self.edits = EditState::default();
+        self.edits.touch();
         self.selected = None;
     }
 

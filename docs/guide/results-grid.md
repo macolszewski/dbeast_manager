@@ -79,7 +79,9 @@ Selecting a cell shows its full value in the value panel below the grid. The pan
 
 ![Value panel below the grid showing a jsonb value formatted as text with syntax coloring](../images/21-json-value.png)
 
-- JSON values can be shown as **Tree** (collapsible objects and arrays) or **Text** (formatted with syntax coloring). Keys keep their original order.
+- JSON values can be shown as **Tree** (collapsible objects and arrays) or **Text** (formatted with syntax coloring). Keys keep their original order. A tree row shows at most 1024 characters of a key or scalar; **Text** and **Copy** give the whole value.
+- Values larger than 64 KiB are prepared in the background while the panel shows "Preparing…", and only the lines on screen are laid out, so a multi-megabyte value scrolls like a short one. Long lines of such values are split into rows of about 1 KiB and each row is selected separately; **Copy** copies the whole value.
+- Grid cells draw at most 1024 characters of a value. Copy, Find and Export always use the full value.
 - **Edit Value** opens an edit buffer. **Apply Value** adds the change to the pending changes, **Cancel Value Edit** discards it, and **Submit** saves it to the database. Enter in this field inserts a new line.
 - Close the panel with ×, or turn it off with **Options** > **Show Value Editor**. **Open in Value Editor** in the cell context menu, or `⇧↵`, shows it again.
 
