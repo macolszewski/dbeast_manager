@@ -1176,3 +1176,139 @@ async fn postgres_stops_only_plain_reads_after_their_page() {
     assert_eq!(count.rows[0][0], Value::Int(1000));
     conn.execute("drop table dbeast_returning_page", Page::first(0)).await.unwrap();
 }
+
+/// Forwards connections to the test MySQL and counts bytes sent to the client.
+async fn mysql_byte_counting_proxy() -> (u16, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = received.clone();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect("127.0.0.1:53306").await else { continue };
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut server_read, mut server_write) = server.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+                let _ = server_write.shutdown().await;
+            });
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 64 * 1024];
+                while let Ok(read) = server_read.read(&mut buffer).await {
+                    if read == 0 || client_write.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                    counter.fetch_add(read as u64, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    (port, received)
+}
+
+async fn mysql_numbers_table(conn: &mut Connection, rows: usize, width: usize) -> String {
+    let table = format!("dbeast_page_{}", uuid::Uuid::new_v4().simple());
+    conn.execute(&format!("create table {table} (id int primary key, note varchar({width}))"), Page::first(0)).await.unwrap();
+    let mut id = 0;
+    while id < rows {
+        let chunk = (id + 1..=(id + 1000).min(rows))
+            .map(|n| format!("({n}, repeat('x', {width}))"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute(&format!("insert into {table} values {chunk}"), Page::first(0)).await.unwrap();
+        id += 1000;
+    }
+    table
+}
+
+/// A console SELECT outside a transaction ends on the server one row after
+/// its page; the bytes received do not depend on the size of the result.
+#[tokio::test]
+async fn mysql_console_pages_end_on_the_server() {
+    if std::net::TcpStream::connect("127.0.0.1:53306").is_err() {
+        eprintln!("skipping, MySQL unavailable");
+        return;
+    }
+    let (port, received) = mysql_byte_counting_proxy().await;
+    let mut ds = mysql();
+    ds.port = port;
+    let mut conn = Connection::open(&ds).await.unwrap();
+    let table = mysql_numbers_table(&mut conn, 20_000, 200).await;
+    let select = format!("select id, note from {table} order by id");
+    let page = Page { skip: 1000, limit: 500 };
+    let before = received.load(std::sync::atomic::Ordering::SeqCst);
+    let r = conn.execute_with_context(&select, page, None).await.unwrap();
+    let bounded = received.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert_eq!((r.rows.len(), r.truncated), (500, true));
+    assert_eq!(r.rows[0][0], Value::Int(1001));
+    assert!(r.source.as_ref().unwrap().columns.iter().all(Option::is_some), "column origins kept");
+    // The same statement read in full, as before, for comparison.
+    let before = received.load(std::sync::atomic::Ordering::SeqCst);
+    let full = conn.execute(&select, page).await.unwrap();
+    let drained = received.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert_eq!(full.rows, r.rows);
+    assert!(bounded * 5 < drained, "bounded {bounded} B, drained {drained} B");
+    // The last page is complete and not marked truncated.
+    let last = conn.execute_with_context(&select, Page { skip: 19_500, limit: 500 }, None).await.unwrap();
+    assert_eq!((last.rows.len(), last.truncated), (500, false));
+    // The statement's own LIMIT still applies, and the next statement runs normally.
+    let own = conn.execute_with_context(&format!("{select} limit 3"), page, None).await.unwrap();
+    assert!(own.rows.is_empty() && !own.truncated);
+    let next = conn.execute_with_context("select 42", Page::first(500), None).await.unwrap();
+    assert_eq!(next.rows, vec![vec![Value::Int(42)]]);
+    // Inside a transaction and for locking reads the full result is read.
+    conn.execute("begin", Page::first(0)).await.unwrap();
+    let before = received.load(std::sync::atomic::Ordering::SeqCst);
+    let in_tx = conn.execute_with_context(&select, page, None).await.unwrap();
+    assert!(received.load(std::sync::atomic::Ordering::SeqCst) - before >= drained);
+    assert_eq!(in_tx.rows, r.rows);
+    conn.execute("rollback", Page::first(0)).await.unwrap();
+    let locking = conn.execute_with_context(&format!("{select} for share"), page, None).await.unwrap();
+    assert_eq!((locking.rows.len(), locking.truncated), (500, true));
+    conn.execute(&format!("drop table {table}"), Page::first(0)).await.unwrap();
+}
+
+/// First console page of a large MySQL result, read in full and ended on
+/// the server.
+#[tokio::test]
+#[ignore = "manual measurement: cargo test --release --test drivers mysql_console_page_cost -- --ignored --nocapture"]
+async fn mysql_console_page_cost() {
+    if std::net::TcpStream::connect("127.0.0.1:53306").is_err() {
+        eprintln!("skipping, MySQL unavailable");
+        return;
+    }
+    let (port, received) = mysql_byte_counting_proxy().await;
+    let mut ds = mysql();
+    ds.port = port;
+    let mut conn = Connection::open(&ds).await.unwrap();
+    for rows in [10_000, 1_000_000] {
+        let table = mysql_numbers_table(&mut conn, rows, 100).await;
+        let select = format!("select id, note from {table}");
+        let mut runs = Vec::new();
+        for bounded in [false, true] {
+            let mut best = (std::time::Duration::MAX, 0);
+            for _ in 0..5 {
+                let before = received.load(std::sync::atomic::Ordering::SeqCst);
+                let started = std::time::Instant::now();
+                let r = if bounded {
+                    conn.execute_with_context(&select, Page::first(500), None).await.unwrap()
+                } else {
+                    conn.execute(&select, Page::first(500)).await.unwrap()
+                };
+                assert_eq!(r.rows.len(), 500);
+                let elapsed = started.elapsed();
+                if elapsed < best.0 {
+                    best = (elapsed, received.load(std::sync::atomic::Ordering::SeqCst) - before);
+                }
+            }
+            runs.push(best);
+        }
+        eprintln!(
+            "MySQL first console page of {rows} rows: full read {:?} ({} B received), ended on the server {:?} ({} B received)",
+            runs[0].0, runs[0].1, runs[1].0, runs[1].1
+        );
+        conn.execute(&format!("drop table {table}"), Page::first(0)).await.unwrap();
+    }
+}

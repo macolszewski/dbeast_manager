@@ -341,7 +341,7 @@ impl Connection {
                 .execute_with_context(sql, page, expected, !limited)
                 .await
                 .map_err(postgres::describe),
-            Kind::MySql(c) => c.execute_with_context(sql, page, expected).await,
+            Kind::MySql(c) => c.execute_with_context(sql, page, expected, !limited).await,
             Kind::Sqlite(c) => {
                 let context = c.resolved_context();
                 check_expected_context(Some(&context), expected)?;

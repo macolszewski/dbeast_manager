@@ -110,6 +110,30 @@ impl MyConn {
         Self::read_result(result, page).await
     }
 
+    /// Runs a console statement. Outside a transaction, a plain SELECT that
+    /// qualifies (see [`page_hint_offset`]) gets an optimizer hint that ends
+    /// its result one row after the page, so the server stops sending rows
+    /// instead of the client reading the rest of a large result off the wire.
+    async fn execute_paged(&mut self, sql: &str, page: Page) -> Result<QueryResult> {
+        let rows = page.skip.saturating_add(page.limit).saturating_add(1);
+        let autocommit = self.conn.last_ok_packet().is_some_and(|packet| {
+            let flags = packet.status_flags();
+            flags.contains(StatusFlags::SERVER_STATUS_AUTOCOMMIT)
+                && !flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS)
+        });
+        match page_hint_offset(sql).filter(|_| autocommit && page.limit != usize::MAX) {
+            Some(at) => {
+                let hinted = format!(
+                    "{} /*+ SET_VAR(sql_select_limit = {rows}) */{}",
+                    &sql[..at],
+                    &sql[at..]
+                );
+                self.execute(&hinted, page).await
+            }
+            None => self.execute(sql, page).await,
+        }
+    }
+
     async fn read_result<P: mysql_async::prelude::Protocol>(
         mut result: mysql_async::QueryResult<'_, '_, P>,
         page: Page,
@@ -554,17 +578,25 @@ impl MyConn {
         Ok(affected)
     }
 
+    /// `bounded` lets a plain SELECT end on the server after the page; it is
+    /// off for SQL that already carries the application's own LIMIT.
     pub async fn execute_with_context(
         &mut self,
         sql: &str,
         page: Page,
         expected: Option<&ResolvedContext>,
+        bounded: bool,
     ) -> Result<QueryResult> {
         // mysql_async does not negotiate CLIENT_SESSION_TRACK. Reading DATABASE
         // before user SQL is necessary: USE, procedures and SQL can change it.
         let context = self.resolved_context().await?;
         super::check_expected_context(Some(&context), expected)?;
-        let mut result = self.execute(sql, page).await?;
+        // The context query just refreshed the session's transaction status.
+        let mut result = if bounded {
+            self.execute_paged(sql, page).await?
+        } else {
+            self.execute(sql, page).await?
+        };
         if result.has_result_set() {
             result.context = Some(context);
         }
@@ -1049,9 +1081,155 @@ fn append_fraction(text: &mut String, micros: u32, decimals: u8) {
     }
 }
 
+/// Built-in functions without side effects whose results do not depend on
+/// how many rows the server produces.
+const PAGE_HINT_FUNCTIONS: &[&str] = &[
+    "abs", "ascii", "avg", "bit_length", "ceil", "ceiling", "char_length", "character_length",
+    "coalesce", "concat", "concat_ws", "count", "curdate", "current_date", "current_time",
+    "current_timestamp", "date", "date_add", "date_format", "date_sub", "datediff", "day",
+    "dayofmonth", "dayofweek", "dense_rank", "field", "find_in_set", "first_value", "floor",
+    "format", "greatest", "group_concat", "hex", "hour", "if", "ifnull", "instr", "json_array",
+    "json_extract", "json_length", "json_object", "json_unquote", "lag", "last_value", "lcase",
+    "lead", "least", "left", "length", "locate", "lower", "lpad", "ltrim", "max", "md5", "min",
+    "minute", "mod", "month", "now", "nullif", "octet_length", "position", "pow", "power",
+    "rank", "repeat", "replace", "reverse", "right", "round", "row_number", "rpad", "rtrim",
+    "second", "sha1", "sha2", "sign", "sqrt", "str_to_date", "substr", "substring", "sum",
+    "time", "timestampdiff", "trim", "truncate", "ucase", "unhex", "upper", "year",
+];
+
+/// Byte offset just after the leading SELECT keyword when `sql` is a single
+/// plain SELECT whose result may end on the server after a page: no locking
+/// clause, no INTO, no SQL_CALC_FOUND_ROWS, no variables, and only built-in
+/// functions from [`PAGE_HINT_FUNCTIONS`], so producing fewer rows changes
+/// nothing but the rows not read. Anything the parser and MySQL could read
+/// differently (executable or hint comments, backslashes, double quotes,
+/// `--` without a space) is refused, and such SQL keeps the full read.
+fn page_hint_offset(sql: &str) -> Option<usize> {
+    use sqlparser::ast::{Expr, Statement};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    if sql.len() > 256 * 1024
+        || sql.contains("/*!")
+        || sql.contains("/*+")
+        || sql.to_ascii_lowercase().contains("/*m!")
+        || sql.contains(['\\', '"', '\0'])
+    {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    if sql.ends_with("--")
+        || bytes
+            .windows(3)
+            .any(|w| w[0] == b'-' && w[1] == b'-' && !w[2].is_ascii_whitespace())
+    {
+        return None;
+    }
+    // The statement must start with SELECT after whitespace and comments.
+    let mut at = 0;
+    loop {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if bytes[at..].starts_with(b"/*") {
+            at += sql[at + 2..].find("*/")? + 4;
+        } else if bytes[at..].starts_with(b"-- ") || bytes[at..].starts_with(b"#") {
+            at += sql[at..].find('\n').map_or(sql.len() - at, |end| end + 1);
+        } else {
+            break;
+        }
+    }
+    let keyword = sql.get(at..at + 6)?;
+    if !keyword.eq_ignore_ascii_case("select")
+        || bytes
+            .get(at + 6)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+    {
+        return None;
+    }
+    let dialect = MySqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
+    let refused = tokens.iter().any(|token| match token {
+        Token::Word(word) => {
+            word.value.starts_with('@')
+                || (word.quote_style.is_none()
+                    && ["into", "for", "lock", "sql_calc_found_rows", "procedure"]
+                        .iter()
+                        .any(|refused| word.value.eq_ignore_ascii_case(refused)))
+        }
+        Token::AtSign | Token::Assignment => true,
+        other => other.to_string().contains('@'),
+    });
+    if refused {
+        return None;
+    }
+    let statements = sqlparser::parser::Parser::new(&dialect)
+        .with_recursion_limit(64)
+        .try_with_sql(sql)
+        .ok()?
+        .parse_statements()
+        .ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    if !query.locks.is_empty() || query.for_clause.is_some() {
+        return None;
+    }
+    let mut safe = true;
+    let _ = sqlparser::ast::visit_expressions(query, |expr| {
+        if let Expr::Function(function) = expr {
+            let name = function.name.to_string().to_ascii_lowercase();
+            safe &= PAGE_HINT_FUNCTIONS.contains(&name.as_str());
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    safe.then_some(at + 6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plain_selects_end_on_the_server_after_their_page() {
+        for (sql, offset) in [
+            ("select * from big", 6),
+            ("  SELECT id, lower(name) FROM t WHERE x IN (1, 2) ORDER BY id;", 8),
+            ("-- note\nselect count(*) from t group by k", 14),
+            ("/* c */ select a from t union all select b from u", 14),
+            ("# note\nSELECT `for`, 'into' FROM t LIMIT 10", 13),
+            ("select date_format(d, '%Y') from t join u on t.id = u.id", 6),
+        ] {
+            assert_eq!(page_hint_offset(sql), Some(offset), "{sql}");
+        }
+        for sql in [
+            "with a as (select 1) select * from a",
+            "(select 1) union (select 2)",
+            "select * from t for update",
+            "select * from t lock in share mode",
+            "select * from t for share",
+            "select a into @x from t",
+            "select a from t into outfile '/tmp/x'",
+            "select sql_calc_found_rows * from t",
+            "select @x := a from t",
+            "select @@version",
+            "select sleep(1) from t",
+            "select my_func(a) from t",
+            "select db.f(a) from t",
+            "select rand() from t",
+            "select 1 --sleep(5)",
+            "select \"a\" from t",
+            "select 'it\\'s' from t",
+            "select /*+ MAX_EXECUTION_TIME(1) */ * from t",
+            "select /*! sleep(1) */ * from t",
+            "select 1; delete from t",
+            "insert into t select * from u",
+            "update t set a = 1",
+            "selectx from t",
+            "select 'unterminated",
+        ] {
+            assert_eq!(page_hint_offset(sql), None, "{sql}");
+        }
+    }
 
     #[test]
     fn binary_time_matches_text_protocol_for_sign_large_hours_and_precision() {
