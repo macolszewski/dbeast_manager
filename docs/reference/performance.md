@@ -15,6 +15,8 @@ How these goals are met:
 - Everything is loaded lazily: the Explorer tree level by level, results in pages (500 rows by default), completion metadata once per connection.
 - Grids, trees, lists and logs draw only the visible rows. Work proportional to the number of rows (sorting, serialization, indexing) is done once and cached, never repeated on every frame.
 
+The verification of the 0.3.0 audit, with the measurements behind each fix, is in [Performance and memory audit of 0.3.0](../design/performance-audit-0.3.md).
+
 Most measurements below are micro-benchmarks of a single stage, without GPU rendering. They show the cost of that stage; they are not a frame-rate measurement of the whole application. Unless stated otherwise, they were taken on Apple Silicon in a release build.
 
 ## Measuring startup, memory and CPU
@@ -82,7 +84,7 @@ Micro-benchmark of layout preparation, 1,000 repetitions, two columns, 14 Octobe
 cargo test --release --lib layout_preparation_benchmark -- --ignored --nocapture
 ```
 
-This is a supporting measurement without UI drawing and GPU. The normal grid no longer builds a list of all records on every frame. Transpose still creates a column for every record on the page, so large results need further horizontal virtualization. The history menu processes entries only when it is opened, without cloning full queries on every frame.
+This is a supporting measurement without UI drawing and GPU. The normal grid no longer builds a list of all records on every frame. Both grids build only the columns in view, so the work follows the viewport: in a 1000×500 view, Transpose of 5,000 records with 20 fields went from 100,000 cells and 252 ms to 300 cells and 1.6 ms per frame, and a result of 2,000 columns from 120 ms to 1.3 ms (`grid_frame_cost_benchmark`, release, 18 October 2026). The history menu processes entries only when it is opened, without cloning full queries on every frame.
 
 ### Find on Current Page
 
@@ -168,7 +170,7 @@ Without the AccessKit accessibility tree, active editor, time of `Context::run_u
 | 1 MB | scrolling | 443.300 / 6.191 ms | 466.765 / 6.798 ms |
 | 1 MB | first keystroke after a pause | 466.401 / 42.993 ms | 480.807 / 45.332 ms |
 
-Typing was measured in five samples, each after three idle frames. The inserted character is a space, so completion is not measured as well. The measurement includes saving the configuration; the correctness of the SQL change is checked outside the measurement.
+Typing was measured in five samples, each after three idle frames. The inserted character is a space, so completion is not measured as well. The configuration is saved after edits pause, so the typing frame only marks it changed; the correctness of the saved SQL is checked outside the measurement.
 
 With AccessKit and the test accessibility tree, time of a whole test step for 1 MB of SQL:
 
@@ -186,7 +188,7 @@ cargo test --release --test ui_editor_performance -- --ignored --nocapture --tes
 
 The first UI construction for 1 MB of SQL with AccessKit dropped from 724 to 267 ms. This is measured inside the application's UI function, not as application startup. The accessibility tree remains expensive in egui, so measurements without it do not prove smoothness with a screen reader. GPU time and process memory were not measured here.
 
-The cache keeps a single text layout and compact indexes of line starts and fold offsets; it does not map every character to a source position. SQL analysis, highlighting and assembling the visible text happen only after changes. The current egui API requires copying and hashing the cached layout job once per UI pass to keep its paragraph cache; this is a known trade-off that needs further work. The standard egui text editor also makes its own copies and keeps its own text history. Saving the configuration is a separate cost still to be moved off the interface thread; the session is saved in the background (see [Session saving](#session-saving)).
+The cache keeps a single text layout and compact indexes of line starts and fold offsets; it does not map every character to a source position. SQL analysis, highlighting and assembling the visible text happen only after changes. The current egui API requires copying and hashing the cached layout job once per UI pass to keep its paragraph cache; since 18 October 2026 adjacent tokens of one format share a layout section, which made this keep-alive 7.5 → 5.5 ms and highlighting 15.6 → 8.1 ms for 1 MB of SQL (`editor_layout_cost_benchmark`). The standard egui text editor also makes its own copies of the text on focused frames, and a change still lays out the whole text: typing in 1 MB of SQL takes about 36 ms of CPU, 8.4 ms for 100 kB. The configuration and the session are saved in the background (see [Configuration and password storage](#configuration-and-password-storage) and [Session saving](#session-saving)).
 
 ## Database Explorer
 
@@ -416,7 +418,9 @@ Computing one force layout (release, Apple Silicon): 100 objects in 7 ms, 1,000 
 | Reload | 0.812 ms, with exactly one vault read |
 | Average autosave (100 repetitions) | 8.453 ms |
 
-Autosave covers cloning the configuration, JSON, locking, `fsync` of the file and directory, and the rename. None of the 100 repetitions performed an extra vault operation. This is a local measurement, not a performance threshold. It does not include native macOS Keychain time, system prompts, UI, GPU or window startup.
+Autosave covers cloning the configuration, JSON, locking, `fsync` of the file and directory, and the rename. None of the 100 repetitions performed an extra vault operation.
+
+Since 18 October 2026 an edit only marks the configuration changed. The snapshot is taken after edits pause (400 ms, at most every 2 s while typing continues), with at most one ordinary save in flight, so the worker never receives a backlog of snapshots. Console and history text is shared with the snapshot (`Arc<str>`), and the writer encodes the file once for both the write and its revision. With 20 MiB of text in 10 consoles, the work per change on the interface thread went from 1.38 ms to 0.85 µs; a snapshot with one changed console takes 1.5 ms (`autosave_cost_benchmark`). This is a local measurement, not a performance threshold. It does not include native macOS Keychain time, system prompts, UI, GPU or window startup.
 
 ```sh
 cargo test --release --lib persistence::tests::benchmark_config_and_credential_persistence -- --ignored --nocapture
@@ -424,16 +428,16 @@ cargo test --release --lib persistence::tests::benchmark_config_and_credential_p
 
 ## Session saving
 
-The session is checked for changes every 2 seconds. The check hashes tab metadata, console text, cursors, folds, logs and the explorer tree, while each result contributes only the identity of its JSON, which is serialized once per result and shared with the snapshot instead of copied. Nothing is serialized or written when the hash is unchanged. A changed snapshot goes to a single writer thread that serializes it and writes it atomically (temporary file with `0600` permissions, then rename); saves queued behind a slow write are replaced by the newest one, and exit waits for the last write.
+The session is checked for changes every 2 seconds. `session.json` holds only metadata; the rows of each result are written once, by the writer thread with a streaming writer, into `session-results/`, and later saves rewrite only `session.json`. Nothing is written when the hash of the metadata is unchanged. Snapshots queued behind a slow write are replaced by the newest one, exit waits for the last write, and files of results no longer open are removed after a successful save. On start, the session is read on a background thread and the rows of a tab are read when the tab is first shown.
 
-17 October 2026, release build, synthetic results of 500 rows x 20 columns per tab (integers, floats, decimals, bytes, text), medians of 21 saves, time spent on the interface thread:
+18 October 2026, release build, synthetic results of 500 rows x 20 columns per tab, medians of 21 saves, time on the interface thread:
 
-| Tabs (session size) | Before: unchanged / changed | After: unchanged / changed | Final write at exit |
-|---|---|---|---|
-| 10 (5.0 MB) | 3.9 ms / 4.4 ms | 0.009 ms / 0.008 ms | 1.2 ms |
-| 30 (15.1 MB) | 13.0 ms / 15.4 ms | 0.028 ms / 0.023 ms | 7.0 ms |
+| Tabs (rows on disk) | First save after the results arrive | Unchanged / changed | Reading the session / restoring tabs | Rows of the active tab shown |
+|---|---|---|---|---|
+| 10 (5.0 MB) | 0.6 ms (8.6 ms when serialized on the interface thread) | 0.019 / 0.017 ms | 0.4 / 0.2 ms | 12.7 ms |
+| 30 (15.1 MB) | 0.2 ms (24.4 ms before) | 0.060 / 0.050 ms | 0.3 / 0.2 ms | 11.0 ms |
 
-The first save after a result arrives also serializes that result once on the interface thread.
+Before the rows were read on demand, restoring 30 tabs read all rows (53 ms in the background) and kept them in memory; the peak RSS of this benchmark process went from 69 to 44 MB. Results of all tabs are kept within 1 GiB in memory; above that, clean results of the tabs unused for longest are released and read again from their files when shown (see [Sessions](../guide/sessions.md)).
 
 ```sh
 cargo test --release --lib ui::session::tests::benchmark_session_save -- --ignored --exact --nocapture

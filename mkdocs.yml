@@ -118,3 +118,4 @@ nav:
       - design/tls-plan.md
       - design/explain-analyse-plan.md
       - design/spatial-data-exploration.md
+      - design/performance-audit-0.3.md
