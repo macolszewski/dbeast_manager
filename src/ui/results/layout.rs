@@ -9,6 +9,58 @@ use std::collections::HashMap;
 const WIDTH_SAMPLE_ROWS: usize = 50;
 const MAX_WIDTH_CHARS: usize = 40;
 
+/// The columns of a wide table that are built this frame. Columns outside the
+/// viewport are replaced by one spacer on each side with the same total width,
+/// so the scroll extent and positions do not change.
+#[derive(Debug, PartialEq)]
+pub(super) struct ColumnWindow {
+    pub range: std::ops::Range<usize>,
+    pub before: f32,
+    pub after: f32,
+}
+
+/// Extra columns built beyond each side of the viewport.
+const WINDOW_MARGIN: usize = 2;
+
+/// `visible` is the viewport relative to the left edge of the first column;
+/// `spacing` is the gap the table adds after every column.
+pub(super) fn column_window(
+    widths: impl ExactSizeIterator<Item = f32> + Clone,
+    spacing: f32,
+    visible: egui::Rangef,
+) -> ColumnWindow {
+    let count = widths.len();
+    let (mut first, mut last) = (count, count);
+    let mut x = 0.0;
+    for (index, width) in widths.clone().enumerate() {
+        if first == count && x + width >= visible.min {
+            first = index;
+        }
+        if x > visible.max {
+            last = index;
+            break;
+        }
+        x += width + spacing;
+    }
+    let first = first.min(last).saturating_sub(WINDOW_MARGIN);
+    let last = (last + WINDOW_MARGIN).min(count);
+    let span = |range: std::ops::Range<usize>| {
+        let len = range.len();
+        widths
+            .clone()
+            .skip(range.start)
+            .take(len)
+            .map(|width| width + spacing)
+            .sum::<f32>()
+            - spacing
+    };
+    ColumnWindow {
+        before: if first > 0 { span(0..first) } else { 0.0 },
+        after: if last < count { span(last..count) } else { 0.0 },
+        range: first..last,
+    }
+}
+
 #[derive(Default)]
 pub(super) struct LayoutCache {
     normal: OnceCell<Vec<f32>>,
@@ -158,6 +210,34 @@ fn value_chars(value: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn column_window_keeps_positions_and_total_width() {
+        let widths = vec![100.0; 1000];
+        let total = |w: &ColumnWindow| {
+            w.before
+                + w.after
+                + w.range.len() as f32 * 100.0
+                + (w.range.len() + usize::from(w.before > 0.0) + usize::from(w.after > 0.0) - 1)
+                    as f32
+                    * 4.0
+        };
+        let at_start = column_window(widths.iter().copied(), 4.0, egui::Rangef::new(0.0, 500.0));
+        assert_eq!(at_start.range, 0..7);
+        assert_eq!(at_start.before, 0.0);
+        let middle = column_window(widths.iter().copied(), 4.0, egui::Rangef::new(52_000.0, 52_500.0));
+        assert_eq!(middle.range, 498..507);
+        // The first built column starts where it would without the window.
+        assert_eq!(middle.before + 4.0, 498.0 * 104.0);
+        let end = column_window(widths.iter().copied(), 4.0, egui::Rangef::new(103_600.0, 104_000.0));
+        assert_eq!(end.range.end, 1000);
+        assert_eq!(end.after, 0.0);
+        for window in [&at_start, &middle, &end] {
+            assert_eq!(total(window), 1000.0 * 104.0 - 4.0);
+        }
+        let few = column_window([50.0, 60.0].into_iter(), 4.0, egui::Rangef::new(0.0, 900.0));
+        assert_eq!(few, ColumnWindow { range: 0..2, before: 0.0, after: 0.0 });
+    }
     use crate::model::{Column, Page, QueryResult};
 
     fn result(rows: usize) -> ResultSet {

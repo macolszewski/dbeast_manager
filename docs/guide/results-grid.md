@@ -36,6 +36,8 @@ The right end of the toolbar shows whether the result is **Editable** or **Read-
 - Numbers are right-aligned and colored.
 - The primary key column has a key icon in its header.
 - Alternate rows have a slightly different background.
+- Drag the right edge of a column header to change the column's width; double-click the edge to restore the automatic width. Widths are kept for the same query until DBeast is closed, also in Transpose.
+- Only the rows and columns in view are drawn, so a page with thousands of records in Transpose, or a table with thousands of columns, scrolls as fast as a small one.
 
 ### Sorting
 

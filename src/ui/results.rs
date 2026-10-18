@@ -1473,6 +1473,12 @@ fn row_number_cell(ui: &mut Ui, label: String, row: GridRow, ev: &mut GridEvents
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Cells whose contents were built, to check that drawing follows the viewport.
+    static CELLS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One value cell: background for pending changes, in-place editor, context menu.
 fn data_cell(
     row: &mut egui_extras::TableRow<'_, '_>,
@@ -1501,6 +1507,8 @@ fn data_cell(
             .as_ref()
             .is_some_and(|(row, col, _)| *row == grid_row && *col == c);
     let (_, resp) = row.col(|ui| {
+        #[cfg(test)]
+        CELLS_BUILT.with(|cells| cells.set(cells.get() + 1));
         if surface == CellSurface::Grid && ev.reveal == Some((grid_row, c)) {
             let rect = ui.max_rect();
             ev.reveal_rect = Some(rect);
@@ -1804,19 +1812,26 @@ fn normal_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
     let scroll = egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let minimum = if rs.local_filter.enabled { 100.0 } else { 74.0 };
+            let resized = ColumnWidths::load(ui, egui::Id::new((&rs.sql, "rows")));
+            let width_of = |c: usize| resized.width(c, widths[c] * look.scale, minimum);
+            let spacing = ui.spacing().item_spacing.x;
+            let window = column_window(ui, row_label_w + spacing, cols, width_of);
+            if let Some((_, c)) = ev.reveal
+                && !window.range.contains(&c)
+            {
+                reveal_outside_window(ui, ev, row_label_w + spacing, c, width_of);
+            }
             let mut table = TableBuilder::new(ui)
                 .id_salt((&rs.sql, "rows"))
                 .striped(look.striped)
-                .resizable(true)
+                .resizable(false)
                 .sense(Sense::click_and_drag())
                 .min_scrolled_height(0.0)
                 .auto_shrink([false, false])
                 .cell_layout(Layout::left_to_right(Align::Center))
                 .column(Column::exact(row_label_w));
-            for w in widths {
-                let minimum = if rs.local_filter.enabled { 100.0 } else { 74.0 };
-                table = table.column(Column::initial(*w * look.scale).at_least(minimum).clip(true));
-            }
+            table = with_window_columns(table, &window, width_of);
             if let Some((row, _)) = ev.reveal
                 && let Some(index) = rs.display_index(row)
             {
@@ -1838,22 +1853,27 @@ fn normal_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
                             ev.select_all = true;
                         }
                     });
-                    for c in 0..cols {
+                    spacer(&mut header, window.before);
+                    for c in window.range.clone() {
                         header.col(|ui| {
                             header_cell_bg(ui);
                             ui.add_space(6.0);
                             column_name(ui, rs, c, ev);
+                            resized.handle(ui, c, width_of(c), minimum);
                         });
                     }
+                    spacer(&mut header, window.after);
                 })
                 .body(|body| {
                     body.rows(look.row_height, row_count, |mut row| {
                         let r = row.index();
                         let grid_row = rs.display_row(r).unwrap();
                         row.col(|ui| row_number_cell(ui, row_label(rs, r, grid_row), grid_row, ev));
-                        for c in 0..cols {
+                        spacer(&mut row, window.before);
+                        for c in window.range.clone() {
                             data_cell(&mut row, rs, grid_row, c, CellSurface::Grid, ev);
                         }
+                        spacer(&mut row, window.after);
                     });
                 });
             // The nested vertical table consumes both scroll axes. Request horizontal
@@ -1863,6 +1883,124 @@ fn normal_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
             }
         });
     finish_horizontal_reveal(ui, ev, scroll.inner_rect);
+}
+
+/// Key of the transposed view's first column in `ColumnWidths`.
+const NAME_COLUMN: usize = usize::MAX;
+
+/// Widths the user dragged, kept in memory per query text so they survive a
+/// rerun. Tables build only visible columns, so they own their widths instead
+/// of the table's per-index state.
+struct ColumnWidths {
+    id: egui::Id,
+    widths: HashMap<usize, f32>,
+}
+
+impl ColumnWidths {
+    fn load(ui: &Ui, id: egui::Id) -> Self {
+        let id = id.with("column_widths");
+        Self {
+            id,
+            widths: ui.data(|data| data.get_temp(id)).unwrap_or_default(),
+        }
+    }
+
+    fn width(&self, key: usize, default: f32, minimum: f32) -> f32 {
+        self.widths.get(&key).copied().unwrap_or(default).max(minimum)
+    }
+
+    /// Drag handle on the right edge of a header cell; double-click restores
+    /// the automatic width.
+    fn handle(&self, ui: &mut Ui, key: usize, width: f32, minimum: f32) {
+        let cell = ui.max_rect();
+        let rect = egui::Rect::from_x_y_ranges(cell.right() - 5.0..=cell.right(), cell.y_range());
+        let response = ui.interact(rect, self.id.with(key), Sense::click_and_drag());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Resize Column")
+        });
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+            ui.painter().vline(
+                cell.right() - 1.0,
+                cell.y_range(),
+                egui::Stroke::new(2.0, theme::ACCENT),
+            );
+        }
+        let change = if response.double_clicked() {
+            Some(None)
+        } else if response.dragged() && response.drag_delta().x != 0.0 {
+            Some(Some((width + response.drag_delta().x).max(minimum)))
+        } else {
+            None
+        };
+        if let Some(change) = change {
+            ui.data_mut(|data| {
+                let widths = data.get_temp_mut_or_default::<HashMap<usize, f32>>(self.id);
+                match change {
+                    Some(width) => widths.insert(key, width),
+                    None => widths.remove(&key),
+                };
+            });
+        }
+    }
+}
+
+/// Columns of a horizontally scrolled table to build this frame. `offset` is
+/// the distance from the table's left edge to the first windowed column.
+fn column_window(
+    ui: &Ui,
+    offset: f32,
+    count: usize,
+    width_of: impl Fn(usize) -> f32,
+) -> layout::ColumnWindow {
+    let origin = ui.max_rect().left() + offset;
+    let clip = ui.clip_rect();
+    layout::column_window(
+        (0..count).map(&width_of),
+        ui.spacing().item_spacing.x,
+        egui::Rangef::new(clip.left() - origin, clip.right() - origin),
+    )
+}
+
+fn with_window_columns<'a>(
+    mut table: TableBuilder<'a>,
+    window: &layout::ColumnWindow,
+    width_of: impl Fn(usize) -> f32,
+) -> TableBuilder<'a> {
+    if window.before > 0.0 {
+        table = table.column(Column::exact(window.before));
+    }
+    for index in window.range.clone() {
+        table = table.column(Column::exact(width_of(index)).clip(true));
+    }
+    if window.after > 0.0 {
+        table = table.column(Column::exact(window.after));
+    }
+    table
+}
+
+/// Stands in for the columns outside the window.
+fn spacer(row: &mut egui_extras::TableRow<'_, '_>, width: f32) {
+    if width > 0.0 {
+        row.col(|_| {});
+    }
+}
+
+/// Scrolls toward a column that is not built this frame; the reveal finishes
+/// once the column is in the window and drawn.
+fn reveal_outside_window(
+    ui: &Ui,
+    ev: &mut GridEvents,
+    offset: f32,
+    index: usize,
+    width_of: impl Fn(usize) -> f32,
+) {
+    let spacing = ui.spacing().item_spacing.x;
+    let left = ui.max_rect().left() + offset + (0..index).map(|i| width_of(i) + spacing).sum::<f32>();
+    let clip = ui.clip_rect();
+    let rect = egui::Rect::from_x_y_ranges(left..=left + width_of(index), clip.y_range());
+    ui.scroll_to_rect(rect, None);
+    ev.revealed = false;
 }
 
 fn finish_horizontal_reveal(ui: &Ui, ev: &mut GridEvents, viewport: egui::Rect) {
@@ -1895,41 +2033,50 @@ fn transposed_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
     let scroll = egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let resized = ColumnWidths::load(ui, egui::Id::new((&rs.sql, "transposed")));
+            let name_minimum = if rs.local_filter.enabled { 126.0 } else { 100.0 };
+            let name_w = resized.width(NAME_COLUMN, name_w, name_minimum);
+            let width_of = |index: usize| {
+                resized.width(index, rs.transposed_width(rs.display_row(index).unwrap()), 40.0)
+            };
+            let spacing = ui.spacing().item_spacing.x;
+            let window = column_window(ui, name_w + spacing, row_count, width_of);
+            if let Some((row, _)) = ev.reveal
+                && let Some(index) = rs.display_index(row)
+                && !window.range.contains(&index)
+            {
+                reveal_outside_window(ui, ev, name_w + spacing, index, width_of);
+            }
             let mut table = TableBuilder::new(ui)
                 .id_salt((&rs.sql, "transposed"))
                 .striped(look.striped)
-                .resizable(true)
+                .resizable(false)
                 .sense(Sense::click_and_drag())
                 .min_scrolled_height(0.0)
                 .auto_shrink([false, false])
                 .cell_layout(Layout::left_to_right(Align::Center))
-                .column(
-                    Column::initial(name_w)
-                        .at_least(if rs.local_filter.enabled {
-                            126.0
-                        } else {
-                            100.0
-                        })
-                        .clip(true),
-                );
-            for index in 0..row_count {
-                let width = rs.transposed_width(rs.display_row(index).unwrap());
-                table = table.column(Column::initial(width).at_least(40.0).clip(true));
-            }
+                .column(Column::exact(name_w).clip(true));
+            table = with_window_columns(table, &window, width_of);
             if let Some((_, col)) = ev.reveal {
                 table = table.scroll_to_row(col, None);
             }
             table
                 .header(26.0, |mut header| {
-                    header.col(|ui| header_cell_bg(ui));
-                    for r in 0..row_count {
+                    header.col(|ui| {
+                        header_cell_bg(ui);
+                        resized.handle(ui, NAME_COLUMN, name_w, name_minimum);
+                    });
+                    spacer(&mut header, window.before);
+                    for r in window.range.clone() {
                         let row = rs.display_row(r).unwrap();
                         header.col(|ui| {
                             header_cell_bg(ui);
                             ui.add_space(6.0);
                             row_number_cell(ui, row_label(rs, r, row), row, ev);
+                            resized.handle(ui, r, width_of(r), 40.0);
                         });
                     }
+                    spacer(&mut header, window.after);
                 })
                 .body(|body| {
                     body.rows(look.row_height, cols, |mut row| {
@@ -1941,10 +2088,12 @@ fn transposed_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
                             ui.add_space(6.0);
                             column_name(ui, rs, c, ev);
                         });
-                        for index in 0..row_count {
+                        spacer(&mut row, window.before);
+                        for index in window.range.clone() {
                             let grid_row = rs.display_row(index).unwrap();
                             data_cell(&mut row, rs, grid_row, c, CellSurface::Grid, ev);
                         }
+                        spacer(&mut row, window.after);
                     });
                 });
             // The nested vertical table consumes both scroll axes. Request horizontal
@@ -2355,6 +2504,112 @@ mod tests {
                     toolbar: false,
                 },
             )
+    }
+
+    fn wide_harness(records: usize, columns: usize, transposed: bool) -> egui_kittest::Harness<'static, GridHarness> {
+        let data = QueryResult {
+            columns: (0..columns)
+                .map(|c| Column {
+                    name: format!("c{c}"),
+                    type_name: String::new(),
+                })
+                .collect(),
+            rows: (0..records)
+                .map(|r| (0..columns).map(|c| Value::Text(format!("v{r}_{c}"))).collect())
+                .collect(),
+            ..Default::default()
+        };
+        let mut result = ResultSet::new("t".into(), "select".into(), data, Page::first(records));
+        result.transposed = transposed;
+        result.show_value_editor = false;
+        egui_kittest::Harness::builder()
+            .with_size([1000.0, 500.0])
+            .build_ui_state(
+                |ui, state: &mut GridHarness| grid(ui, &mut state.rs, &mut state.tiles),
+                GridHarness {
+                    rs: result,
+                    tiles: super::super::map::TileCache::new(String::new(), std::env::temp_dir()),
+                    sql: String::new(),
+                    submitted: Vec::new(),
+                    toolbar: false,
+                },
+            )
+    }
+
+    /// Cells built and time per frame once layout has settled.
+    fn frame_cost(h: &mut egui_kittest::Harness<'static, GridHarness>) -> (usize, std::time::Duration) {
+        h.run_steps(5);
+        CELLS_BUILT.with(|cells| cells.set(0));
+        let start = std::time::Instant::now();
+        const FRAMES: u32 = 10;
+        for _ in 0..FRAMES {
+            h.step();
+        }
+        let elapsed = start.elapsed() / FRAMES;
+        (CELLS_BUILT.with(|cells| cells.get()) / FRAMES as usize, elapsed)
+    }
+
+    #[test]
+    fn wide_grids_build_only_visible_cells_and_still_reveal_far_ones() {
+        use egui_kittest::kittest::Queryable;
+        let mut few = wide_harness(500, 20, true);
+        let mut many = wide_harness(5000, 20, true);
+        let (few_cells, _) = frame_cost(&mut few);
+        let (many_cells, _) = frame_cost(&mut many);
+        assert_eq!(few_cells, many_cells, "same viewport, same cells");
+        assert!(many_cells < 1000, "{many_cells} cells");
+        // Keyboard navigation to the last record scrolls it into view.
+        many.state_mut().rs.select_cell((GridRow::Data(4999), 3), false);
+        many.state_mut().rs.pending_reveal = true;
+        many.run_steps(8);
+        assert!(!many.state().rs.pending_reveal);
+        assert!(many.query_by_label("v4999_3").is_some());
+        assert!(many.query_by_label("v0_3").is_none());
+
+        let mut wide = wide_harness(50, 2000, false);
+        let (cells, _) = frame_cost(&mut wide);
+        assert!(cells < 1000, "{cells} cells");
+        wide.state_mut().rs.select_cell((GridRow::Data(1), 1999), false);
+        wide.state_mut().rs.pending_reveal = true;
+        wide.run_steps(8);
+        assert!(!wide.state().rs.pending_reveal);
+        assert!(wide.query_by_label("v1_1999").is_some());
+    }
+
+    #[test]
+    fn dragging_a_header_edge_resizes_only_that_column() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = wide_harness(5, 3, false);
+        h.run_steps(3);
+        let cell = |h: &egui_kittest::Harness<'static, GridHarness>, label: &str| {
+            h.get_by_label(label).rect().left()
+        };
+        let before = (cell(&h, "v0_1"), cell(&h, "v0_2"));
+        let edge = h
+            .get_all_by_label("Resize Column")
+            .map(|node| node.rect())
+            .find(|rect| rect.left() > before.0 && rect.right() < before.1)
+            .expect("handle of c1");
+        let (edge, y) = (edge.center().x, edge.center().y);
+        h.drag_at(egui::pos2(edge, y));
+        h.hover_at(egui::pos2(edge + 30.0, y));
+        h.run_steps(1);
+        h.hover_at(egui::pos2(edge + 60.0, y));
+        h.run_steps(1);
+        h.drop_at(egui::pos2(edge + 60.0, y));
+        h.run_steps(3);
+        assert_eq!(cell(&h, "v0_1"), before.0);
+        assert!(cell(&h, "v0_2") > before.1 + 40.0, "column c1 grew");
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release --lib grid_frame_cost -- --ignored --nocapture"]
+    fn grid_frame_cost_benchmark() {
+        for (records, columns, transposed) in [(500, 20, true), (5000, 20, true), (50, 2000, false), (50, 20, false)] {
+            let mut h = wide_harness(records, columns, transposed);
+            let (cells, time) = frame_cost(&mut h);
+            println!("records={records} columns={columns} transposed={transposed}: {cells} cells/frame, {time:?}/frame");
+        }
     }
 
     #[test]
