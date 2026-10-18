@@ -215,7 +215,7 @@ Pageant. Shortcuts use Ctrl in place of ⌘ and Alt in place of ⌥.
 | | macOS | Linux | Windows |
 |---|---|---|---|
 | Configuration | `~/Library/Application Support/dev.dbeast.dbeast/config.json` | `~/.config/dbeast/config.json` | `%APPDATA%\dbeast\dbeast\config\config.json` |
-| Working session | `session.json` next to the configuration | same | same |
+| Working session | `session.json` and `session-results/` next to the configuration | same | same |
 
 Set `DBEAST_CONFIG` to use another configuration file, for example a throwaway one while
 testing. Neither file ever contains passwords; on macOS and Linux both are written with `0600`

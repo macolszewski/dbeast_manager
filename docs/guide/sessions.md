@@ -32,9 +32,9 @@ Some restored content needs a fresh read before you can change it:
 
 ## The session file
 
-The session is stored in `session.json` next to the configuration file. The file has 0600 permissions because it contains query results.
+The session is stored in `session.json` next to the configuration file, and the rows of saved results in the `session-results` folder beside it, one file per result. The files have 0600 permissions because they contain query results.
 
-It is written at most every 2 seconds after a change, and when the application closes.
+It is written at most every 2 seconds after a change, and when the application closes. The rows of a result are written once, in the background; later saves rewrite only `session.json` and remove files of results that are no longer open. On start, the session is read in the background and the tabs appear when it has been read. A `session.json` from an earlier version, which held the rows itself, is still restored.
 
 !!! note "Closing a console discards its content"
     The content of a closed console is removed from the saved session, and there is no recovery of closed consoles yet. DBeast therefore asks for confirmation before closing any console that is not empty.
@@ -53,7 +53,7 @@ The file is written with 0600 permissions. If a configuration from an earlier ve
 
 Files stored next to the configuration:
 
-- `session.json`, the working session,
+- `session.json` and the `session-results` folder, the working session,
 - `known_hosts`, the SSH host keys remembered on first connection (separate from `~/.ssh`),
 - `config.json.credentials-pending.json`, present only during a password migration. It contains identifiers of leftover entries from the old storage format, never passwords. Do not delete it manually after a migration error.
 

@@ -1293,6 +1293,7 @@ pub(super) mod tests {
             tiles: super::super::map::TileCache::new(String::new(), std::env::temp_dir()),
             scope_chooser: None,
             session_writer: Default::default(),
+            session_loading: None,
             find_action: Default::default(),
             appearance_dialog: None,
             about: Default::default(),

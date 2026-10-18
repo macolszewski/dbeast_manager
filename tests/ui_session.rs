@@ -105,14 +105,26 @@ fn tabs_and_data_survive_a_restart() {
         h.query_by_label("user10@example.com").is_some()
     });
     let session = dir.join("session.json");
+    let results = dir.join("session-results");
     wait_until(&mut h, "session written", |_| {
-        std::fs::read_to_string(&session).is_ok_and(|s| s.contains("user10@example.com"))
+        // Rows are kept next to session.json, one file per result.
+        session.exists()
+            && std::fs::read_dir(&results).is_ok_and(|files| {
+                files.flatten().any(|file| {
+                    std::fs::read_to_string(file.path())
+                        .is_ok_and(|s| s.contains("user10@example.com"))
+                })
+            })
     });
     drop(h);
 
     // Second run against an unreachable server: everything comes from the session.
     std::fs::write(&config_path, config(1)).unwrap();
     let mut h = app();
+    // The session is read in the background, then restored at once.
+    wait_until(&mut h, "session restored", |h| {
+        h.query_by_label("user10@example.com").is_some()
+    });
     assert!(
         h.query_all_by_label_contains("customers").count() >= 2,
         "table tab restored next to the tree row"
@@ -140,6 +152,7 @@ fn tabs_and_data_survive_a_restart() {
     // With the server back, the restored tree loads further on demand.
     std::fs::write(&config_path, config(55432)).unwrap();
     let mut h = app();
+    wait_until(&mut h, "session restored", |h| h.query_by_label("orders").is_some());
     expand(&mut h, "orders", 4);
     wait_until(&mut h, "folders of orders", |h| {
         h.query_by_label("indexes").is_some()

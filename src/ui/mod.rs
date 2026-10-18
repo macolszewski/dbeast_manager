@@ -308,6 +308,8 @@ pub struct App {
     /// Data source whose database and schema chooser is open.
     scope_chooser: Option<String>,
     session_writer: session::SessionWriter,
+    /// The saved session being read in the background on start.
+    session_loading: Option<std::sync::mpsc::Receiver<Option<session::Session>>>,
     find_action: actions::FindAction,
     appearance_dialog: Option<appearance::AppearanceDialog>,
     about: about::About,
@@ -341,6 +343,11 @@ impl App {
     }
 
     /// Test fixtures explicitly inject an isolated store; config overrides never select one.
+    /// True until the configuration is loaded and the saved session restored.
+    pub fn starting(&self) -> bool {
+        !self.config_loaded || self.session_loading.is_some()
+    }
+
     pub fn new_for_test(cc: &eframe::CreationContext<'_>) -> Self {
         assert!(
             std::env::var_os("DBEAST_CONFIG").is_some(),
@@ -405,6 +412,7 @@ impl App {
             tiles,
             scope_chooser: None,
             session_writer: Default::default(),
+            session_loading: None,
             find_action: Default::default(),
             appearance_dialog: None,
             about: about::About::new(!synchronous),
@@ -423,6 +431,26 @@ impl App {
             app.loaded_config(initial);
         }
         app
+    }
+
+    /// Restores the saved work session, or opens the configured consoles.
+    fn session_loaded(&mut self, saved: Option<session::Session>) {
+        match saved {
+            Some(saved) => self.restore_session(saved),
+            None => {
+                for console in self.config.consoles.clone() {
+                    let i = self.add_tab(
+                        console.title,
+                        console.ds_id,
+                        TabKind::Console { sql: console.sql },
+                    );
+                    self.tabs[i].database = console.database;
+                    self.tabs[i].schema = console.schema;
+                    self.update_metadata_key(i);
+                }
+                self.active = 0;
+            }
+        }
     }
 
     fn loaded_config(&mut self, result: Result<crate::persistence::Loaded, String>) {
@@ -494,21 +522,11 @@ impl App {
                 }
                 if first {
                     self.load_mcp_state();
-                    match session::load() {
-                        Some(saved) => self.restore_session(saved),
-                        None => {
-                            for console in self.config.consoles.clone() {
-                                let i = self.add_tab(
-                                    console.title,
-                                    console.ds_id,
-                                    TabKind::Console { sql: console.sql },
-                                );
-                                self.tabs[i].database = console.database;
-                                self.tabs[i].schema = console.schema;
-                                self.update_metadata_key(i);
-                            }
-                            self.active = 0;
-                        }
+                    if session::exists() {
+                        self.session_loading =
+                            Some(session::load_in_background(self.backend.ctx().clone()));
+                    } else {
+                        self.session_loaded(None);
                     }
                 }
                 if let Some(dialog) = &mut self.dialog {
@@ -704,6 +722,19 @@ impl App {
     // ---------------------------------------------------------------- events
 
     fn handle_events(&mut self) {
+        if let Some(loading) = &self.session_loading {
+            match loading.try_recv() {
+                Ok(saved) => {
+                    self.session_loading = None;
+                    self.session_loaded(saved);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.session_loading = None;
+                    self.session_loaded(None);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         while let Ok(ev) = self.backend.rx.try_recv() {
             match ev {
                 Event::McpChanged => self.mcp_changed(),

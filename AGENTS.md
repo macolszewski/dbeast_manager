@@ -47,7 +47,7 @@ Rust 2024, GUI in egui/eframe 0.36 (immediate mode rendering), UI tests with egu
 | `src/ui/scene3d.rs` | shared orbit camera and perspective projection for 3D scenes (Depth View, Database Graph) |
 | `src/config.rs` | `config.json` (data sources, history, filters); `DBEAST_CONFIG` overrides the path |
 | `src/ui/mod.rs` | `App`: application state, tabs, event handling, main window layout |
-| `src/ui/session.rs` | saving and restoring the work session (`session.json`) |
+| `src/ui/session.rs` | saving and restoring the work session (`session.json`, result rows in `session-results/`) |
 | `src/ui/console.rs` | console and table editor: toolbar, SQL editor |
 | `src/ui/results.rs` | result grid with editing, Output log |
 | `src/ui/explorer.rs`, `scope_chooser.rs` | Database Explorer and database/schema selection |

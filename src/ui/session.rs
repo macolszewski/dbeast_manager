@@ -8,12 +8,12 @@ use crate::config::Config;
 use crate::model::{DbObject, Page, QueryResult, SchemaSelection};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hasher;
+use std::io::Write as _;
 use std::ops::Range;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -84,57 +84,19 @@ struct SavedResult {
     aggregate_view: bool,
     #[serde(default = "value_editor_default")]
     show_value_editor: bool,
-    data: ResultJson,
+    /// Rows written inline by sessions before results had their own files.
+    #[serde(default, skip_serializing)]
+    data: Option<Box<RawValue>>,
+    /// File in the results folder holding the rows, written once per result.
+    #[serde(default)]
+    file: Option<String>,
+    /// Rows to write or just read; never part of session.json.
+    #[serde(skip)]
+    rows: Option<Arc<QueryResult>>,
 }
 
-/// Result rows serialized once and shared by the result, session snapshots
-/// and the writer thread, so a save never copies them. `id` names this
-/// serialization, which lets change detection skip the rows themselves.
-#[derive(Clone)]
-pub(super) struct ResultJson {
-    id: u64,
-    raw: Arc<RawValue>,
-}
-
-static NEXT_RESULT_JSON: AtomicU64 = AtomicU64::new(1);
-
-thread_local! {
-    /// Set while hashing a session: results contribute their `id`, not their rows.
-    static FINGERPRINT: Cell<bool> = const { Cell::new(false) };
-}
-
-impl ResultJson {
-    pub(super) fn of(data: &QueryResult) -> Option<Self> {
-        let raw = RawValue::from_string(serde_json::to_string(data).ok()?).ok()?;
-        Some(Self::new(raw))
-    }
-
-    fn new(raw: Box<RawValue>) -> Self {
-        Self {
-            id: NEXT_RESULT_JSON.fetch_add(1, Ordering::Relaxed),
-            raw: Arc::from(raw),
-        }
-    }
-}
-
-impl Serialize for ResultJson {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if FINGERPRINT.get() {
-            serializer.serialize_u64(self.id)
-        } else {
-            self.raw.serialize(serializer)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ResultJson {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Box::<RawValue>::deserialize(deserializer).map(Self::new)
-    }
-}
-
-/// Hash of everything a save would write, with each result's rows replaced by
-/// its identity. Equal hashes mean nothing needs serializing or writing.
+/// Hash of everything a save would write to session.json. Rows are in their own
+/// files, named once per result, so equal hashes mean nothing needs writing.
 fn fingerprint(session: &Session) -> Option<u64> {
     struct HashWriter(std::collections::hash_map::DefaultHasher);
     impl std::io::Write for HashWriter {
@@ -147,10 +109,7 @@ fn fingerprint(session: &Session) -> Option<u64> {
         }
     }
     let mut writer = HashWriter(Default::default());
-    FINGERPRINT.set(true);
-    let result = serde_json::to_writer(&mut writer, session);
-    FINGERPRINT.set(false);
-    result.ok()?;
+    serde_json::to_writer(&mut writer, session).ok()?;
     Some(writer.0.finish())
 }
 
@@ -212,11 +171,18 @@ mod tests {
         });
         app.tabs[index].results.push(result);
         app.tabs[index].view = ServicesView::Result(0);
-        let serialized = serde_json::to_string(&app.session()).unwrap();
+        let snapshot = app.session();
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        let rows = snapshot.tabs[0].results[0].rows.clone().unwrap();
         assert!(!serialized.contains("session_epoch"));
+        assert!(!serde_json::to_string(&*rows).unwrap().contains("session_epoch"));
+        let mut parsed: Session = serde_json::from_str(&serialized).unwrap();
+        // As `load` reads them back from their file.
+        parsed.tabs[0].results[0].rows =
+            Some(Arc::new(serde_json::from_str(&serde_json::to_string(&*rows).unwrap()).unwrap()));
         let mut restored = super::super::actions::tests::isolated_app(&ctx);
         restored.config.data_sources.push(ds);
-        restored.restore_session(serde_json::from_str(&serialized).unwrap());
+        restored.restore_session(parsed);
         let tab = &restored.tabs[0];
         assert_eq!(tab.bound_query.as_ref().unwrap().values, query.values);
         let TabKind::Console { sql } = &tab.kind else {
@@ -305,9 +271,13 @@ mod tests {
         let mut app = app_with_results(&ctx, 2);
         let first = fingerprint(&app.session()).unwrap();
         assert_eq!(fingerprint(&app.session()), Some(first));
-        // Results are shared with snapshots, not copied per save.
-        let json = app.tabs[0].results[0].data_json().unwrap().raw.clone();
-        assert!(Arc::ptr_eq(&json, &app.session().tabs[0].results[0].data.raw));
+        // Results are shared with snapshots, not copied or serialized per save.
+        let snapshot = app.session();
+        assert!(Arc::ptr_eq(
+            &app.tabs[0].results[0].data,
+            snapshot.tabs[0].results[0].rows.as_ref().unwrap()
+        ));
+        drop(snapshot);
         app.tabs[0].cursor = Some(1..2);
         let moved = fingerprint(&app.session()).unwrap();
         assert_ne!(moved, first);
@@ -319,23 +289,77 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dbeast-session-writer-{}", uuid::Uuid::new_v4()));
         let path = dir.join("session.json");
         let mut writer = SessionWriter::default();
+        let flush = |writer: &SessionWriter| {
+            let (done, finished) = mpsc::channel();
+            writer.worker.as_ref().unwrap().send(Job::Flush(done)).unwrap();
+            finished.recv().unwrap();
+        };
         for text in ["first", "second", "last"] {
             app.tabs[0].kind = TabKind::Console { sql: text.into() };
             writer.send(Job::Write(path.clone(), Box::new(app.session())));
         }
-        let (done, finished) = mpsc::channel();
-        writer.worker.as_ref().unwrap().send(Job::Flush(done)).unwrap();
-        finished.recv().unwrap();
-        let restored: Session = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        flush(&writer);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.len() < 20_000, "session.json holds no rows: {} bytes", text.len());
+        let restored = load_from(&path).unwrap();
         assert!(matches!(&restored.tabs[0].kind, TabKind::Console { sql } if sql == "last"));
-        assert_eq!(restored.tabs[1].results[0].data.raw.get(), app.tabs[1].results[0].data_json().unwrap().raw.get());
+        let rows = |result: &SavedResult| serde_json::to_string(result.rows.as_deref().unwrap()).unwrap();
+        assert_eq!(rows(&restored.tabs[1].results[0]), serde_json::to_string(&*app.tabs[1].results[0].data).unwrap());
+        assert_eq!(restored.tabs[1].results[0].file.as_ref(), Some(&app.tabs[1].results[0].session_file));
+        let results = results_dir(&path);
+        let file = results.join(&app.tabs[0].results[0].session_file);
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        // A changed session keeps the file of unchanged rows and drops replaced ones.
+        let replaced = app.tabs[1].results[0].session_file.clone();
+        let data = (*app.tabs[1].results[0].data).clone();
+        app.tabs[1].results[0] = ResultSet::new("synthetic".into(), "select 2".into(), data, Page::first(500));
+        writer.send(Job::Write(path.clone(), Box::new(app.session())));
+        flush(&writer);
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written);
+        assert!(!results.join(replaced).exists());
+        assert!(results.join(&app.tabs[1].results[0].session_file).exists());
+        assert_eq!(std::fs::read_dir(&results).unwrap().count(), 2);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+            for file in [path.clone(), file.clone()] {
+                let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
         }
         assert!(!writer.failed.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sessions_with_inline_rows_still_restore() {
+        let ctx = egui::Context::default();
+        let app = app_with_results(&ctx, 1);
+        let dir = std::env::temp_dir().join(format!("dbeast-session-compat-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("session.json");
+        let mut session = serde_json::to_value(app.session()).unwrap();
+        let result = &mut session["tabs"][0]["results"][0];
+        result.as_object_mut().unwrap().remove("file");
+        result["data"] = serde_json::to_value(&*app.tabs[0].results[0].data).unwrap();
+        // A damaged name never reaches outside the results folder.
+        session["tabs"][0]["results"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"title": "bad", "sql": "", "page": app.tabs[0].results[0].page, "file": "../config.json"}));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, session.to_string()).unwrap();
+        let restored = load_from(&path).unwrap();
+        let results = &restored.tabs[0].results;
+        assert!(results[0].file.is_none(), "rows get a new file on the next save");
+        assert_eq!(
+            serde_json::to_string(results[0].rows.as_deref().unwrap()).unwrap(),
+            serde_json::to_string(&*app.tabs[0].results[0].data).unwrap()
+        );
+        assert!(results[1].rows.is_none());
+        let mut restored_app = app_with_results(&ctx, 0);
+        restored_app.restore_session(restored);
+        assert_eq!(restored_app.tabs[0].results.len(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -349,9 +373,25 @@ mod tests {
         let ctx = egui::Context::default();
         for tabs in [10, 30] {
             let mut app = app_with_results(&ctx, tabs);
+            let start = Instant::now();
             app.save_session(true);
+            let first = start.elapsed().as_secs_f64() * 1000.0;
             app.finish_session();
-            let size = std::fs::metadata(dir.join("session.json")).unwrap().len();
+            // Reading happens on a background thread; restoring on the UI thread.
+            let start = Instant::now();
+            let saved = load().unwrap();
+            let read = start.elapsed().as_secs_f64() * 1000.0;
+            let start = Instant::now();
+            let mut restored = app_with_results(&ctx, 0);
+            restored.restore_session(saved);
+            let restore = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(restored.tabs.len(), tabs);
+            let size = std::fs::metadata(dir.join("session.json")).unwrap().len()
+                + std::fs::read_dir(dir.join("session-results"))
+                    .unwrap()
+                    .flatten()
+                    .map(|file| file.metadata().unwrap().len())
+                    .sum::<u64>();
             let median = |times: &mut Vec<f64>| {
                 times.sort_by(f64::total_cmp);
                 times[times.len() / 2]
@@ -372,7 +412,7 @@ mod tests {
             app.finish_session();
             let flush = start.elapsed().as_secs_f64() * 1000.0;
             println!(
-                "{tabs} tabs x 500 rows x 20 cols, session {:.1} MB: UI thread unchanged={:.3} ms, changed={:.3} ms (median of 21); final flush={flush:.1} ms",
+                "{tabs} tabs x 500 rows x 20 cols, session {:.1} MB: UI thread first save={first:.1} ms, unchanged={:.3} ms, changed={:.3} ms (median of 21); final flush={flush:.1} ms; background read={read:.1} ms, UI restore={restore:.1} ms",
                 size as f64 / 1e6,
                 median(&mut unchanged),
                 median(&mut changed),
@@ -448,10 +488,24 @@ fn run_writer(receiver: &mpsc::Receiver<Job>, failed: &AtomicBool) {
     }
 }
 
-fn save_to(path: &std::path::Path, session: &Session, failed: &AtomicBool) {
-    let result = serde_json::to_string(session)
-        .map_err(std::io::Error::other)
-        .and_then(|text| write(path, &text));
+/// Writes rows of results not yet on disk, then session.json, then removes
+/// result files the new session no longer names. session.json is replaced
+/// last, so it never names a file that is missing.
+fn save_to(path: &Path, session: &Session, failed: &AtomicBool) {
+    let result = (|| {
+        let dir = results_dir(path);
+        for result in session.tabs.iter().flat_map(|tab| &tab.results) {
+            if let (Some(file), Some(rows)) = (&result.file, &result.rows) {
+                let target = dir.join(file);
+                if !target.exists() {
+                    write_json(&target, rows.as_ref())?;
+                }
+            }
+        }
+        write_json(path, session)?;
+        remove_unreferenced(&dir, session);
+        Ok::<_, std::io::Error>(())
+    })();
     if let Err(e) = result {
         eprintln!("session save failed: {e}");
         failed.store(true, Ordering::Relaxed);
@@ -462,32 +516,126 @@ fn path() -> PathBuf {
     Config::data_dir().join("session.json")
 }
 
-/// The saved session, or `None` before the first one is written.
-pub(super) fn load() -> Option<Session> {
-    let text = std::fs::read_to_string(path()).ok()?;
-    match serde_json::from_str(&text) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!("session not restored: {e}");
-            None
+fn results_dir(session: &Path) -> PathBuf {
+    session.with_file_name("session-results")
+}
+
+/// A result file name written by this module; anything else in session.json
+/// is ignored, so a damaged file cannot point outside the results folder.
+fn result_file_name(name: &str) -> bool {
+    name.strip_prefix("r-")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+pub(super) fn new_result_file() -> String {
+    format!("r-{}.json", uuid::Uuid::new_v4())
+}
+
+fn remove_unreferenced(dir: &Path, session: &Session) {
+    let kept: HashSet<&str> = session
+        .tabs
+        .iter()
+        .flat_map(|tab| &tab.results)
+        .filter_map(|result| result.file.as_deref())
+        .collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let stale_temp = name
+            .strip_suffix(".tmp")
+            .is_some_and(result_file_name);
+        if (result_file_name(name) && !kept.contains(name)) || stale_temp {
+            std::fs::remove_file(entry.path()).ok();
         }
     }
 }
 
+/// The saved session with the rows of its results, or `None` before the first
+/// one is written. Reads files as streams; meant for a background thread.
+pub(super) fn exists() -> bool {
+    path().exists()
+}
+
+pub(super) fn load() -> Option<Session> {
+    load_from(&path())
+}
+
+fn load_from(path: &Path) -> Option<Session> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut session: Session = match serde_json::from_reader(std::io::BufReader::new(file)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("session not restored: {e}");
+            return None;
+        }
+    };
+    let dir = results_dir(path);
+    for result in session.tabs.iter_mut().flat_map(|tab| &mut tab.results) {
+        let rows = if let Some(raw) = result.data.take() {
+            // An older session: the rows get their own file on the next save.
+            result.file = None;
+            serde_json::from_str::<QueryResult>(raw.get()).ok()
+        } else {
+            result
+                .file
+                .as_deref()
+                .filter(|name| result_file_name(name))
+                .and_then(|name| std::fs::File::open(dir.join(name)).ok())
+                .and_then(|file| serde_json::from_reader(std::io::BufReader::new(file)).ok())
+        };
+        result.rows = rows.map(Arc::new);
+    }
+    Some(session)
+}
+
+/// Reads the session on a background thread; the result arrives on the receiver.
+pub(super) fn load_in_background(ctx: egui::Context) -> mpsc::Receiver<Option<Session>> {
+    let (sender, receiver) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("session-reader".into())
+        .spawn({
+            let sender = sender.clone();
+            move || {
+                let _ = sender.send(load());
+                ctx.request_repaint();
+            }
+        });
+    if spawned.is_err() {
+        let _ = sender.send(load());
+    }
+    receiver
+}
+
 /// Session data is local to this machine and may hold query results, so the
-/// file is readable only by the owner, like the config.
-fn write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+/// files are readable only by the owner, like the config. Written to a
+/// temporary file and renamed, so an interrupted write keeps the previous one.
+fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut out = std::io::BufWriter::new(options.open(&tmp)?);
+    serde_json::to_writer(&mut out, value).map_err(std::io::Error::other)?;
+    out.flush()?;
+    drop(out);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    // Renaming keeps the previous session intact if writing is interrupted.
     std::fs::rename(&tmp, path)
 }
 
@@ -518,8 +666,7 @@ impl App {
                 results: t
                     .results
                     .iter()
-                    .filter_map(|rs| {
-                        Some(SavedResult {
+                    .map(|rs| SavedResult {
                             origin: rs.origin.clone(),
                             title: rs.title.clone(),
                             sql: rs.sql.clone(),
@@ -529,8 +676,9 @@ impl App {
                             record_view: rs.record_view,
                             aggregate_view: rs.aggregate_view,
                             show_value_editor: rs.show_value_editor,
-                            data: rs.data_json()?.clone(),
-                        })
+                            data: None,
+                            file: Some(rs.session_file.clone()),
+                            rows: Some(rs.data.clone()),
                     })
                     .collect(),
                 view: match t.view {
@@ -613,12 +761,15 @@ impl App {
             tab.folds = saved.folds;
             tab.log = super::results::OutputLog::from_lines(saved.log);
             for r in saved.results {
-                let Ok(data) = serde_json::from_str::<QueryResult>(r.data.raw.get()) else {
+                let Some(rows) = r.rows else {
                     continue;
                 };
+                let data = Arc::try_unwrap(rows).unwrap_or_else(|rows| (*rows).clone());
                 let mut rs = ResultSet::new(r.title, r.sql, data, r.page);
-                // The rows were just read from this text; the next save reuses it.
-                rs.set_data_json(r.data);
+                // These rows are already in this file; the next save keeps it.
+                if let Some(file) = r.file {
+                    rs.session_file = file;
+                }
                 rs.origin = r.origin;
                 rs.transposed = r.transposed;
                 rs.record_view = r.record_view && !r.aggregate_view;
@@ -638,7 +789,8 @@ impl App {
     /// Writes the session when it changed, at most every [`SAVE_INTERVAL`]
     /// unless `now` is set.
     pub(super) fn save_session(&mut self, now: bool) {
-        if !self.config_loaded {
+        // Until the saved session is restored, saving would replace it.
+        if !self.config_loaded || self.session_loading.is_some() {
             return;
         }
         if !now

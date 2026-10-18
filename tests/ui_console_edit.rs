@@ -21,6 +21,13 @@ fn app() -> H<'static> {
         .wgpu()
         .build_eframe(|cc| dbeast::ui::App::new_for_test(cc));
     h.run_steps(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while h.state().starting() {
+        assert!(Instant::now() < deadline, "timed out waiting for the session");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
     h
 }
 
@@ -371,10 +378,18 @@ fn console_edits_use_physical_names_and_verified_row_operations() {
             return false;
         };
         let result = &tab["results"][view as usize];
+        // The rows are in their own file next to session.json.
+        let Some(rows) = result["file"]
+            .as_str()
+            .and_then(|file| std::fs::read_to_string(dir.join("session-results").join(file)).ok())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        else {
+            return false;
+        };
         tab["kind"]["Console"]["sql"] == SELECT
             && result["sql"] == SELECT
-            && result["data"]["rows"][0][2]["Text"] == "Ada O'Neil Żółw"
-            && result["data"]["rows"][0][3]["Text"] == "Value editor Żółw\nsecond line"
+            && rows["rows"][0][2]["Text"] == "Ada O'Neil Żółw"
+            && rows["rows"][0][3]["Text"] == "Value editor Żółw\nsecond line"
     });
     drop(h);
     let mut restored = app();
