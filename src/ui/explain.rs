@@ -124,7 +124,10 @@ impl App {
             context: context.clone(),
             bound_query: None,
         });
-        tab.log(LogKind::Sql, format!("{}> {sql}", mode.label()));
+        tab.log(
+            LogKind::Sql,
+            super::results::log_text(&[mode.label(), "> ", sql.as_str()]),
+        );
         self.show_services = true;
         self.backend.explain(ExplainRequest {
             console_id: tab.id,

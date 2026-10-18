@@ -2320,6 +2320,40 @@ struct LogEntry {
     rows: u32,
 }
 
+impl LogEntry {
+    /// Heap bytes the entry holds, which is what the log's byte limit counts.
+    fn owned_bytes(&self) -> usize {
+        self.line.text.capacity() + self.stamp.capacity()
+    }
+}
+
+/// The text of a log message made of `parts`, copying at most
+/// [`LOG_ENTRY_BYTES`] of them; a cut message ends with a note saying how
+/// many bytes were left out.
+pub fn log_text(parts: &[&str]) -> String {
+    let total: usize = parts.iter().map(|part| part.len()).sum();
+    if total <= LOG_ENTRY_BYTES {
+        return parts.concat();
+    }
+    let mut text = String::with_capacity(LOG_ENTRY_BYTES + 64);
+    for part in parts {
+        let room = LOG_ENTRY_BYTES - text.len();
+        if part.len() <= room {
+            text.push_str(part);
+            continue;
+        }
+        let mut end = room;
+        while !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.push_str(&part[..end]);
+        break;
+    }
+    let rest = total - text.len();
+    text.push_str(&format!("\n… {rest} more bytes of this message are not kept"));
+    text
+}
+
 /// A tab's Output log, bounded by messages and bytes. Drawing lays out only
 /// the messages in view.
 #[derive(Default)]
@@ -2333,14 +2367,10 @@ pub struct OutputLog {
 impl OutputLog {
     pub fn push(&mut self, mut line: LogLine) {
         if line.text.len() > LOG_ENTRY_BYTES {
-            let mut end = LOG_ENTRY_BYTES;
-            while !line.text.is_char_boundary(end) {
-                end -= 1;
-            }
-            let rest = line.text.len() - end;
-            line.text.truncate(end);
-            line.text
-                .push_str(&format!("\n… {rest} more bytes of this message are not kept"));
+            // A new buffer: truncating in place would keep the whole allocation.
+            line.text = log_text(&[&line.text]);
+        } else if line.text.capacity() > line.text.len() + 64 {
+            line.text.shrink_to_fit();
         }
         let stamp = match line.kind {
             LogKind::Sql => String::new(),
@@ -2349,19 +2379,20 @@ impl OutputLog {
             }
         };
         let rows = line.text.split('\n').count() as u32;
-        self.bytes += line.text.len();
-        self.entries.push_back(LogEntry {
+        let entry = LogEntry {
             line,
             stamp,
             top: self.rows,
             rows,
-        });
+        };
+        self.bytes += entry.owned_bytes();
+        self.entries.push_back(entry);
         self.rows += u64::from(rows);
         while self.entries.len() > LOG_ENTRIES || self.bytes > LOG_BYTES {
             let Some(entry) = self.entries.pop_front() else {
                 break;
             };
-            self.bytes -= entry.line.text.len();
+            self.bytes -= entry.owned_bytes();
             self.removed += 1;
         }
     }
@@ -2654,15 +2685,30 @@ mod tests {
         assert_eq!(log.entries.len(), LOG_ENTRIES);
         assert_eq!(log.removed, 5);
         assert_eq!(log.iter().next().unwrap().text, "message 5");
-        log.push(log_line(LogKind::Sql, format!("select '{}'", "ż".repeat(LOG_ENTRY_BYTES))));
+        // A message far over the limit keeps a small buffer, not its allocation.
+        log.push(log_line(LogKind::Sql, format!("select '{}'", "ż".repeat(4 << 20))));
         let last = log.last().unwrap();
-        assert!(last.text.len() < LOG_ENTRY_BYTES + 100);
+        assert!(last.text.capacity() < LOG_ENTRY_BYTES + 128, "{}", last.text.capacity());
         assert!(last.text.ends_with("bytes of this message are not kept"));
-        for _ in 0..200 {
-            log.push(log_line(LogKind::Sql, "x".repeat(LOG_ENTRY_BYTES)));
+        assert!(last.text.is_char_boundary(last.text.find('\n').unwrap()));
+        // A short message from an oversized buffer is shrunk too.
+        let mut roomy = String::with_capacity(1 << 20);
+        roomy.push_str("short");
+        log.push(log_line(LogKind::Info, roomy));
+        assert!(log.last().unwrap().text.capacity() < 128);
+        for _ in 0..500 {
+            log.push(log_line(LogKind::Sql, "x".repeat(LOG_ENTRY_BYTES * 4)));
         }
+        let owned: usize = log.entries.iter().map(LogEntry::owned_bytes).sum();
+        assert_eq!(log.bytes, owned);
         assert!(log.bytes <= LOG_BYTES);
-        assert_eq!(log.bytes, log.iter().map(|line| line.text.len()).sum::<usize>());
+        // Statement messages are built without copying the whole statement.
+        let statement = "ą".repeat(1 << 20);
+        let text = log_text(&["db", "> ", &statement]);
+        assert!(text.capacity() <= LOG_ENTRY_BYTES + 64);
+        assert!(text.starts_with("db> ąą"));
+        assert!(text.ends_with(&format!("{} more bytes of this message are not kept", statement.len() + 4 - text.find('\n').unwrap())));
+        assert_eq!(log_text(&["a", "> ", "b"]), "a> b");
         assert_eq!(log.recent(2).len(), 2);
     }
 

@@ -1399,7 +1399,7 @@ impl App {
             );
         }
         for s in &statements {
-            tab.log(LogKind::Sql, format!("{prompt}> {s}"));
+            tab.log(LogKind::Sql, results::log_text(&[prompt.as_str(), "> ", s.as_str()]));
         }
         tab.running = Some(kind);
         tab.running_origin = Some(results::ResultOrigin {
