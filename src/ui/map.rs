@@ -27,84 +27,179 @@ const USER_AGENT: &str = concat!(
 );
 
 type TileKey = (u8, u32, u32);
+type TileLoader = Arc<dyn Fn(TileKey) -> Option<egui::ColorImage> + Send + Sync>;
 
-enum Tile {
+/// Bytes of tile textures kept for tiles not drawn recently. Tiles needed by
+/// the current view are always kept, so a large view may go above it.
+const TEXTURE_BUDGET: usize = 64 << 20;
+/// Remembered failures and downloads in flight, so moving around the map
+/// does not grow the cache with entries that hold no texture.
+const MAX_EMPTY_ENTRIES: usize = 1024;
+
+enum TileState {
     Loading,
-    Ready(egui::TextureHandle),
+    Ready(egui::TextureHandle, usize),
     Failed,
 }
 
-/// Downloaded tiles as textures, shared by all Geo Viewers.
+struct Tile {
+    state: TileState,
+    /// Frame number in which a view last drew or kept this tile.
+    used: u64,
+}
+
+/// Downloaded tiles as textures, shared by all Geo Viewers. Textures are
+/// evicted least recently used first once they exceed the byte budget.
 pub struct TileCache {
     url: String,
-    dir: PathBuf,
+    load: TileLoader,
     tiles: HashMap<TileKey, Tile>,
     tx: Sender<(TileKey, Option<egui::ColorImage>)>,
     rx: Receiver<(TileKey, Option<egui::ColorImage>)>,
     running: Arc<AtomicUsize>,
+    budget: usize,
+    texture_bytes: usize,
+    frame: u64,
 }
 
 impl TileCache {
     /// `url` with `{z}`, `{x}` and `{y}`; empty disables the base map.
     pub fn new(url: String, dir: PathBuf) -> Self {
+        let template = url.clone();
+        let load: TileLoader = Arc::new(move |key: TileKey| {
+            let url = template
+                .replace("{z}", &key.0.to_string())
+                .replace("{x}", &key.1.to_string())
+                .replace("{y}", &key.2.to_string());
+            load_tile(&url, &dir.join(format!("{}/{}/{}.png", key.0, key.1, key.2)))
+        });
+        Self::with_loader(url, load, TEXTURE_BUDGET)
+    }
+
+    fn with_loader(url: String, load: TileLoader, budget: usize) -> Self {
         let (tx, rx) = channel();
         Self {
             url,
-            dir,
+            load,
             tiles: HashMap::new(),
             tx,
             rx,
             running: Arc::default(),
+            budget,
+            texture_bytes: 0,
+            frame: 0,
         }
     }
 
+    /// Takes finished downloads and evicts old textures, once per frame.
     fn poll(&mut self, ctx: &egui::Context) {
+        let frame = ctx.cumulative_frame_nr();
+        if frame == self.frame && frame != 0 {
+            return;
+        }
+        self.frame = frame;
+        // Tiles drawn in the previous frame by any view are still needed.
+        let recent = frame.saturating_sub(1);
         for (key, image) in self.rx.try_iter() {
-            let tile = match image {
-                Some(img) => Tile::Ready(ctx.load_texture(
-                    format!("tile-{key:?}"),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                )),
-                None => Tile::Failed,
+            let Some(tile) = self.tiles.get_mut(&key) else {
+                continue;
             };
-            self.tiles.insert(key, tile);
+            match image {
+                // A tile that left the view meanwhile is only on disk until needed again.
+                Some(_) if tile.used < recent => {
+                    self.tiles.remove(&key);
+                }
+                Some(img) => {
+                    let bytes = img.width() * img.height() * 4;
+                    let texture =
+                        ctx.load_texture(format!("tile-{key:?}"), img, egui::TextureOptions::LINEAR);
+                    tile.state = TileState::Ready(texture, bytes);
+                    self.texture_bytes += bytes;
+                }
+                None => tile.state = TileState::Failed,
+            }
+        }
+        self.evict(recent);
+    }
+
+    /// Drops least recently used textures above the budget and old empty
+    /// entries, never a tile used since `recent`.
+    fn evict(&mut self, recent: u64) {
+        let empty = self.tiles.len() - self.texture_count();
+        if self.texture_bytes <= self.budget && empty <= MAX_EMPTY_ENTRIES {
+            return;
+        }
+        let mut old: Vec<(u64, TileKey)> = self
+            .tiles
+            .iter()
+            .filter(|(_, t)| t.used < recent && !matches!(t.state, TileState::Loading))
+            .map(|(k, t)| (t.used, *k))
+            .collect();
+        old.sort_unstable();
+        let mut empty = empty;
+        for (_, key) in old {
+            if self.texture_bytes <= self.budget && empty <= MAX_EMPTY_ENTRIES {
+                break;
+            }
+            match self.tiles.get(&key).map(|t| &t.state) {
+                Some(TileState::Ready(_, bytes)) if self.texture_bytes > self.budget => {
+                    self.texture_bytes -= bytes;
+                    self.tiles.remove(&key);
+                }
+                Some(TileState::Failed) if empty > MAX_EMPTY_ENTRIES => {
+                    empty -= 1;
+                    self.tiles.remove(&key);
+                }
+                _ => {}
+            }
         }
     }
 
+    fn texture_count(&self) -> usize {
+        self.tiles
+            .values()
+            .filter(|t| matches!(t.state, TileState::Ready(..)))
+            .count()
+    }
+
+    /// Texture of a tile, starting its download when missing.
     fn get(&mut self, key: TileKey, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
         if self.url.is_empty() {
             return None;
         }
+        let frame = self.frame;
         if !self.tiles.contains_key(&key) && self.running.load(Ordering::Relaxed) < MAX_DOWNLOADS {
-            self.tiles.insert(key, Tile::Loading);
+            self.tiles.insert(
+                key,
+                Tile {
+                    state: TileState::Loading,
+                    used: frame,
+                },
+            );
             self.running.fetch_add(1, Ordering::Relaxed);
-            let (url, path, tx, running, ctx) = (
-                self.url
-                    .replace("{z}", &key.0.to_string())
-                    .replace("{x}", &key.1.to_string())
-                    .replace("{y}", &key.2.to_string()),
-                self.dir.join(format!("{}/{}/{}.png", key.0, key.1, key.2)),
+            let (load, tx, running, ctx) = (
+                self.load.clone(),
                 self.tx.clone(),
                 self.running.clone(),
                 ctx.clone(),
             );
             std::thread::spawn(move || {
-                let image = load_tile(&url, &path);
+                let image = load(key);
                 running.fetch_sub(1, Ordering::Relaxed);
                 let _ = tx.send((key, image));
                 ctx.request_repaint();
             });
         }
-        match self.tiles.get(&key) {
-            Some(Tile::Ready(t)) => Some(t),
-            _ => None,
-        }
+        self.ready(key)
     }
 
-    fn ready(&self, key: TileKey) -> Option<&egui::TextureHandle> {
-        match self.tiles.get(&key) {
-            Some(Tile::Ready(t)) => Some(t),
+    /// Texture of a tile already loaded, marked as still in use.
+    fn ready(&mut self, key: TileKey) -> Option<&egui::TextureHandle> {
+        let frame = self.frame;
+        let tile = self.tiles.get_mut(&key)?;
+        tile.used = frame;
+        match &tile.state {
+            TileState::Ready(t, _) => Some(t),
             _ => None,
         }
     }
@@ -456,6 +551,14 @@ fn draw_tiles(
     if tl[0] > 1.0 || br[0] < 0.0 || x1 < x0 || y1 < y0 {
         return;
     }
+    // Loaded tiles just outside the view stay cached, so small pans do not reload them.
+    for y in y0.saturating_sub(1)..=(y1 + 1).min(n - 1) {
+        for x in x0.saturating_sub(1)..=(x1 + 1).min(n - 1) {
+            if !(x0..=x1).contains(&x) || !(y0..=y1).contains(&y) {
+                tiles.ready((z, x, y));
+            }
+        }
+    }
     for y in y0..=y1 {
         for x in x0..=x1 {
             let w0 = [x as f64 / n as f64, y as f64 / n as f64];
@@ -608,5 +711,117 @@ mod tests {
         assert!(point_in_ring(pos2(5.0, 5.0), &ring));
         assert!(!point_in_ring(pos2(15.0, 5.0), &ring));
         assert!(segment_distance(pos2(5.0, 3.0), pos2(0.0, 0.0), pos2(10.0, 0.0)) == 3.0);
+    }
+
+    /// One headless frame; texture uploads are discarded as there is no renderer.
+    fn run_frame(ctx: &egui::Context, size: Vec2, mut ui: impl FnMut(&mut Ui)) -> egui::FullOutput {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            &mut ui,
+        );
+        out.textures_delta.clear();
+        out
+    }
+
+    /// Frames of a 1200x800 map until downloads settle; returns the loads made.
+    fn settle(
+        ctx: &egui::Context,
+        view: &mut MapView,
+        tiles: &mut TileCache,
+        loads: &AtomicUsize,
+    ) -> usize {
+        let before = loads.load(Ordering::SeqCst);
+        let mut idle = 0;
+        while idle < 3 {
+            let pending = tiles.running.load(Ordering::SeqCst)
+                + tiles
+                    .tiles
+                    .values()
+                    .filter(|t| matches!(t.state, TileState::Loading))
+                    .count();
+            idle = if pending == 0 { idle + 1 } else { 0 };
+            run_frame(ctx, vec2(1200.0, 800.0), |ui| {
+                show(ui, view, tiles, &[], None, false, &|_, _| {});
+            });
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        loads.load(Ordering::SeqCst) - before
+    }
+
+    #[test]
+    fn tile_textures_stay_within_budget_and_keep_the_view() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+        let load: TileLoader = Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Some(egui::ColorImage::filled([256, 256], Color32::GRAY))
+        });
+        let tile_bytes = 256 * 256 * 4;
+        let mut tiles = TileCache::with_loader("fake".into(), load, 40 * tile_bytes);
+        let ctx = egui::Context::default();
+        let mut view = MapView::default();
+        let mut peak = 0;
+        // Pan across Europe and zoom in and out repeatedly.
+        for step in 0..60 {
+            view.zoom = 5.0 + (step % 6) as f64;
+            view.center[0] = 0.5 + (step as f64 * 0.37).sin() * 0.05;
+            settle(&ctx, &mut view, &mut tiles, &loads);
+            let ready: usize = tiles
+                .tiles
+                .values()
+                .filter_map(|t| match t.state {
+                    TileState::Ready(_, bytes) => Some(bytes),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(ready, tiles.texture_bytes, "byte accounting");
+            peak = peak.max(tiles.texture_count());
+            // A settled view does not evict and reload its own tiles.
+            assert_eq!(settle(&ctx, &mut view, &mut tiles, &loads), 0, "step {step}");
+        }
+        // 1200x800 needs up to 6x5 tiles plus a one-tile margin; nothing else grows.
+        assert!(peak <= 40 + 8 * 7, "{peak} live textures");
+        assert!(tiles.texture_bytes <= 40 * tile_bytes + 8 * 7 * tile_bytes);
+        assert!(loads.load(Ordering::SeqCst) > 100, "the scenario evicts and reloads");
+    }
+
+    #[test]
+    fn late_tile_outside_the_view_is_not_uploaded() {
+        let (tx, rx) = channel::<()>();
+        let rx = std::sync::Mutex::new(rx);
+        let load: TileLoader = Arc::new(move |_| {
+            let _ = rx.lock().unwrap().recv();
+            Some(egui::ColorImage::filled([256, 256], Color32::GRAY))
+        });
+        let mut tiles = TileCache::with_loader("fake".into(), load, TEXTURE_BUDGET);
+        let ctx = egui::Context::default();
+        let frame = |tiles: &mut TileCache, view: &mut MapView| {
+            run_frame(&ctx, vec2(300.0, 300.0), |ui| {
+                show(ui, view, tiles, &[], None, false, &|_, _| {});
+            });
+        };
+        let mut view = MapView {
+            center: [0.1, 0.1],
+            zoom: 10.0,
+        };
+        frame(&mut tiles, &mut view);
+        assert_eq!(tiles.running.load(Ordering::SeqCst), MAX_DOWNLOADS);
+        // Far away before the downloads finish.
+        view.center = [0.9, 0.9];
+        frame(&mut tiles, &mut view);
+        frame(&mut tiles, &mut view);
+        for _ in 0..MAX_DOWNLOADS * 2 {
+            let _ = tx.send(());
+        }
+        while tiles.running.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        frame(&mut tiles, &mut view);
+        assert_eq!(tiles.texture_count(), 0, "late tiles are dropped, not uploaded");
+        assert_eq!(tiles.texture_bytes, 0);
     }
 }

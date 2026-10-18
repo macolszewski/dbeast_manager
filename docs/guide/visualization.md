@@ -29,7 +29,7 @@ Without an SRID, coordinates within the range of degrees are treated as EPSG:432
 
 - Drag to pan, use the mouse wheel or the **+** / **-** buttons to zoom, and **Fit** to show all objects.
 - Hover an object to see the record's data. Click it to select the record; the value panel and editing work as in the grid.
-- The base map uses OpenStreetMap raster tiles. Tiles are downloaded with DBeast's own User-Agent, cached on disk for 7 days and credited with "© OpenStreetMap contributors", following the OpenStreetMap tile usage policy. The tile server can be changed with the `tile_url` setting in the configuration file.
+- The base map uses OpenStreetMap raster tiles. Tiles are downloaded with DBeast's own User-Agent, cached on disk for 7 days (in memory, only about 64 MB of recently shown tiles are kept as textures) and credited with "© OpenStreetMap contributors", following the OpenStreetMap tile usage policy. The tile server can be changed with the `tile_url` setting in the configuration file.
 - Without tiles, objects are drawn on a dark background with a subtle grid.
 
 **Record View** also works next to the map. The panel on the right shows the record selected on the map or in the grid, and ◀ ▶ move the selection, which is also shown on the map. Aggregate View, Find and local filters apply to the grid and are hidden while the map is shown. Local filters do not affect the map: it shows the whole fetched page.
