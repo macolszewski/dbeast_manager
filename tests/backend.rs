@@ -2276,3 +2276,126 @@ fn wide_rows_end_a_page_on_its_byte_budget() {
         exercise_wide_row_pages(ds);
     }
 }
+
+/// Forwards the first connection to the test MySQL and holds every later one
+/// without answering, so a KILL QUERY connection never reaches the server.
+struct KillBlockingProxy {
+    port: u16,
+    /// Bytes the server sent to the client on the forwarded connection.
+    received: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    forwarded_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn kill_blocking_proxy() -> KillBlockingProxy {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(AtomicU64::new(0));
+    let forwarded_closed = Arc::new(AtomicBool::new(false));
+    let (counter, closed) = (received.clone(), forwarded_closed.clone());
+    std::thread::spawn(move || {
+        let mut first = true;
+        for client in listener.incoming() {
+            let Ok(mut client) = client else { return };
+            if !first {
+                // Held open and never answered, until the client gives up.
+                std::thread::spawn(move || {
+                    let mut buffer = [0u8; 1024];
+                    while matches!(client.read(&mut buffer), Ok(n) if n > 0) {}
+                });
+                continue;
+            }
+            first = false;
+            let mut server = std::net::TcpStream::connect("127.0.0.1:53306").unwrap();
+            let (mut client_in, mut server_out) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_in, &mut server_out);
+                let _ = server_out.shutdown(std::net::Shutdown::Both);
+            });
+            let (counter, closed) = (counter.clone(), closed.clone());
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 64 * 1024];
+                loop {
+                    match server.read(&mut buffer) {
+                        Ok(n) if n > 0 && client.write_all(&buffer[..n]).is_ok() => {
+                            counter.fetch_add(n as u64, Ordering::SeqCst);
+                        }
+                        _ => break,
+                    }
+                }
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                let _ = server.shutdown(std::net::Shutdown::Both);
+                closed.store(true, Ordering::SeqCst);
+            });
+        }
+    });
+    KillBlockingProxy { port, received, forwarded_closed }
+}
+
+/// Stop during a large MySQL result whose KILL QUERY cannot be delivered:
+/// the abandoned connection is closed within seconds instead of a detached
+/// task reading the rest of the result, the server session ends, and
+/// repeating it leaves no sessions behind.
+#[test]
+fn mysql_stop_closes_an_abandoned_connection_without_draining_it() {
+    use std::sync::atomic::Ordering;
+    let Some(direct) = mysql() else { return };
+    let backend = Backend::new(egui::Context::default());
+    let table = format!("dbeast_abandon_{}", uuid::Uuid::new_v4().simple());
+    let (setup, ..) = run(&backend, req(90, &direct, &[
+        &format!("create table {table} (id int primary key, note varchar(500))"),
+        &format!("insert into {table} with recursive s(n) as (select 1 union all select n + 1 from s where n < 1000) select n, repeat('x', 500) from s"),
+    ], false));
+    assert!(setup.iter().all(|(_, result)| result.is_ok()), "{setup:?}");
+    // TO_BASE64 keeps the statement on the full-read path: 10^9 rows.
+    let query = format!("select a.id, to_base64(b.note) from {table} a cross join {table} b cross join {table} c");
+    let sessions = |backend: &Backend| -> i64 {
+        let probe = format!("select count(*) from information_schema.processlist where info like 'select a.id, to_base64(b.note) from {table}%'");
+        let (done, ..) = run(backend, req(91, &direct, &[&probe], false));
+        match &done[0].1.as_ref().unwrap().rows[0][0] {
+            Value::Int(n) => *n,
+            other => panic!("{other:?}"),
+        }
+    };
+    for attempt in 0..3 {
+        let proxy = kill_blocking_proxy();
+        let mut ds = direct.clone();
+        ds.id = uuid::Uuid::new_v4().to_string();
+        ds.port = proxy.port;
+        let console = 10 + attempt;
+        backend.run(req(console, &ds, &[&query], false));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while proxy.received.load(Ordering::SeqCst) < 4 << 20 {
+            assert!(Instant::now() < deadline, "the result did not start streaming");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stopped = Instant::now();
+        backend.cancel(console);
+        let (done, in_tx) = collect_run(&backend, console);
+        assert!(!in_tx);
+        assert!(done[0].1.as_ref().unwrap_err().contains("outcome is unknown"));
+        while !proxy.forwarded_closed.load(Ordering::SeqCst) {
+            assert!(
+                stopped.elapsed() < Duration::from_secs(4),
+                "abandoned connection still open, {} bytes received",
+                proxy.received.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!(
+            "attempt {attempt}: connection closed {:.0} ms after Stop, {} MB received",
+            stopped.elapsed().as_secs_f64() * 1000.0,
+            proxy.received.load(Ordering::SeqCst) >> 20
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sessions(&backend) > 0 {
+            assert!(Instant::now() < deadline, "the server session kept running");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        backend.disconnect(&ds.id);
+    }
+    let (cleanup, ..) = run(&backend, req(90, &direct, &[&format!("drop table {table}")], false));
+    assert!(cleanup[0].1.is_ok());
+}

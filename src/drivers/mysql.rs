@@ -44,11 +44,13 @@ async fn open_socket(opts: Opts) -> Result<Conn> {
 }
 
 impl MyCancel {
+    /// Callers bound this with a timeout; dropping it then closes the cancel
+    /// socket instead of leaving a detached task to finish the exchange.
     pub async fn cancel(self) -> Result<()> {
-        let mut conn = open_socket(self.opts).await?;
+        let mut conn = mcp::ManagedConn::ordinary(open_socket(self.opts).await?);
         conn.query_drop(format!("KILL QUERY {}", self.connection_id))
             .await?;
-        conn.disconnect().await?;
+        conn.close().await;
         Ok(())
     }
 }
@@ -70,7 +72,7 @@ impl MyConn {
             builder = builder.ssl_opts(Some(material.mysql.with_danger_tls_hostname_override(Some(ds.host.clone()))));
         }
         let opts: Opts = builder.into();
-        let mut conn = open_socket(opts.clone()).await?;
+        let mut conn = mcp::ManagedConn::ordinary(open_socket(opts.clone()).await?);
         if ds.read_only {
             conn.query_drop("SET SESSION TRANSACTION READ ONLY").await?;
         }
@@ -79,7 +81,7 @@ impl MyConn {
             .await?
             .and_then(|row| row.0);
         Ok(Self {
-            conn: mcp::ManagedConn::ordinary(conn),
+            conn,
             opts,
             initial_database,
             tls_mode: ds.tls.mode,

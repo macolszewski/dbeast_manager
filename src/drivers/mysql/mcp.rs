@@ -11,11 +11,15 @@ use mysql_async::prelude::*;
 use mysql_async::{Row, Value};
 use serde_json::json;
 
-/// mysql_async's normal Drop drains pending results in a detached recycler.
-/// MCP sockets must close without draining an unbounded query tail instead.
+/// mysql_async's normal Drop drains pending results in a detached recycler
+/// (`cleanup_for_pool` in 0.37), which reads an abandoned query's whole tail
+/// or waits on an unresponsive server without limit. Every socket, MCP and
+/// application alike, instead closes after at most a second of `disconnect`;
+/// a drain still running then is cut off by dropping the stream.
 pub(super) struct ManagedConn {
     inner: Option<mysql_async::Conn>,
-    bounded: bool,
+    /// Opened for an MCP execution, which cancels through [`McpCancel`].
+    mcp: bool,
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
 }
 impl ManagedConn {
@@ -59,7 +63,7 @@ impl ManagedConn {
         .await?
     }
 
-    async fn close(mut self) {
+    pub(super) async fn close(mut self) {
         if let Some(connection) = self.inner.take() {
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(1), connection.disconnect())
@@ -69,7 +73,7 @@ impl ManagedConn {
     pub(super) fn ordinary(connection: mysql_async::Conn) -> Self {
         Self {
             inner: Some(connection),
-            bounded: false,
+            mcp: false,
             execution_lease: None,
         }
     }
@@ -79,7 +83,7 @@ impl ManagedConn {
     ) -> Self {
         Self {
             inner: Some(connection),
-            bounded: true,
+            mcp: true,
             execution_lease,
         }
     }
@@ -113,11 +117,9 @@ impl std::ops::DerefMut for ManagedConn {
 }
 impl Drop for ManagedConn {
     fn drop(&mut self) {
-        if self.bounded
-            && let Some(connection) = self.inner.take()
-        {
-            // Guard for cancellation during setup. The normal execution path
-            // awaits close_mcp before releasing its global concurrency permit.
+        if let Some(connection) = self.inner.take() {
+            // Also the guard for MCP cancellation during setup. The normal MCP
+            // path awaits close_mcp before releasing its concurrency permit.
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let execution_lease = self.execution_lease.take();
                 runtime.spawn(async move {
@@ -216,7 +218,7 @@ impl MyConn {
     }
 
     pub(crate) fn mcp_cancel_handle(&self) -> Option<McpCancel> {
-        self.conn.bounded.then(|| McpCancel {
+        self.conn.mcp.then(|| McpCancel {
             opts: self.opts.clone(),
             connection_id: self.conn.id(),
             execution_lease: self.conn.execution_lease.clone(),
