@@ -54,6 +54,8 @@ struct Node {
 
 /// A parsed JSON value flattened in preorder, with the rows its open nodes show.
 pub struct JsonTree {
+    /// Heap bytes of the nodes and their text, counted once when built.
+    bytes: usize,
     nodes: Vec<Node>,
     /// Nodes whose open state differs from the default (the first two levels open).
     toggled: HashSet<u32>,
@@ -123,13 +125,33 @@ impl JsonTree {
         for index in open {
             nodes[index].next = end;
         }
+        let text: usize = nodes
+            .iter()
+            .map(|node| {
+                let key = match &node.key {
+                    Key::Name(name) => name.len(),
+                    Key::None | Key::Item => 0,
+                };
+                let value = match &node.kind {
+                    Kind::Scalar { text, .. } => text.len(),
+                    Kind::Container { .. } => 0,
+                };
+                key + value
+            })
+            .sum();
         let mut tree = Self {
+            bytes: nodes.capacity() * std::mem::size_of::<Node>() + text,
             nodes,
             toggled,
             rows: Vec::new(),
         };
         tree.refresh_rows();
         Some(tree)
+    }
+
+    /// Heap bytes held, rows of the open nodes included.
+    pub fn heap_bytes(&self) -> usize {
+        self.bytes + self.rows.capacity() * 4 + self.toggled.capacity() * 8
     }
 
     pub fn toggled(&self) -> &HashSet<u32> {
@@ -304,6 +326,10 @@ impl TextLines {
 
     pub fn row_count(&self) -> usize {
         self.starts.len()
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.starts.capacity() * std::mem::size_of::<u64>()
     }
 
     fn row<'a>(&self, text: &'a str, row: usize) -> (&'a str, bool) {

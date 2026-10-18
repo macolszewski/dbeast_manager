@@ -479,20 +479,122 @@ fn is_geometry_type(type_name: &str) -> bool {
 
 /// Columns that hold geometries: by type, or because their first non-null
 /// values decode as geometries.
+/// Columns holding geometries: a geometry type, or sampled values that all
+/// parse. Checks every candidate fully; see [`detect_geometry_columns`] for
+/// the bounded check the UI makes.
 pub fn geometry_columns(columns: &[Column], rows: &[Vec<Value>]) -> Vec<usize> {
-    (0..columns.len())
+    let detection = detect_geometry_columns(columns, rows);
+    let mut found = detection.columns;
+    found.extend(confirm_geometry_columns(
+        &detection.undecided,
+        rows,
+        &std::sync::atomic::AtomicBool::new(false),
+    ));
+    found.sort_unstable();
+    found
+}
+
+/// Rows looked at per column, NULLs included.
+const SAMPLE_ROWS: usize = 1000;
+/// Non-NULL values that must all parse for a column without a geometry type.
+const SAMPLE_VALUES: usize = 20;
+/// Bytes of values parsed by [`detect_geometry_columns`] for all columns
+/// together; columns beyond it, or with larger values, are left undecided.
+const QUICK_BYTES: usize = 256 * 1024;
+
+pub struct Detection {
+    /// Geometry columns, by type or by small sampled values.
+    pub columns: Vec<usize>,
+    /// Columns whose sample is too large to parse here; confirm them with
+    /// [`confirm_geometry_columns`], away from the UI thread.
+    pub undecided: Vec<usize>,
+}
+
+fn sample(rows: &[Vec<Value>], column: usize) -> impl Iterator<Item = &Value> {
+    rows.iter()
+        .take(SAMPLE_ROWS)
+        .map(move |row| &row[column])
+        .filter(|value| **value != Value::Null)
+        .take(SAMPLE_VALUES)
+}
+
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Text(text) => text.len(),
+        Value::Bytes(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
+
+/// Values that cannot be geometries, found without parsing: JSON in which no
+/// GeoJSON member appears (every GeoJSON geometry, Feature and collection has
+/// "coordinates" or "geometries" somewhere), numbers and booleans. Text longer
+/// than `scan` bytes is not scanned and counts as possible.
+fn cannot_be_geometry(value: &Value, scan: usize) -> bool {
+    match value {
+        Value::Text(text) => {
+            let text = text.trim_start();
+            text.starts_with('{')
+                && text.len() <= scan
+                && !text.contains("\"coordinates\"")
+                && !text.contains("\"geometries\"")
+        }
+        Value::Bytes(_) => false,
+        _ => true,
+    }
+}
+
+/// A bounded first check of which columns hold geometries: at most
+/// [`SAMPLE_ROWS`] rows per column and [`QUICK_BYTES`] of parsed values for
+/// the whole result. Its cost does not depend on the size of large cells.
+pub fn detect_geometry_columns(columns: &[Column], rows: &[Vec<Value>]) -> Detection {
+    let mut detection = Detection {
+        columns: Vec::new(),
+        undecided: Vec::new(),
+    };
+    let mut budget = QUICK_BYTES;
+    for (c, column) in columns.iter().enumerate() {
+        if is_geometry_type(&column.type_name) {
+            detection.columns.push(c);
+            continue;
+        }
+        let values: Vec<&Value> = sample(rows, c).collect();
+        if values.is_empty() || values.iter().any(|value| cannot_be_geometry(value, QUICK_BYTES)) {
+            continue;
+        }
+        let bytes: usize = values.iter().map(|value| value_bytes(value)).sum();
+        if bytes > budget {
+            detection.undecided.push(c);
+            continue;
+        }
+        budget -= bytes;
+        if values
+            .iter()
+            .all(|value| parse_value(value).is_some_and(|g| !g.shapes.is_empty()))
+        {
+            detection.columns.push(c);
+        }
+    }
+    detection
+}
+
+/// The full check of undecided columns; stops early when `cancel` is set.
+pub fn confirm_geometry_columns(
+    candidates: &[usize],
+    rows: &[Vec<Value>],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<usize> {
+    candidates
+        .iter()
+        .copied()
         .filter(|&c| {
-            if is_geometry_type(&columns[c].type_name) {
-                return true;
-            }
-            let mut sample = rows
-                .iter()
-                .map(|r| &r[c])
-                .filter(|v| **v != Value::Null)
-                .take(20)
-                .peekable();
-            sample.peek().is_some()
-                && sample.all(|v| parse_value(v).is_some_and(|g| !g.shapes.is_empty()))
+            // A scan rejects plain JSON before any value is parsed into a tree.
+            !sample(rows, c).any(|value| cannot_be_geometry(value, usize::MAX))
+                && sample(rows, c).all(|value| {
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        && parse_value(value).is_some_and(|g| !g.shapes.is_empty())
+                })
+                && !cancel.load(std::sync::atomic::Ordering::Relaxed)
         })
         .collect()
 }
@@ -798,6 +900,92 @@ mod tests {
             Value::Text("POINT(21 52)".into()),
         ]];
         assert_eq!(geometry_columns(&cols, &rows), [2, 3]);
+    }
+
+    #[test]
+    fn detection_on_the_ui_thread_is_bounded_by_bytes_and_rows() {
+        let cols: Vec<Column> = ["json", "geojson", "wkt", "wkb", "empty", "small"]
+            .iter()
+            .map(|n| Column {
+                name: n.to_string(),
+                type_name: "text".into(),
+            })
+            .collect();
+        let big_json = format!("{{\"items\": [{}0]}}", "1, ".repeat(1 << 20));
+        let big_geojson = format!(
+            "{{\"type\": \"LineString\", \"coordinates\": [{}[0, 0]]}}",
+            "[21.0, 52.0], ".repeat(40_000)
+        );
+        let big_wkt = format!("LINESTRING({}0 0)", "21 52, ".repeat(60_000));
+        let mut wkb = vec![1u8, 2, 0, 0, 0];
+        wkb.extend(100_000u32.to_le_bytes());
+        for _ in 0..100_000 {
+            wkb.extend(21.0f64.to_le_bytes());
+            wkb.extend(52.0f64.to_le_bytes());
+        }
+        let mut rows: Vec<Vec<Value>> = (0..3)
+            .map(|_| {
+                vec![
+                    Value::Text(big_json.clone()),
+                    Value::Text(big_geojson.clone()),
+                    Value::Text(big_wkt.clone()),
+                    Value::Bytes(wkb.clone()),
+                    Value::Null,
+                    Value::Text("POINT(1 2)".into()),
+                ]
+            })
+            .collect();
+        // Thousands of NULL rows are looked at only up to the row limit.
+        rows.extend((0..5000).map(|_| vec![Value::Null; 6]));
+        let detection = detect_geometry_columns(&cols, &rows);
+        assert_eq!(detection.columns, [5], "small values are decided at once");
+        // Large values, plain JSON included, are left to the worker, which
+        // rejects plain JSON by a scan before parsing anything.
+        assert_eq!(detection.undecided, [0, 1, 2, 3]);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(confirm_geometry_columns(&detection.undecided, &rows, &cancel), [1, 2, 3]);
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(confirm_geometry_columns(&detection.undecided, &rows, &cancel).is_empty());
+        assert_eq!(geometry_columns(&cols, &rows), [1, 2, 3, 5]);
+        // A column whose values appear only after the sampled rows stays plain.
+        let late = vec![vec![Value::Null; 6]; 1000]
+            .into_iter()
+            .chain([vec![Value::Text("POINT(1 2)".into()); 6]])
+            .collect::<Vec<_>>();
+        assert!(geometry_columns(&cols, &late).is_empty());
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release --lib geometry_detection_cost -- --ignored --nocapture"]
+    fn geometry_detection_cost_benchmark() {
+        let cols = vec![Column {
+            name: "doc".into(),
+            type_name: "jsonb".into(),
+        }];
+        for mib in [1usize, 10] {
+            let json = format!("{{\"items\": [{}0]}}", "1, ".repeat((mib << 20) / 3));
+            let rows = vec![vec![Value::Text(json)]; 20];
+            // The check before: parse every sampled value on the UI thread.
+            let start = std::time::Instant::now();
+            let old = rows
+                .iter()
+                .map(|r| &r[0])
+                .take(20)
+                .all(|v| parse_value(v).is_some_and(|g| !g.shapes.is_empty()));
+            let before = start.elapsed();
+            let start = std::time::Instant::now();
+            let detection = detect_geometry_columns(&cols, &rows);
+            let ui = start.elapsed();
+            let start = std::time::Instant::now();
+            let confirmed = confirm_geometry_columns(
+                &detection.undecided,
+                &rows,
+                &std::sync::atomic::AtomicBool::new(false),
+            );
+            let worker = start.elapsed();
+            assert!(!old && confirmed.is_empty());
+            println!("20 x {mib} MiB plain JSON: before {before:?} on the UI thread; after {ui:?} on the UI thread, {worker:?} on the worker (no parse)");
+        }
     }
 
     #[test]

@@ -5,10 +5,33 @@ use super::super::json_view;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
+/// Releases what the value panel prepared for `rs` while it is not shown.
+pub(super) fn release_hidden(rs: &ResultSet) {
+    if let Some(cache) = rs.value_cache.as_ref().and_then(std::sync::Weak::upgrade) {
+        let mut cache = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        if cache.holds(rs.action_id) {
+            cache.release(rs.action_id);
+        }
+    }
+}
+
+/// Releases what the value panel prepared for a result that is dropped.
+pub(super) fn release_dropped(cache: &std::sync::Weak<Mutex<ViewCache>>, result: u64) {
+    if let Some(cache) = cache.upgrade() {
+        cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .release(result);
+    }
+}
+
 pub(super) fn viewer(ui: &mut Ui, rs: &mut ResultSet) {
     let Some((row, column)) = rs.valid_selection() else {
         return;
     };
+    if rs.value_cache.is_none() {
+        rs.value_cache = Some(std::sync::Arc::downgrade(&ViewCache::of(ui.ctx())));
+    }
     let editing = rs.edits.editing_surface == CellSurface::Value
         && rs
             .edits
@@ -244,6 +267,9 @@ const INLINE_BYTES: usize = 64 * 1024;
 /// Prepared views kept at once, across all result sets: the active cell and
 /// one more, so two panels drawn in the same frame do not rebuild each other.
 const CACHED_VIEWS: usize = 2;
+/// Bytes prepared views may hold together; the newest view is kept even when
+/// it alone is larger.
+const CACHED_VIEW_BYTES: usize = 128 << 20;
 
 /// Identifies the shown text without hashing it: a fetched value never changes,
 /// and every change to staged values gets a new edit revision.
@@ -289,6 +315,22 @@ enum View {
 impl View {
     fn is_json(&self) -> bool {
         !matches!(self, View::Plain(_))
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            View::Plain(lines) => lines.heap_bytes(),
+            View::Tree(tree) => tree.heap_bytes(),
+            View::Pretty { text, lines, job } => {
+                text.capacity()
+                    + lines.heap_bytes()
+                    + job.as_ref().map_or(0, |job| {
+                        job.text.capacity()
+                            + job.sections.capacity()
+                                * std::mem::size_of::<egui::text::LayoutSection>()
+                    })
+            }
+        }
     }
 
     fn prepare(
@@ -411,10 +453,32 @@ impl ViewCache {
             self.prepared += 1;
         }
         self.views.retain(|(k, _)| *k != key);
-        if self.views.len() >= CACHED_VIEWS {
+        self.views.push((key, view));
+        while self.views.len() > CACHED_VIEWS
+            || (self.views.len() > 1 && self.bytes() > CACHED_VIEW_BYTES)
+        {
             self.views.remove(0);
         }
-        self.views.push((key, view));
+    }
+
+    fn bytes(&self) -> usize {
+        self.views.iter().map(|(_, view)| view.heap_bytes()).sum()
+    }
+
+    /// Drops the views of one result and stops a worker preparing one, when
+    /// the result is closed or its value panel is no longer shown.
+    fn release(&mut self, result: u64) {
+        self.views.retain(|(key, _)| key.result != result);
+        if self.job.as_ref().is_some_and(|job| job.key.result == result)
+            && let Some(job) = self.job.take()
+        {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn holds(&self, result: u64) -> bool {
+        self.views.iter().any(|(key, _)| key.result == result)
+            || self.job.as_ref().is_some_and(|job| job.key.result == result)
     }
 }
 
@@ -563,7 +627,7 @@ mod tests {
 
     #[test]
     fn stale_worker_results_are_dropped_when_the_cell_or_edit_changes() {
-        let big = |c: char| format!("[\"{}\"]", c.to_string().repeat(4 << 20));
+        let big = |c: char| format!("[\"{}\"]", c.to_string().repeat(32 << 20));
         let mut h = values_harness(vec![Value::Text(big('a')), Value::Text(big('b'))]);
         h.run_steps(1);
         // Select another cell while the first is still being prepared.
@@ -614,5 +678,79 @@ mod tests {
             let after = start.elapsed() / 10;
             println!("{mib} MiB JSON: before >= {before:?} per frame (copy + parse only); after: prepared once in {prepare:?} off the UI thread, then {after:?} per frame");
         }
+    }
+
+    #[test]
+    fn closing_a_result_or_hiding_its_panel_releases_prepared_views() {
+        let big = |c: char| format!("[\"{}\"]", c.to_string().repeat(2 << 20));
+        let mut h = values_harness(vec![Value::Text(big('a')), Value::Text(big('b'))]);
+        h.run_steps(1);
+        wait_for_worker(&mut h);
+        h.state_mut().selected = Some((GridRow::Data(1), 1));
+        h.run_steps(1);
+        wait_for_worker(&mut h);
+        let cache = ViewCache::of(&h.ctx);
+        let result = h.state().action_id;
+        assert_eq!(cache.lock().unwrap().views.len(), 2);
+        assert!(cache.lock().unwrap().bytes() > 0);
+
+        // Hidden while a third value is being prepared: the job is dropped
+        // and the worker lets go of the rows when it stops.
+        std::sync::Arc::make_mut(&mut h.state_mut().data).rows.push(vec![
+            Value::Int(3),
+            Value::Text(big('c')),
+            Value::Int(0),
+        ]);
+        h.state_mut().order.push(2);
+        let rows = std::sync::Arc::downgrade(&h.state().data);
+        h.state_mut().selected = Some((GridRow::Data(2), 1));
+        h.run_steps(1);
+        assert!(cache.lock().unwrap().job.is_some());
+        release_hidden(h.state());
+        assert!(!cache.lock().unwrap().holds(result));
+        let state = std::mem::replace(
+            h.state_mut(),
+            editability::tests::editable_result(),
+        );
+        drop(state);
+        for _ in 0..500 {
+            if rows.strong_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(rows.strong_count(), 0, "the worker released the rows");
+
+        // Dropping a result releases its views without the panel being drawn.
+        let mut second = values_harness(vec![Value::Text(big('d'))]);
+        second.run_steps(1);
+        wait_for_worker(&mut second);
+        let cache = ViewCache::of(&second.ctx);
+        assert_eq!(cache.lock().unwrap().views.len(), 1);
+        let replaced = std::mem::replace(second.state_mut(), editability::tests::editable_result());
+        drop(replaced);
+        assert!(cache.lock().unwrap().views.is_empty());
+    }
+
+    #[test]
+    fn prepared_views_stay_within_their_byte_budget() {
+        let mut cache = ViewCache::default();
+        let key = |row| ViewKey {
+            result: 1,
+            data: 0,
+            row: GridRow::Data(row),
+            column: 0,
+            revision: 0,
+            text_mode: false,
+        };
+        let text = "x\n".repeat(CACHED_VIEW_BYTES / 10);
+        let lines = || {
+            View::Plain(json_view::TextLines::index(&text, false, &AtomicBool::new(false)).unwrap())
+        };
+        cache.insert(key(0), lines());
+        assert!(cache.bytes() > CACHED_VIEW_BYTES / 2);
+        cache.insert(key(1), lines());
+        assert_eq!(cache.views.len(), 1, "two views would exceed the budget");
+        assert_eq!(cache.views[0].0, key(1), "the newest view is kept");
     }
 }

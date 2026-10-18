@@ -137,6 +137,10 @@ pub struct ResultSet {
     /// Geo Viewer shown instead of the grid.
     pub geo: Option<GeoState>,
     geo_columns: Option<Vec<usize>>,
+    /// Confirmation of geometry columns with large values, owned by this result.
+    geo_detection: Option<GeoDetection>,
+    /// The value panel's cache that may hold views of this result.
+    value_cache: Option<std::sync::Weak<std::sync::Mutex<value::ViewCache>>>,
     /// `data` as JSON for the saved session; rows never change after fetching.
     /// File the work session keeps these rows in, written once.
     pub(super) session_file: String,
@@ -161,6 +165,85 @@ impl GeoState {
             layer: Default::default(),
             fit: true,
         }
+    }
+}
+
+/// Geometry detections running at once; others start when one finishes.
+const GEO_DETECTIONS: usize = 2;
+static RUNNING_GEO_DETECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The full parse of sampled values that were too large to check on the UI
+/// thread. Dropping it, with its result, cancels the worker.
+struct GeoDetection {
+    candidates: Vec<usize>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<usize>>>>>,
+}
+
+impl GeoDetection {
+    fn pending(candidates: Vec<usize>) -> Self {
+        Self {
+            candidates,
+            cancel: Default::default(),
+            done: None,
+        }
+    }
+
+    /// Starts the worker when a slot is free; the found columns once it finished.
+    fn poll(
+        &mut self,
+        data: &std::sync::Arc<QueryResult>,
+        ctx: &egui::Context,
+    ) -> Option<Vec<usize>> {
+        if let Some(done) = &self.done {
+            return done.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
+        let started = RUNNING_GEO_DETECTIONS.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < GEO_DETECTIONS as u64).then_some(n + 1)
+        });
+        if started.is_err() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return None;
+        }
+        let done = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (data, candidates, cancel, result, ctx) = (
+            data.clone(),
+            self.candidates.clone(),
+            self.cancel.clone(),
+            done.clone(),
+            ctx.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("geometry-detection".into())
+            .spawn(move || {
+                let found = crate::geo::confirm_geometry_columns(&candidates, &data.rows, &cancel);
+                drop(data);
+                RUNNING_GEO_DETECTIONS.fetch_sub(1, Ordering::AcqRel);
+                if !cancel.load(Ordering::Relaxed) {
+                    *result.lock().unwrap_or_else(|p| p.into_inner()) = Some(found);
+                    ctx.request_repaint();
+                }
+            });
+        if spawned.is_err() {
+            RUNNING_GEO_DETECTIONS.fetch_sub(1, Ordering::AcqRel);
+            return Some(Vec::new());
+        }
+        self.done = Some(done);
+        None
+    }
+}
+
+impl Drop for ResultSet {
+    fn drop(&mut self) {
+        if let Some(cache) = &self.value_cache {
+            value::release_dropped(cache, self.action_id);
+        }
+    }
+}
+
+impl Drop for GeoDetection {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -213,17 +296,32 @@ impl ResultSet {
             pending_grid_focus: false,
             geo: None,
             geo_columns: None,
+            geo_detection: None,
+            value_cache: None,
             session_file: super::session::new_result_file(),
         }
     }
 
-    /// Columns holding geometries, detected once per result.
-    pub fn geometry_columns(&mut self) -> &[usize] {
+    /// Columns holding geometries. A bounded check runs here once; columns
+    /// with large sampled values are confirmed on a worker and added when it
+    /// finishes, so the list can grow by one step.
+    pub fn geometry_columns(&mut self, ctx: &egui::Context) -> &[usize] {
         if self.geo_columns.is_none() {
-            self.geo_columns = Some(crate::geo::geometry_columns(
-                &self.data.columns,
-                &self.data.rows,
-            ));
+            let detection =
+                crate::geo::detect_geometry_columns(&self.data.columns, &self.data.rows);
+            self.geo_columns = Some(detection.columns);
+            if !detection.undecided.is_empty() {
+                self.geo_detection = Some(GeoDetection::pending(detection.undecided));
+            }
+        }
+        if let Some(detection) = &mut self.geo_detection
+            && let Some(found) = detection.poll(&self.data, ctx)
+        {
+            self.geo_detection = None;
+            if let Some(columns) = &mut self.geo_columns {
+                columns.extend(found);
+                columns.sort_unstable();
+            }
         }
         self.geo_columns.as_deref().unwrap_or_default()
     }
@@ -673,7 +771,7 @@ pub fn grid_toolbar(
             toolbar_button_width(ui, "Options  ⏷") + toolbar_button_width(ui, "Export  ⏷") + 30.0;
         let mut overflow = [false; RESULT_VIEWS.len()];
         for (index, label) in RESULT_VIEWS.iter().enumerate() {
-            if (index != 5 || !rs.geometry_columns().is_empty())
+            if (index != 5 || !rs.geometry_columns(ui.ctx()).is_empty())
                 && (index != 6 || rs.depth_may_apply())
                 && ui.available_width() >= toolbar_button_width(ui, label) + reserved
             {
@@ -884,7 +982,7 @@ fn result_view_action(ui: &mut Ui, rs: &mut ResultSet, index: usize, in_menu: bo
             }
         }
         5 => {
-            let geometry_column = rs.geometry_columns().first().copied();
+            let geometry_column = rs.geometry_columns(ui.ctx()).first().copied();
             let globe = egui::Button::selectable(
                 rs.geo.is_some(),
                 RichText::new(if in_menu { "🌐 Geo Viewer" } else { "🌐" }).size(if in_menu { 13.0 } else { 15.0 }),
@@ -2089,7 +2187,7 @@ fn transposed_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
 
 /// Geo Viewer: the rows with a geometry in the chosen column on a map.
 fn geo_view(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) {
-    let columns = rs.geometry_columns().to_vec();
+    let columns = rs.geometry_columns(ui.ctx()).to_vec();
     let names: Vec<String> = rs.data.columns.iter().map(|c| c.name.clone()).collect();
     let selected_row = rs.selected.and_then(|(r, _)| match r {
         GridRow::Data(i) => Some(i),
@@ -2271,6 +2369,7 @@ fn cell(ui: &mut Ui, shown: Shown<'_>, deleted: bool, selected: bool) {
 /// like a value editor. Drag its top edge to change the height.
 pub fn value_panel(ui: &mut Ui, id: egui::Id, rs: &mut ResultSet) {
     if !rs.show_value_editor || rs.valid_selection().is_none() {
+        value::release_hidden(rs);
         return;
     }
     egui::Panel::bottom(id)
@@ -2668,6 +2767,48 @@ mod tests {
             )
     }
 
+    #[test]
+    fn geo_viewer_is_offered_after_large_geometries_are_confirmed_in_the_background() {
+        let geojson = format!(
+            "{{\"type\": \"LineString\", \"coordinates\": [{}[0, 0]]}}",
+            "[21.0, 52.0], ".repeat(40_000)
+        );
+        let data = QueryResult {
+            columns: vec![Column {
+                name: "shape".into(),
+                type_name: "text".into(),
+            }],
+            rows: vec![vec![Value::Text(geojson)]; 10],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut rs = ResultSet::new("geo".into(), "select".into(), data.clone(), Page::first(500));
+        let start = std::time::Instant::now();
+        assert!(rs.geometry_columns(&ctx).is_empty(), "not decided on the UI thread");
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        for _ in 0..500 {
+            if !rs.geometry_columns(&ctx).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(rs.geometry_columns(&ctx), [0]);
+        assert!(rs.geo_detection.is_none());
+
+        // Closing a result stops its detection and releases the rows.
+        let mut closed = ResultSet::new("geo".into(), "select".into(), data, Page::first(500));
+        let rows = std::sync::Arc::downgrade(&closed.data);
+        closed.geometry_columns(&ctx);
+        drop(closed);
+        for _ in 0..500 {
+            if rows.strong_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(rows.strong_count(), 0);
+    }
+
     fn log_line(kind: LogKind, text: String) -> LogLine {
         LogLine {
             time: chrono::Local::now(),
@@ -3010,7 +3151,7 @@ mod tests {
 
     fn large_grid_harness(transposed: bool) -> egui_kittest::Harness<'static, GridHarness> {
         let mut h = grid_harness(false);
-        let mut data = std::sync::Arc::unwrap_or_clone(rs().data);
+        let mut data = (*rs().data).clone();
         data.rows = (0..60)
             .map(|index| vec![Value::Int(index), Value::Text(format!("row{index}"))])
             .collect();
@@ -3087,7 +3228,7 @@ mod tests {
     #[test]
     fn revealing_a_cell_wider_than_the_viewport_finishes() {
         let mut h = grid_harness(false);
-        let mut data = std::sync::Arc::unwrap_or_clone(rs().data);
+        let mut data = (*rs().data).clone();
         data.rows[0][1] = Value::Text("wide value ".repeat(10));
         h.state_mut().rs =
             ResultSet::new("wide".into(), "select wide".into(), data, Page::first(500));
