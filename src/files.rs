@@ -9,6 +9,7 @@
 use crate::model::{DataSource, DriverKind};
 use anyhow::{Context, Result, bail};
 use rusqlite::types::ValueRef;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +124,9 @@ fn table_name(path: &Path) -> String {
         .map_or_else(|| "data".into(), |s| s.to_string_lossy().into_owned())
 }
 
+/// Longest header prefix read to detect the separator.
+const MAX_HEADER_SAMPLE: u64 = 1 << 20;
+
 /// Picks the separator that splits the header line into the most fields.
 pub fn detect_delimiter(path: &Path) -> Result<u8> {
     if path
@@ -131,8 +135,13 @@ pub fn detect_delimiter(path: &Path) -> Result<u8> {
     {
         return Ok(b'\t');
     }
-    let text = std::fs::read(path)?;
-    let first_line = text.split(|&b| b == b'\n').next().unwrap_or_default();
+    // Only the header line is analysed; large files are not read whole.
+    let mut first_line = Vec::new();
+    std::io::BufReader::new(std::io::Read::take(
+        std::fs::File::open(path)?,
+        MAX_HEADER_SAMPLE,
+    ))
+    .read_until(b'\n', &mut first_line)?;
     let count = |d: u8| {
         let mut in_quotes = false;
         first_line
@@ -219,21 +228,26 @@ impl ColumnType {
 }
 
 /// The most specific type every non-empty value round-trips through unchanged.
+#[cfg(test)]
 fn infer_type<'a>(values: impl Iterator<Item = &'a str>) -> ColumnType {
-    let mut ty = ColumnType::Integer;
-    for v in values.filter(|v| !v.is_empty()) {
-        if ty == ColumnType::Integer && v.parse::<i64>().is_ok_and(|i| i.to_string() == v) {
-            continue;
-        }
-        if v.parse::<f64>()
-            .is_ok_and(|f| f.is_finite() && format_real(f) == v)
-        {
-            ty = ColumnType::Real;
-            continue;
-        }
-        return ColumnType::Text;
+    values.fold(ColumnType::Integer, refine_type)
+}
+
+/// Narrows `ty` so that `value` also round-trips through it unchanged.
+fn refine_type(ty: ColumnType, value: &str) -> ColumnType {
+    if value.is_empty() || ty == ColumnType::Text {
+        return ty;
     }
-    ty
+    if ty == ColumnType::Integer && value.parse::<i64>().is_ok_and(|i| i.to_string() == value) {
+        return ty;
+    }
+    if value
+        .parse::<f64>()
+        .is_ok_and(|f| f.is_finite() && format_real(f) == value)
+    {
+        return ColumnType::Real;
+    }
+    ColumnType::Text
 }
 
 fn format_real(f: f64) -> String {
@@ -266,23 +280,23 @@ pub fn import_csv(
         }
         columns.push(name);
     }
-    let rows: Vec<Vec<String>> = reader
-        .records()
-        .map(|r| r.map(|rec| rec.iter().map(str::to_string).collect()))
-        .collect::<Result<_, _>>()?;
-    // Rows longer than the header get extra columns instead of losing data.
-    let width = rows
-        .iter()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
-        .max(columns.len());
+    // First pass: width and types over every record, without keeping the rows,
+    // so a late value can still widen a column type exactly as before.
+    let mut record = csv::StringRecord::new();
+    let mut types = vec![ColumnType::Integer; columns.len()];
+    while reader.read_record(&mut record)? {
+        if record.len() > types.len() {
+            // Rows longer than the header get extra columns instead of losing data.
+            types.resize(record.len(), ColumnType::Integer);
+        }
+        for (ty, value) in types.iter_mut().zip(record.iter()) {
+            *ty = refine_type(*ty, value);
+        }
+    }
+    let width = types.len();
     while columns.len() < width {
         columns.push(format!("column_{}", columns.len() + 1));
     }
-    let types: Vec<ColumnType> = (0..width)
-        .map(|c| infer_type(rows.iter().map(|r| r.get(c).map_or("", String::as_str))))
-        .collect();
 
     let q = |s: &str| crate::drivers::quote_ident(s, '"');
     let defs = columns
@@ -297,30 +311,43 @@ pub fn import_csv(
     ))?;
     let placeholders = vec!["?"; width].join(", ");
     let tx = conn.unchecked_transaction()?;
+    let mut count = 0;
     {
         let mut insert =
             tx.prepare(&format!("INSERT INTO {} VALUES ({placeholders})", q(table)))?;
-        for row in &rows {
-            let values: Vec<rusqlite::types::Value> = (0..width)
-                .map(|c| {
-                    let v = row.get(c).map_or("", String::as_str);
-                    match (v.is_empty(), types[c]) {
-                        (true, _) => rusqlite::types::Value::Null,
-                        (false, ColumnType::Integer) => {
-                            rusqlite::types::Value::Integer(v.parse().unwrap())
-                        }
-                        (false, ColumnType::Real) => {
-                            rusqlite::types::Value::Real(v.parse().unwrap())
-                        }
-                        (false, ColumnType::Text) => rusqlite::types::Value::Text(v.to_string()),
+        // Second pass streams the records into SQLite; text is bound from the
+        // reused record buffer instead of being copied.
+        let mut reader = csv::ReaderBuilder::new()
+            .delimiter(delimiter)
+            .flexible(true)
+            .from_path(path)?;
+        let changed = || anyhow::anyhow!("the file changed while it was being opened");
+        while reader.read_record(&mut record)? {
+            if record.len() > width {
+                return Err(changed());
+            }
+            let mut values = Vec::with_capacity(width);
+            for (c, ty) in types.iter().enumerate() {
+                let v = record.get(c).unwrap_or("");
+                values.push(match (v.is_empty(), ty) {
+                    (true, _) => ValueRef::Null,
+                    (false, ColumnType::Integer) => {
+                        ValueRef::Integer(v.parse().map_err(|_| changed())?)
                     }
-                })
-                .collect();
-            insert.execute(rusqlite::params_from_iter(values))?;
+                    (false, ColumnType::Real) => ValueRef::Real(v.parse().map_err(|_| changed())?),
+                    (false, ColumnType::Text) => ValueRef::Text(v.as_bytes()),
+                });
+            }
+            insert.execute(rusqlite::params_from_iter(
+                values
+                    .into_iter()
+                    .map(rusqlite::types::ToSqlOutput::Borrowed),
+            ))?;
+            count += 1;
         }
     }
     tx.commit()?;
-    Ok(rows.len())
+    Ok(count)
 }
 
 /// Writes a table back to CSV in rowid order (the order rows were read in, new
@@ -525,6 +552,49 @@ mod tests {
         drop(conn);
         opened.close();
         assert!(!opened.db_path.exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn streamed_import_types_from_every_record() {
+        let dir = temp();
+        let csv = dir.join("late.csv");
+        // A long integer run is followed by values that only fit TEXT or REAL,
+        // a row wider than the header and a quoted multiline field.
+        let mut original = String::from("n,big,amount\n");
+        for i in 0..5000 {
+            original.push_str(&format!("{i},{},{i}\n", i64::MAX - i));
+        }
+        original.push_str("0042,99999999999999999999,2.5\n");
+        original.push_str(",,,extra,\"line one\nline, two ł\"\n");
+        std::fs::write(&csv, &original).unwrap();
+        let opened = open(&csv, &dir.join("tmp")).unwrap();
+        let conn = rusqlite::Connection::open(&opened.db_path).unwrap();
+        let declared: Vec<String> = conn
+            .prepare("select type from pragma_table_info('late')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(declared, ["TEXT", "TEXT", "REAL", "TEXT", "TEXT"]);
+        let count: i64 = conn
+            .query_row("select count(*) from late", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 5002);
+        let last: String = conn
+            .query_row("select column_5 from late where rowid = 5002", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(last, "line one\nline, two ł");
+        assert_eq!(save(&opened, None).unwrap(), 5002);
+        let saved = std::fs::read_to_string(&csv).unwrap();
+        assert!(saved.starts_with("n,big,amount,column_4,column_5\n0,9223372036854775807,0,,\n"));
+        assert!(saved.contains("\n0042,99999999999999999999,2.5,,\n"));
+        assert!(saved.ends_with(",,,extra,\"line one\nline, two ł\"\n"));
+        drop(conn);
+        opened.close();
         std::fs::remove_dir_all(dir).ok();
     }
 
