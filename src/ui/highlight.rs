@@ -157,6 +157,18 @@ pub fn layout_with_folds(
     let leading = std::cell::Cell::new(0.0);
     let mut push = |text: &str, color: Color32, italic: bool| {
         let space = leading.take();
+        // Adjacent text of one format is one section: fewer sections make
+        // copying, hashing and laying out the job cheaper on every frame.
+        if space == 0.0
+            && let Some(last) = job.sections.last_mut()
+            && last.format.color == color
+            && last.format.italics == italic
+            && last.byte_range.end.0 == job.text.len()
+        {
+            job.text.push_str(text);
+            last.byte_range.end.0 = job.text.len();
+            return;
+        }
         job.append(
             text,
             space,
@@ -210,8 +222,7 @@ pub fn layout_with_folds(
                 i += 1;
             }
             let word = &code[start..i];
-            let upper = word.to_ascii_uppercase();
-            let color = if KEYWORDS.contains(&upper.as_str()) {
+            let color = if KEYWORDS.iter().any(|keyword| keyword.eq_ignore_ascii_case(word)) {
                 theme::SQL_KEYWORD
             } else if bytes.get(i) == Some(&b'(') {
                 theme::SQL_FUNCTION
@@ -232,4 +243,63 @@ pub fn layout_with_folds(
         }
     }
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn color_at(job: &LayoutJob, needle: &str) -> Color32 {
+        let at = job.text.find(needle).unwrap();
+        job.sections
+            .iter()
+            .find(|s| s.byte_range.start.0 <= at && at < s.byte_range.end.0)
+            .unwrap()
+            .format
+            .color
+    }
+
+    #[test]
+    fn adjacent_tokens_of_one_color_share_a_section() {
+        let sql = "select a.id, count(*) from orders a -- note\nwhere a.name = 'Łódź' and x = 42;";
+        let job = layout_with_folds(sql, 13.0, &|_| None);
+        assert_eq!(job.text, sql);
+        assert_eq!(color_at(&job, "select"), theme::SQL_KEYWORD);
+        assert_eq!(color_at(&job, "count"), theme::SQL_FUNCTION);
+        assert_eq!(color_at(&job, "orders"), theme::TEXT);
+        assert_eq!(color_at(&job, "-- note"), theme::SQL_COMMENT);
+        assert_eq!(color_at(&job, "'Łódź'"), theme::SQL_STRING);
+        assert_eq!(color_at(&job, "42"), theme::SQL_NUMBER);
+        assert_eq!(color_at(&job, "WHERE".to_lowercase().as_str()), theme::SQL_KEYWORD);
+        // "a.id, " is one plain section, not one per character.
+        assert!(job.sections.len() < 30, "{} sections", job.sections.len());
+        let mut covered = 0;
+        for section in &job.sections {
+            assert_eq!(section.byte_range.start.0, covered);
+            covered = section.byte_range.end.0;
+            assert!(section.byte_range.start.0 < section.byte_range.end.0);
+        }
+        assert_eq!(covered, sql.len());
+        for (a, b) in job.sections.iter().zip(job.sections.iter().skip(1)) {
+            assert!(
+                a.format.color != b.format.color
+                    || a.format.italics != b.format.italics
+                    || b.leading_space > 0.0,
+                "mergeable neighbours left apart"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_placeholders_keep_their_own_section_and_space() {
+        let job = layout_with_folds("select 1\u{E000} from t", 13.0, &|c| {
+            (c == '\u{E000}').then_some(40.0)
+        });
+        let placeholder = job
+            .sections
+            .iter()
+            .position(|s| s.format.color == Color32::TRANSPARENT)
+            .expect("placeholder section");
+        assert_eq!(job.sections[placeholder + 1].leading_space, 40.0);
+    }
 }
