@@ -120,7 +120,7 @@ The same commands are in the **Find** menu on the console toolbar.
 
 ## Undo and Redo
 
-`⌘Z` undoes and `⌘⇧Z` redoes changes in the console, including replacements and edits around folded code. Undo and Redo unfold the code so that the restored selection is visible. History is kept separately for each tab, in memory, until the tab is closed.
+`⌘Z` undoes and `⌘⇧Z` redoes changes in the console, including replacements and edits around folded code. Undo and Redo unfold the code so that the restored selection is visible. History is kept separately for each tab, in memory, until the tab is closed. Typing is grouped into one step until you pause for a second. A tab keeps up to 100 steps and up to 16 MiB of text; when a large script reaches that limit, the oldest steps are dropped, and the last step can always be undone.
 
 ## Query history
 
