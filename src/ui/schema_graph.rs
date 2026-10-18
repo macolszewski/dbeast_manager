@@ -190,18 +190,22 @@ struct ProjectionKey {
     node_size: u32,
 }
 
-/// Shown nodes on screen, far to near, plus a lookup by node index.
+/// Shown nodes on screen, far to near, plus a lookup by node index that also
+/// holds nodes off screen, for edges that cross the screen.
 struct Projection {
     key: ProjectionKey,
     generation: u64,
     ordered: Vec<(usize, Pos2, f32, f32)>,
     lookup: Vec<Option<(Pos2, f32, f32)>>,
+    /// Nearest and farthest depth of all projected nodes, for the depth fade.
+    depth_range: (f32, f32),
 }
 
+/// What the tessellated picture shows. The hovered object is drawn on top of
+/// it each frame, so moving the pointer does not rebuild it.
 #[derive(Clone, Copy, PartialEq)]
 struct FrameKey {
     projection: u64,
-    hovered: Option<usize>,
     selected: Option<usize>,
     display: DisplayOptions,
     positions: u64,
@@ -214,6 +218,9 @@ struct Frame {
     key: FrameKey,
     mesh: Arc<egui::Mesh>,
     labels: Vec<(Rect, usize, String)>,
+    /// Shapes tessellated into `mesh`.
+    #[cfg(test)]
+    shapes: usize,
 }
 
 /// Filtered nodes and edges with their sizes, rebuilt only when the key changes.
@@ -435,6 +442,10 @@ fn edge_dash(kind: EdgeKind) -> (f32, f32) {
         EdgeKind::Partition => (1.0, 0.0),
     }
 }
+
+/// Pixels around the canvas where a node still counts as on screen, so its
+/// label below it stays drawn.
+const LABEL_MARGIN: f32 = 40.0;
 
 fn line(shapes: &mut Vec<egui::Shape>, from: Pos2, to: Pos2, kind: EdgeKind, stroke: Stroke) {
     let (dash, gap) = edge_dash(kind);
@@ -1052,7 +1063,6 @@ impl GraphView {
         // so typing elsewhere in the application does not redraw the graph.
         let key = FrameKey {
             projection: projection.generation,
-            hovered,
             selected: self.selected,
             display: self.display,
             positions: self.positions_version,
@@ -1065,6 +1075,11 @@ impl GraphView {
         }
         let frame = self.frame.as_ref().unwrap();
         painter.add(egui::Shape::Mesh(Arc::clone(&frame.mesh)));
+        if let Some(index) = hovered
+            && Some(index) != self.selected
+        {
+            painter.extend(self.hover_shapes(&painter, &graph, scene, &projection, index));
+        }
         for (label, index, name) in &frame.labels {
             // Labelled objects are exposed to accessibility; hover sense keeps canvas drags working.
             ui.interact(*label, ui.id().with(("graph_label", *index)), Sense::hover())
@@ -1120,11 +1135,17 @@ impl GraphView {
         lookup.clear();
         lookup.resize(positions.len(), None);
         let mut ordered = Vec::with_capacity(scene.visible.len());
+        let mut depth_range = (f32::MAX, f32::MIN);
+        // Nodes off the canvas are neither drawn nor picked; room for a label below.
+        let canvas = rect.expand2(Vec2::new(LABEL_MARGIN, LABEL_MARGIN));
         for &index in &scene.visible {
             let p = positions[index];
             if let Some(point) = view.project(Vec3::new(p[0], p[1], p[2]), rect) {
                 let r = (scene.radius[index] * self.display.node_size * view.pixels_per_unit(point.depth, rect)).max(2.5);
-                ordered.push((index, point.pos, point.depth, r));
+                depth_range = (depth_range.0.min(point.depth), depth_range.1.max(point.depth));
+                if canvas.expand(r).contains(point.pos) {
+                    ordered.push((index, point.pos, point.depth, r));
+                }
                 lookup[index] = Some((point.pos, point.depth, r));
             }
         }
@@ -1136,42 +1157,27 @@ impl GraphView {
             generation: self.projection_generation,
             ordered,
             lookup,
+            depth_range,
         }));
     }
 
     /// Edges, nodes and labels as one tessellated mesh.
     fn build_frame(&self, ctx: &egui::Context, painter: &egui::Painter, graph: &SchemaGraph, scene: &Scene, projection: &Projection, key: FrameKey) -> Frame {
         let mut shapes: Vec<egui::Shape> = Vec::with_capacity(scene.edges.len() + projection.ordered.len() * 3);
-        let (near, far) = projection.ordered.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.2), hi.max(p.2)));
-        let depth_fade = self.display.depth_fade;
-        let fade = |depth: f32| if !depth_fade || far - near < 1.0 { 1.0 } else { 1.0 - 0.55 * (depth - near) / (far - near) };
-        let (selected, hovered) = (key.selected, key.hovered);
+        let fade = |depth: f32| self.fade(projection, depth);
+        let selected = key.selected;
         let touches = |a: usize, b: usize, node: Option<usize>| node.is_some_and(|n| n == a || n == b);
+        let canvas = projection.key.rect;
         for &(from, to, kind, _) in &scene.edges {
             let (Some(a), Some(b)) = (projection.lookup[from], projection.lookup[to]) else {
                 continue;
             };
-            let focus = touches(from, to, selected) || touches(from, to, hovered);
-            let alpha = if focus { 1.0 } else { self.display.edge_opacity * fade((a.1 + b.1) * 0.5) };
-            let width = if focus { 2.0 } else if kind == EdgeKind::Partition { 0.8 } else { 1.2 };
-            let stroke = Stroke::new(width, edge_color(kind).gamma_multiply(alpha));
-            // Stop at the node outlines so arrows stay visible.
-            let direction = (b.0 - a.0).normalized();
-            let start = a.0 + direction * a.2;
-            let end = b.0 - direction * b.2;
-            if (end - start).dot(direction) <= 0.0 {
+            // An edge is kept when its box meets the canvas, even if both ends are off it.
+            if !Rect::from_two_pos(a.0, b.0).intersects(canvas) {
                 continue;
             }
-            line(&mut shapes, start, end, kind, stroke);
-            if self.display.arrows && kind == EdgeKind::ForeignKey && (end - start).length() > 14.0 {
-                let normal = Vec2::new(-direction.y, direction.x);
-                let size = if focus { 8.0 } else { 6.0 };
-                shapes.push(egui::Shape::convex_polygon(
-                    vec![end, end - direction * size + normal * size * 0.45, end - direction * size - normal * size * 0.45],
-                    stroke.color,
-                    Stroke::NONE,
-                ));
-            }
+            let focus = touches(from, to, selected);
+            self.edge_shapes(&mut shapes, a, b, kind, focus, fade((a.1 + b.1) * 0.5));
         }
         let neighbors: HashSet<usize> = selected
             .map(|s| {
@@ -1189,7 +1195,7 @@ impl GraphView {
         for &(index, pos, depth, r) in &projection.ordered {
             let node = &graph.nodes[index];
             let color = kind_color(node.kind).gamma_multiply(fade(depth));
-            let emphasized = Some(index) == selected || Some(index) == hovered;
+            let emphasized = Some(index) == selected;
             let outline = Stroke::new(if emphasized { 2.5 } else { 1.0 }, if emphasized { theme::TEXT } else { color });
             if !scene.sized[index] {
                 draw_marker(&mut shapes, painter, node, pos, r, color, outline);
@@ -1218,7 +1224,7 @@ impl GraphView {
         }
         // Labels: important ones first (capped), then the largest nodes that fit.
         let priority = |index: usize| -> u8 {
-            if Some(index) == selected || Some(index) == hovered {
+            if Some(index) == selected {
                 0
             } else if scene.matches.contains(&index) || neighbors.contains(&index) {
                 1
@@ -1272,6 +1278,8 @@ impl GraphView {
         let options = ctx.tessellation_options(|o| *o);
         let mut tessellator = egui::epaint::Tessellator::new(ctx.pixels_per_point(), options, key.font_texture, Vec::new());
         let mut mesh = egui::Mesh::default();
+        #[cfg(test)]
+        let count = shapes.len();
         for shape in shapes {
             tessellator.tessellate_shape(shape, &mut mesh);
         }
@@ -1279,7 +1287,71 @@ impl GraphView {
             key,
             mesh: Arc::new(mesh),
             labels,
+            #[cfg(test)]
+            shapes: count,
         }
+    }
+
+    fn fade(&self, projection: &Projection, depth: f32) -> f32 {
+        let (near, far) = projection.depth_range;
+        if !self.display.depth_fade || far - near < 1.0 {
+            1.0
+        } else {
+            1.0 - 0.55 * (depth - near) / (far - near)
+        }
+    }
+
+    /// An edge between two projected nodes; `focus` draws it as touching the
+    /// selected or hovered object.
+    fn edge_shapes(&self, shapes: &mut Vec<egui::Shape>, a: (Pos2, f32, f32), b: (Pos2, f32, f32), kind: EdgeKind, focus: bool, fade: f32) {
+        let alpha = if focus { 1.0 } else { self.display.edge_opacity * fade };
+        let width = if focus { 2.0 } else if kind == EdgeKind::Partition { 0.8 } else { 1.2 };
+        let stroke = Stroke::new(width, edge_color(kind).gamma_multiply(alpha));
+        // Stop at the node outlines so arrows stay visible.
+        let direction = (b.0 - a.0).normalized();
+        let start = a.0 + direction * a.2;
+        let end = b.0 - direction * b.2;
+        if (end - start).dot(direction) <= 0.0 {
+            return;
+        }
+        line(shapes, start, end, kind, stroke);
+        if self.display.arrows && kind == EdgeKind::ForeignKey && (end - start).length() > 14.0 {
+            let normal = Vec2::new(-direction.y, direction.x);
+            let size = if focus { 8.0 } else { 6.0 };
+            shapes.push(egui::Shape::convex_polygon(
+                vec![end, end - direction * size + normal * size * 0.45, end - direction * size - normal * size * 0.45],
+                stroke.color,
+                Stroke::NONE,
+            ));
+        }
+    }
+
+    /// The hovered object on top of the picture: its edges, outline and name.
+    fn hover_shapes(&self, painter: &egui::Painter, graph: &SchemaGraph, scene: &Scene, projection: &Projection, index: usize) -> Vec<egui::Shape> {
+        let mut shapes = Vec::new();
+        for &(from, to, kind, _) in &scene.edges {
+            if from != index && to != index {
+                continue;
+            }
+            if let (Some(a), Some(b)) = (projection.lookup[from], projection.lookup[to]) {
+                self.edge_shapes(&mut shapes, a, b, kind, true, 1.0);
+            }
+        }
+        let Some((pos, _, r)) = projection.lookup[index] else {
+            return shapes;
+        };
+        shapes.push(egui::Shape::circle_stroke(pos, r, Stroke::new(2.5, theme::TEXT)));
+        let node = &graph.nodes[index];
+        let text = if self.hidden_schemas.is_empty() && scene.several_schemas {
+            format!("{}.{}", node.schema, node.name)
+        } else {
+            node.name.clone()
+        };
+        let galley = painter.layout_no_wrap(text, FontId::proportional(12.5), theme::TEXT);
+        let at = pos + Vec2::new(-galley.size().x * 0.5, r + 3.0);
+        shapes.push(egui::Shape::rect_filled(Rect::from_min_size(at, galley.size()).expand(2.0), 3.0, theme::BG_EDITOR.gamma_multiply(0.85)));
+        shapes.push(egui::Shape::galley(at, galley, theme::TEXT));
+        shapes
     }
 
     fn legend(&self, painter: &egui::Painter, rect: Rect, scene: &Scene) {
@@ -1727,5 +1799,147 @@ mod tests {
         let mut server = node("Foreign servers", "remote", NodeKind::ForeignServer, None, None);
         server.path.clear();
         assert!(explorer_node(&server).is_none());
+    }
+
+    /// A window showing `side`² tables on a grid with spacing 120, each
+    /// referencing its right neighbour, and one long edge across the grid.
+    fn grid_window(side: usize) -> GraphWindow {
+        let count = side * side;
+        let edge = |from, to| GraphEdge { from, to, kind: EdgeKind::ForeignKey, name: None, columns: Vec::new(), validated: None };
+        let mut edges: Vec<GraphEdge> = (0..count).filter(|i| (i + 1) % side != 0).map(|i| edge(i, i + 1)).collect();
+        edges.push(edge(0, count - 1));
+        let graph = SchemaGraph {
+            database: "db".into(),
+            nodes: (0..count).map(|i| node("public", &format!("t{i}"), NodeKind::Table, Some(100.0), None)).collect(),
+            edges,
+            ..Default::default()
+        };
+        let positions = (0..count).map(|i| [(i % side) as f32 * 120.0, (i / side) as f32 * 120.0, 0.0]).collect();
+        let mut window = GraphWindow::default();
+        window.open("ds".into(), "db".into(), "db".into(), None, SavedGraphLayout::default());
+        let request = window.view.as_ref().unwrap().request_id;
+        window.loaded(
+            request,
+            Ok(Box::new(crate::backend::SchemaGraphLoaded {
+                graph: Arc::new(graph),
+                layout: crate::schema_graph::Layout { positions },
+                flat: true,
+            })),
+        );
+        window.view.as_mut().unwrap().flat = true;
+        window
+    }
+
+    fn frame(ctx: &egui::Context, window: &mut GraphWindow, pointer: Option<Pos2>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+            events: pointer.map(egui::Event::PointerMoved).into_iter().collect(),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            window.show(ui.ctx());
+        });
+        out.textures_delta.clear();
+        out
+    }
+
+    fn view(window: &mut GraphWindow) -> &mut GraphView {
+        window.view.as_mut().unwrap()
+    }
+
+    #[test]
+    fn hovering_draws_on_top_without_rebuilding_the_picture() {
+        let ctx = egui::Context::default();
+        let mut window = grid_window(20);
+        for _ in 0..4 {
+            frame(&ctx, &mut window, None);
+        }
+        let mesh = Arc::clone(&view(&mut window).frame.as_ref().expect("drawn").mesh);
+        let nodes: Vec<Pos2> = view(&mut window).projection.as_ref().unwrap().ordered.iter().take(30).map(|n| n.1).collect();
+        for pos in nodes {
+            frame(&ctx, &mut window, Some(pos));
+            let now = &view(&mut window).frame.as_ref().unwrap().mesh;
+            assert!(Arc::ptr_eq(&mesh, now), "hover rebuilt the picture");
+        }
+    }
+
+    #[test]
+    fn objects_off_the_canvas_are_not_built_but_crossing_edges_are() {
+        let ctx = egui::Context::default();
+        let mut window = grid_window(30);
+        for _ in 0..4 {
+            frame(&ctx, &mut window, None);
+        }
+        let all = view(&mut window).frame.as_ref().unwrap().shapes;
+        // Close to one corner: few nodes in view.
+        let camera = view(&mut window).camera.as_mut().unwrap();
+        camera.target = Vec3::new(1740.0, 1740.0, 0.0);
+        camera.distance = 400.0;
+        view(&mut window).camera_moved = true;
+        frame(&ctx, &mut window, None);
+        let projection = view(&mut window).projection.clone().unwrap();
+        let close = view(&mut window).frame.as_ref().unwrap().shapes;
+        assert!(projection.ordered.len() < 40, "{} nodes drawn", projection.ordered.len());
+        assert_eq!(projection.lookup.iter().flatten().count(), 900, "every node projected for edges");
+        assert!(close * 10 < all, "{close} of {all} shapes built");
+        // The middle of the grid, away from both ends of the long edge 0 → 899.
+        let camera = view(&mut window).camera.as_mut().unwrap();
+        camera.target = Vec3::new(1740.0 / 2.0, 1740.0 / 2.0, 0.0);
+        camera.distance = 300.0;
+        frame(&ctx, &mut window, None);
+        let projection = view(&mut window).projection.clone().unwrap();
+        let (a, b) = (projection.lookup[0].unwrap().0, projection.lookup[899].unwrap().0);
+        let canvas = projection.key.rect;
+        assert!(!canvas.contains(a) && !canvas.contains(b), "both ends off the canvas");
+        assert!(Rect::from_two_pos(a, b).intersects(canvas), "the edge crosses it and is kept");
+    }
+
+    fn percentiles(mut times: Vec<f64>) -> String {
+        times.sort_by(f64::total_cmp);
+        let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+        format!("p50={:.3} p95={:.3} p99={:.3} ms", at(0.5), at(0.95), at(0.99))
+    }
+
+    /// Run with `cargo test --release --lib graph_interaction_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn graph_interaction_benchmark() {
+        for (name, zoom) in [("whole graph in view", false), ("few objects in view", true)] {
+            let ctx = egui::Context::default();
+            let mut window = grid_window(70);
+            for _ in 0..4 {
+                frame(&ctx, &mut window, None);
+            }
+            if zoom {
+                let camera = view(&mut window).camera.as_mut().unwrap();
+                camera.target = Vec3::new(4140.0, 4140.0, 0.0);
+                camera.distance = 500.0;
+                view(&mut window).camera_moved = true;
+                frame(&ctx, &mut window, None);
+            }
+            let nodes: Vec<Pos2> = view(&mut window).projection.as_ref().unwrap().ordered.iter().map(|n| n.1).collect();
+            for phase in ["idle", "hover", "orbit"] {
+                let (mut cpu, mut tess) = (Vec::new(), Vec::new());
+                for i in 0..60 {
+                    if phase == "orbit" {
+                        let camera = view(&mut window).camera.as_mut().unwrap();
+                        camera.yaw += 0.002;
+                        view(&mut window).camera_moved = true;
+                    }
+                    let pointer = (phase == "hover").then(|| nodes[i * 7 % nodes.len()]);
+                    let t = std::time::Instant::now();
+                    let out = frame(&ctx, &mut window, pointer);
+                    let ui_time = t.elapsed().as_secs_f64() * 1000.0;
+                    let t = std::time::Instant::now();
+                    let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+                    if i >= 10 {
+                        cpu.push(ui_time);
+                        tess.push(t.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+                let built = view(&mut window).frame.as_ref().map_or(0, |f| f.shapes);
+                eprintln!("4900 nodes, {name}, {phase}: UI {} | tessellation {} | shapes built {built}", percentiles(cpu), percentiles(tess));
+            }
+        }
     }
 }

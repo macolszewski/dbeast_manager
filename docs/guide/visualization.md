@@ -152,5 +152,5 @@ Data is read only on request: **Open Data** or a double-click opens the table, a
 
 - A scan covers up to 5,000 objects. A larger database is clearly marked as a partial result. Scanning runs in the background and can be cancelled.
 - The force layout with schema grouping is computed in the background, deterministically, and only for the mode shown. The other mode (2D or 3D) is computed the first time you switch to it. A newer request or closing the window stops stale computations.
-- At rest the window does not simulate physics. The finished picture is kept as a single mesh and redrawn only when the camera, layout, filters, hover or settings change.
+- At rest the window does not simulate physics. The finished picture is kept as a single mesh and redrawn only when the camera, layout, filters, selection or settings change. The object under the pointer, its relations and its name are drawn on top of that picture, so hovering does not rebuild it. Objects outside the window are not drawn; relations that cross the window are.
 - Computing one layout (release build, Apple Silicon): 100 objects in 7 ms, 1,000 objects in 0.16 s, 5,000 objects and 15,000 relations in 1.2 s.

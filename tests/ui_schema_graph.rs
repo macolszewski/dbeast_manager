@@ -110,7 +110,8 @@ fn database_graph_reads_metadata_and_keeps_a_saved_layout() {
     click(&mut h, "View");
     h.get_by_role_and_label(egui::accesskit::Role::Slider, "Spread").focus();
     h.run_steps(2);
-    for _ in 0..40 {
+    // A few steps apart: objects pushed off the canvas are not drawn and have no label.
+    for _ in 0..10 {
         h.key_press(egui::Key::ArrowRight);
         h.run_steps(1);
     }
