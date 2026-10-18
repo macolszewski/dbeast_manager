@@ -41,7 +41,7 @@ The right end of the toolbar shows whether the result is **Editable** or **Read-
 
 ### Sorting
 
-Each column header has a separate sort control that appears when you hover over the header or when the column is sorted. Click it to cycle between ascending, descending and unsorted. Sorting is applied to the fetched page, without another query. Clicking the column name itself selects the column.
+Each column header has a separate sort control that appears when you hover over the header or when the column is sorted. Click it to cycle between ascending, descending and unsorted. Sorting is applied to the fetched page, without another query. `NULL` sorts first. Numbers compare by value, decimals exactly; `NaN` sorts after all other numbers. Other values compare by their displayed text. Clicking the column name itself selects the column.
 
 To sort in the database, use `ORDER BY` in your query or in the table editor's **ORDER BY** field.
 

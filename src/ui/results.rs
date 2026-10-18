@@ -18,6 +18,7 @@ mod layout;
 mod local_filter;
 mod record;
 mod selection;
+mod sort;
 mod value;
 
 const MODIFIED_BG: Color32 = Color32::from_rgb(0x23, 0x3A, 0x5C);
@@ -268,8 +269,10 @@ impl ResultSet {
         self.order = (0..self.data.rows.len()).collect();
         if let Some((col, asc)) = self.sort {
             let rows = &self.data.rows;
+            let keys: Vec<sort::SortKey<'_>> =
+                rows.iter().map(|row| sort::SortKey::of(&row[col])).collect();
             self.order.sort_by(|&a, &b| {
-                let ord = compare(&rows[a][col], &rows[b][col]);
+                let ord = sort::compare(&keys[a], &rows[a][col], &keys[b], &rows[b][col]);
                 if asc { ord } else { ord.reverse() }
             });
         }
@@ -544,21 +547,6 @@ impl ResultSet {
 enum Shown<'a> {
     Value(&'a Value),
     Edit(&'a CellEdit),
-}
-
-fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
-    match (a, b) {
-        (Value::Null, Value::Null) => Equal,
-        (Value::Null, _) => Less,
-        (_, Value::Null) => Greater,
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        _ if a.is_numeric() && b.is_numeric() => {
-            let num = |v: &Value| v.to_string().parse::<f64>().unwrap_or(f64::NAN);
-            num(a).partial_cmp(&num(b)).unwrap_or(Equal)
-        }
-        _ => a.to_string().cmp(&b.to_string()),
-    }
 }
 
 /// Toolbar above the grid: paging, reload, editing and export.
