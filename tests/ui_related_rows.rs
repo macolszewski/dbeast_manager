@@ -23,6 +23,13 @@ fn app() -> H<'static> {
         .wgpu()
         .build_eframe(|cc| dbeast::ui::App::new_for_test(cc));
     h.run_steps(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while h.state().starting() {
+        assert!(Instant::now() < deadline, "timed out waiting for the session");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
     h
 }
 
@@ -119,6 +126,17 @@ fn page_action(h: &mut H<'_>, label: &str) {
 
 fn session(path: &Path) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Rows of a saved result, kept in their own file next to session.json.
+fn saved_rows(path: &Path, result: &serde_json::Value) -> serde_json::Value {
+    result["file"]
+        .as_str()
+        .and_then(|file| {
+            std::fs::read_to_string(path.with_file_name("session-results").join(file)).ok()
+        })
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .map_or(serde_json::Value::Null, |rows| rows["rows"].clone())
 }
 
 #[test]
@@ -357,7 +375,7 @@ fn related_rows_preserve_keys_context_pending_edits_and_session_payload() {
             && tab["bound_query"].is_object()
             && result["page"]["skip"] == 2
             && result["page"]["limit"] == 2
-            && result["data"]["rows"]
+            && saved_rows(&session_path, result)
                 == serde_json::json!([
                     [{"Int":13},{"Int":1},{"Text":"Iga"},{"Text":"third"}]
                 ])
