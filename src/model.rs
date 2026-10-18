@@ -868,4 +868,19 @@ mod preview_tests {
         assert_eq!(large.chars().count(), 1025);
         assert!(large.capacity() <= 1024 * 4 + 3);
     }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release --lib cell_preview_cost -- --ignored --nocapture"]
+    fn cell_preview_cost_benchmark() {
+        for mib in [1usize, 10, 50] {
+            let value = Value::Text("line of text\n".repeat((mib << 20) / 13));
+            let start = std::time::Instant::now();
+            let full = value.to_cell();
+            let before = start.elapsed();
+            let start = std::time::Instant::now();
+            let preview = value.cell_preview(1024);
+            let after = start.elapsed();
+            println!("{mib} MiB cell: full copy {before:?} ({} B), preview {after:?} ({} B)", full.len(), preview.len());
+        }
+    }
 }

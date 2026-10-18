@@ -584,4 +584,35 @@ mod tests {
         assert!(h.query_by_label_contains("cccc").is_some());
         assert!(h.query_by_label_contains("bbbb").is_none());
     }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release --lib value_panel_frame_cost -- --ignored --nocapture"]
+    fn value_panel_frame_cost_benchmark() {
+        for mib in [1usize, 10, 50] {
+            let item = r#"{"id": 12345, "name": "Łódź", "tags": ["a", "b"]},"#;
+            let mut text = String::from("[");
+            while text.len() < mib << 20 {
+                text.push_str(item);
+            }
+            text.push_str("{}]");
+            // Work the panel did on every frame before: copy the value and parse it.
+            let start = std::time::Instant::now();
+            let copy = Value::Text(text.clone());
+            let Value::Text(copy) = &copy else { unreachable!() };
+            let parsed = serde_json::from_str::<serde_json::Value>(copy).unwrap();
+            let before = start.elapsed();
+            drop(parsed);
+            let mut h = values_harness(vec![Value::Text(text)]);
+            h.run_steps(1);
+            let start = std::time::Instant::now();
+            wait_for_worker(&mut h);
+            let prepare = start.elapsed();
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                h.step();
+            }
+            let after = start.elapsed() / 10;
+            println!("{mib} MiB JSON: before >= {before:?} per frame (copy + parse only); after: prepared once in {prepare:?} off the UI thread, then {after:?} per frame");
+        }
+    }
 }
