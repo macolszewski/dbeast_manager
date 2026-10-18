@@ -1258,13 +1258,10 @@ async fn apply_update_batch(
         // metadata view came from cache. Other clients may have changed the table.
         let fresh = conn.table_edit_metadata(&origin).await?;
         validate_edit_metadata(&request.metadata, &fresh)?;
-        for update in &request.mutations {
-            source_row = Some(update.source_row);
-            let affected = conn.execute_bound_update(update).await?;
-            anyhow::ensure!(affected == 1,
-                "The change matched {affected} rows instead of one. The row or its values may have changed; refresh before retrying.");
+        if let Err((index, error)) = conn.execute_bound_updates(&request.mutations, Arc::new(|| false)).await {
+            source_row = request.mutations.get(index).map(|update| update.source_row);
+            return Err(error);
         }
-        source_row = None;
         conn.execute_control(&format!("RELEASE SAVEPOINT {savepoint}")).await?;
         savepoint_active = false;
         if opened_transaction && !request.manual_tx {

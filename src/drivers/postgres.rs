@@ -585,23 +585,70 @@ impl PgConn {
     }
 
     pub async fn execute_bound_update(&mut self, update: &BoundUpdate) -> Result<u64> {
-        let statement = if let Some(statement) = self.update_statements.get(&update.sql) {
-            statement.clone()
-        } else {
-            let statement = self.client.prepare(&update.sql).await?;
-            if self.update_statements.len() >= 128 {
-                self.update_statements.clear();
-            }
-            self.update_statements
-                .insert(update.sql.clone(), statement.clone());
-            statement
-        };
+        let statement = self.update_statement(&update.sql).await?;
         let values: Vec<_> = update.params.iter().map(PgInput).collect();
         let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = values
             .iter()
             .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
         Ok(self.client.execute(&statement, &params).await?)
+    }
+
+    /// Sends up to `WINDOW` UPDATEs before reading their results. Responses
+    /// arrive in order; after a failure PostgreSQL rejects the statements
+    /// already sent behind it in the same transaction, and the caller's
+    /// savepoint discards any that ran after a conflict.
+    pub async fn execute_bound_updates(
+        &mut self,
+        updates: &[BoundUpdate],
+        stopped: &(dyn Fn() -> bool + Sync),
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        use futures_util::StreamExt;
+        const WINDOW: usize = 32;
+        let mut statements = Vec::with_capacity(updates.len());
+        for (index, update) in updates.iter().enumerate() {
+            statements.push(self.update_statement(&update.sql).await.map_err(|error| (index, error))?);
+        }
+        let inputs: Vec<Vec<PgInput>> = updates
+            .iter()
+            .map(|update| update.params.iter().map(PgInput).collect())
+            .collect();
+        let client = &self.client;
+        let mut pending = futures_util::stream::FuturesOrdered::new();
+        let mut next = 0;
+        loop {
+            while next < updates.len() && pending.len() < WINDOW && !stopped() {
+                let (statement, values, index) = (&statements[next], &inputs[next], next);
+                pending.push_back(async move {
+                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = values
+                        .iter()
+                        .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+                        .collect();
+                    (index, client.execute(statement, &params).await)
+                });
+                next += 1;
+            }
+            match pending.next().await {
+                Some((index, Ok(affected))) => {
+                    super::one_row_changed(affected).map_err(|error| (index, error))?
+                }
+                Some((index, Err(error))) => return Err((index, error.into())),
+                None if next < updates.len() => return Err((next, super::stopped_before_change())),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    async fn update_statement(&mut self, sql: &str) -> Result<Statement> {
+        if let Some(statement) = self.update_statements.get(sql) {
+            return Ok(statement.clone());
+        }
+        let statement = self.client.prepare(sql).await?;
+        if self.update_statements.len() >= 128 {
+            self.update_statements.clear();
+        }
+        self.update_statements.insert(sql.to_owned(), statement.clone());
+        Ok(statement)
     }
 
     pub async fn resolved_context(&self) -> Result<ResolvedContext> {

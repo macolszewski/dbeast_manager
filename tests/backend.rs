@@ -2020,3 +2020,84 @@ fn table_pages_are_read_from_the_server_in_key_order() {
     }
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// A 100-row Submit whose 51st change conflicts with another session: the
+/// failure names that row, and no change of the batch remains, also those
+/// sent after the conflict. Then 1-row and 100-row batches succeed.
+fn exercise_batch_conflict(ds: DataSource) {
+    const ROWS: usize = 100;
+    let backend = Backend::new(egui::Context::default());
+    let table = format!("dbeast_batch_{}", uuid::Uuid::new_v4().simple());
+    let schema = match ds.driver {
+        DriverKind::Postgres => "public",
+        DriverKind::MySql => "dbeast",
+        DriverKind::Sqlite => "main",
+    };
+    let qualified = dbeast::sqlgen::qualified(ds.driver, Some(schema), &table);
+    let sql = format!("SELECT id, name FROM {qualified} ORDER BY id");
+    let default = ExecutionContext::default();
+    let test = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let engine = if ds.driver == DriverKind::MySql { " ENGINE=InnoDB" } else { "" };
+        query_context(&backend, 9300, &ds, &default, &format!("CREATE TABLE {qualified} (id INTEGER PRIMARY KEY, name TEXT NOT NULL){engine}"));
+        let rows = (1..=ROWS).map(|id| format!("({id},'before')")).collect::<Vec<_>>().join(",");
+        query_context(&backend, 9300, &ds, &default, &format!("INSERT INTO {qualified} VALUES {rows}"));
+        let changes = |label: &str, count: usize| -> Vec<((usize, usize), CellEdit)> {
+            (0..count).map(|row| ((row, 1), CellEdit::Text(format!("{label}_{row}")))).collect()
+        };
+
+        let (data, metadata) = editable_query(&backend, 9301, &ds, &sql);
+        query_context(&backend, 9300, &ds, &default, &format!("UPDATE {qualified} SET name = 'elsewhere' WHERE id = 51"));
+        let (result, in_tx) = apply_updates(&backend, mutation_request(9301, &ds, &data, &metadata, &changes("lost", ROWS), false));
+        let failure = result.unwrap_err();
+        assert_eq!(failure.source_row, Some(50), "{}", failure.message);
+        assert!(failure.message.contains("matched 0 rows"), "{}", failure.message);
+        assert!(!failure.outcome_unknown);
+        assert!(!in_tx);
+        let stored = query_context(&backend, 9300, &ds, &default, &sql);
+        for (row, values) in stored.rows.iter().enumerate() {
+            let expected = if row == 50 { "elsewhere" } else { "before" };
+            assert_eq!(values[1], Value::Text(expected.into()), "row {row}");
+        }
+
+        for count in [1, ROWS] {
+            let (data, metadata) = editable_query(&backend, 9301, &ds, &sql);
+            let label = format!("saved{count}");
+            let (result, in_tx) = apply_updates(&backend, mutation_request(9301, &ds, &data, &metadata, &changes(&label, count), false));
+            assert_eq!(result.unwrap().changed_rows, count);
+            assert!(!in_tx);
+            let stored = query_context(&backend, 9300, &ds, &default, &sql);
+            for row in 0..count {
+                assert_eq!(stored.rows[row][1], Value::Text(format!("{label}_{row}")));
+            }
+        }
+    }));
+    backend.close_session(&ds.id, 9301);
+    run(&backend, req(9300, &ds, &[&format!("DROP TABLE IF EXISTS {qualified}")], false));
+    if let Err(panic) = test {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn sqlite_batch_conflict_rolls_back_the_whole_submit() {
+    let directory = std::env::temp_dir().join(format!("dbeast_batch_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut sqlite = DataSource::new(DriverKind::Sqlite);
+    sqlite.file = directory.join("batch.sqlite").to_string_lossy().into_owned();
+    exercise_batch_conflict(sqlite);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn postgres_batch_conflict_rolls_back_the_whole_submit() {
+    if let Some(ds) = pg() {
+        exercise_batch_conflict(ds);
+    }
+}
+
+#[test]
+fn mysql_batch_conflict_rolls_back_the_whole_submit() {
+    if let Some(ds) = mysql() {
+        exercise_batch_conflict(ds);
+    }
+}

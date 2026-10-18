@@ -251,7 +251,7 @@ Backend response times, medians of 7 runs, without UI and GPU. Opening the conne
 cargo test --release --test backend console_update_metadata_and_submit_latency -- --ignored --nocapture
 ```
 
-The PostgreSQL cache keeps up to 128 prepared `UPDATE` templates; a session keeps metadata for up to 256 tables. A cached metadata read checks the context but does not query the catalogs again. Scrolling never fetches metadata. On a remote server, the cost of many `UPDATE` statements depends on network latency.
+The PostgreSQL cache keeps up to 128 prepared `UPDATE` templates; a session keeps metadata for up to 256 tables. A cached metadata read checks the context but does not query the catalogs again. Scrolling never fetches metadata. PostgreSQL sends up to 32 `UPDATE` statements of one Submit before reading their results, so a remote server costs about one round trip per 32 changes instead of one per change: 100 changes through a local proxy with 2 ms one-way delay took 873 ms one at a time and 70 ms pipelined (debug build, best of 5, `postgres_update_batch_latency`, 18 October 2026). SQLite runs the whole Submit in one background task with cached statements. MySQL still sends one statement at a time, so there its cost grows with network latency.
 
 ## Related Rows
 

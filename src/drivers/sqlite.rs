@@ -285,6 +285,31 @@ impl LiteConn {
             .await
     }
 
+    pub async fn execute_bound_updates(
+        &self,
+        updates: &[BoundUpdate],
+        stopped: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        let updates: Vec<_> = updates
+            .iter()
+            .map(|update| (update.sql.clone(), bind_values(&update.params)))
+            .collect();
+        self.with(move |conn| {
+            Ok(updates.iter().enumerate().try_for_each(|(index, (sql, params))| {
+                if stopped() {
+                    return Err((index, super::stopped_before_change()));
+                }
+                let changed = conn
+                    .prepare_cached(sql)
+                    .and_then(|mut statement| statement.execute(rusqlite::params_from_iter(params)))
+                    .map_err(|error| (index, error.into()))?;
+                super::one_row_changed(changed as u64).map_err(|error| (index, error))
+            }))
+        })
+        .await
+        .unwrap_or_else(|error| Err((0, error)))
+    }
+
     pub fn resolved_context(&self) -> ResolvedContext {
         ResolvedContext {
             database: None,

@@ -968,6 +968,76 @@ async fn postgres_limited_pages_open_no_cancel_connection() {
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), opened + 1, "one cancel connection");
 }
 
+/// Forwards to the test PostgreSQL, delaying every chunk by `delay` in each
+/// direction, like a remote server.
+async fn delaying_proxy(delay: std::time::Duration) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn pump(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, delay: std::time::Duration) {
+        let mut buffer = vec![0u8; 64 * 1024];
+        while let Ok(read) = from.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            tokio::time::sleep(delay).await;
+            if to.write_all(&buffer[..read]).await.is_err() {
+                break;
+            }
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect("127.0.0.1:55432").await else { continue };
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            tokio::spawn(pump(client_read, server_write, delay));
+            tokio::spawn(pump(server_read, client_write, delay));
+        }
+    });
+    port
+}
+
+/// 100 UPDATEs over a link with 2 ms one-way delay: one at a time, and
+/// pipelined by `execute_bound_updates`.
+#[tokio::test]
+#[ignore = "manual measurement: cargo test --release --test drivers postgres_update_batch_latency -- --ignored --nocapture"]
+async fn postgres_update_batch_latency() {
+    if std::net::TcpStream::connect("127.0.0.1:55432").is_err() {
+        eprintln!("skipping, PostgreSQL unavailable");
+        return;
+    }
+    let mut ds = pg();
+    ds.host = "127.0.0.1".into();
+    ds.port = delaying_proxy(std::time::Duration::from_millis(2)).await;
+    let mut conn = Connection::open(&ds).await.unwrap();
+    let table = format!("dbeast_batch_cost_{}", uuid::Uuid::new_v4().simple());
+    conn.execute(&format!("create table {table} (id int primary key, n int)"), Page::first(0)).await.unwrap();
+    conn.execute(&format!("insert into {table} select g, 0 from generate_series(1, 100) g"), Page::first(0)).await.unwrap();
+    let updates: Vec<BoundUpdate> = (1..=100)
+        .map(|id| BoundUpdate {
+            sql: format!("update {table} set n = n + 1 where id = $1"),
+            params: vec![Value::Int(id)],
+            source_row: id as usize - 1,
+        })
+        .collect();
+    let mut best = [std::time::Duration::MAX; 2];
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        for update in &updates {
+            assert_eq!(conn.execute_bound_update(update).await.unwrap(), 1);
+        }
+        best[0] = best[0].min(started.elapsed());
+        let started = std::time::Instant::now();
+        conn.execute_bound_updates(&updates, std::sync::Arc::new(|| false)).await.map_err(|(_, error)| error).unwrap();
+        best[1] = best[1].min(started.elapsed());
+    }
+    let r = conn.execute(&format!("select min(n), max(n) from {table}"), Page::first(1)).await.unwrap();
+    assert_eq!(r.rows[0], vec![Value::Int(10), Value::Int(10)]);
+    conn.execute(&format!("drop table {table}"), Page::first(0)).await.unwrap();
+    eprintln!("100 updates over 2 ms one-way delay: {:?} one at a time, {:?} pipelined", best[0], best[1]);
+}
+
 /// Errors in, at and after the page boundary (page size 500) fail the
 /// statement, in autocommit and inside a transaction block.
 #[tokio::test]

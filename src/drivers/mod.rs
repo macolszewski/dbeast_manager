@@ -22,6 +22,19 @@ pub async fn open_tunnel(ds: &DataSource) -> Result<std::sync::Arc<Tunnel>> {
     tunnel::open(ds).await.context("SSH tunnel")
 }
 
+/// The check every grid mutation must pass before the batch continues.
+pub(crate) fn one_row_changed(affected: u64) -> Result<()> {
+    anyhow::ensure!(
+        affected == 1,
+        "The change matched {affected} rows instead of one. The row or its values may have changed; refresh before retrying."
+    );
+    Ok(())
+}
+
+pub(crate) fn stopped_before_change() -> anyhow::Error {
+    anyhow::anyhow!("Stopped before all changes were sent.")
+}
+
 /// Rows read by [`Connection::stream_rows`]: the column origins and columns
 /// once, then batches.
 pub enum RowBatch {
@@ -478,6 +491,36 @@ impl Connection {
                 .map_err(postgres::describe),
             Kind::MySql(c) => c.execute_bound_update(update).await,
             Kind::Sqlite(c) => c.execute_bound_update(update).await,
+        }
+    }
+
+    /// Runs grid mutations in order on this session; each must change exactly
+    /// one row. Stops at the first failure, or before the next mutation once
+    /// `stopped` returns true, and reports the index of that mutation.
+    /// PostgreSQL pipelines a bounded window of statements, SQLite runs the
+    /// whole batch in one blocking task; mutations already executed are left
+    /// to the caller's savepoint.
+    pub async fn execute_bound_updates(
+        &mut self,
+        updates: &[BoundUpdate],
+        stopped: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        match &mut self.kind {
+            Kind::Postgres(c) => c
+                .execute_bound_updates(updates, &*stopped)
+                .await
+                .map_err(|(index, error)| (index, postgres::describe(error))),
+            Kind::MySql(c) => {
+                for (index, update) in updates.iter().enumerate() {
+                    if stopped() {
+                        return Err((index, stopped_before_change()));
+                    }
+                    let affected = c.execute_bound_update(update).await.map_err(|error| (index, error))?;
+                    one_row_changed(affected).map_err(|error| (index, error))?;
+                }
+                Ok(())
+            }
+            Kind::Sqlite(c) => c.execute_bound_updates(updates, stopped).await,
         }
     }
 
