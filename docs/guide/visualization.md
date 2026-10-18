@@ -72,7 +72,7 @@ A histogram above the scene shows the time window.
 - Numbers are never guessed to be epoch times.
 - Missing values are counted and reported in the status line.
 
-Parsing, the histogram and the list of rows in the window are computed once and kept until the data, series or window changes. Each frame projects only the tiles and text of 16 rows, on the CPU, without a 3D engine. Depth View works only on the fetched page and runs no queries.
+Parsing, the histogram and the list of rows in the window are computed once and kept until the data, series or window changes. A wide or long page, more than 10,000 cells to parse, is read in the background while the view shows "Reading times…"; reloading or closing the result stops that work. Each frame projects only the tiles and text of 16 rows, on the CPU, without a 3D engine. Depth View works only on the fetched page and runs no queries.
 
 ## Database Graph
 

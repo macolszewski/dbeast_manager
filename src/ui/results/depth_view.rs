@@ -85,13 +85,23 @@ pub(in crate::ui) struct DepthState {
 
 type ModelResult = Result<Arc<DepthModel>, String>;
 
-/// Results with more rows are analysed on a worker thread.
-const SYNC_ROWS: usize = 20_000;
+/// Analyses that read more cells than this run on a worker thread. A first
+/// analysis reads every column; a new choice of series only the series.
+const SYNC_CELLS: usize = 10_000;
 
 struct Pending {
     key: usize,
     series: Vec<usize>,
     receiver: std::sync::mpsc::Receiver<Analysis>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A replaced or dropped request stops its worker, which then releases the
+/// result it was reading.
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Candidates, resolved series and model of one data version: one pass of
@@ -104,23 +114,33 @@ struct Analysis {
     histogram: Vec<u32>,
 }
 
-fn analyse(data: &crate::model::QueryResult, key: usize, mut series: Vec<usize>, cached: Option<Arc<Vec<TimeColumn>>>) -> Analysis {
-    let candidates = cached.unwrap_or_else(|| Arc::new(depth::time_columns(data)));
+/// `None` when `cancelled` returned true before the analysis finished.
+fn analyse(
+    data: &crate::model::QueryResult,
+    key: usize,
+    mut series: Vec<usize>,
+    cached: Option<Arc<Vec<TimeColumn>>>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Analysis> {
+    let candidates = match cached {
+        Some(cached) => cached,
+        None => Arc::new(depth::time_columns_until(data, cancelled)?),
+    };
     series.retain(|column| candidates.iter().any(|candidate| candidate.index == *column));
     if series.is_empty()
         && let Some(first) = candidates.first()
     {
         series.push(first.index);
     }
-    let model = DepthModel::build(data, &series, &candidates).map(Arc::new);
+    let model = DepthModel::build_until(data, &series, &candidates, cancelled)?.map(Arc::new);
     let histogram = model.as_ref().map(|m| histogram(m)).unwrap_or_default();
-    Analysis {
+    Some(Analysis {
         key,
         candidates,
         series,
         model,
         histogram,
-    }
+    })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -249,8 +269,10 @@ impl ResultSet {
             return None;
         }
         let series = self.depth.series.clone();
-        if self.data.rows.len() <= SYNC_ROWS {
-            let done = analyse(&self.data, key, series, cached);
+        // The work is the cells parsed, not only the rows: a wide page parses many columns.
+        let columns = if cached.is_some() { series.len().max(1) } else { self.data.columns.len() };
+        if self.data.rows.len().saturating_mul(columns) <= SYNC_CELLS {
+            let done = analyse(&self.data, key, series, cached, &|| false)?;
             self.apply_analysis(done);
             let candidates = self.depth.candidates.as_ref().map(|(_, c)| Arc::clone(c))?;
             return self.depth.model.as_ref().map(|(_, _, model)| (candidates, model.clone()));
@@ -259,14 +281,23 @@ impl ResultSet {
         let data = Arc::clone(&self.data);
         let ctx = ctx.clone();
         let requested = series.clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        // Replacing the pending request cancels its worker.
+        self.depth.pending = None;
         std::thread::Builder::new()
             .name("depth-view".into())
             .spawn(move || {
-                let _ = sender.send(analyse(&data, key, requested, cached));
-                ctx.request_repaint();
+                let cancelled = || stop.load(std::sync::atomic::Ordering::Relaxed);
+                let done = analyse(&data, key, requested, cached, &cancelled);
+                drop(data);
+                if let Some(done) = done {
+                    let _ = sender.send(done);
+                    ctx.request_repaint();
+                }
             })
             .ok()?;
-        self.depth.pending = Some(Pending { key, series, receiver });
+        self.depth.pending = Some(Pending { key, series, receiver, cancel });
         None
     }
 
@@ -1288,7 +1319,7 @@ mod tests {
 
     #[test]
     fn large_results_are_analysed_off_the_ui_thread() {
-        let rows = (0..SYNC_ROWS + 1)
+        let rows = (0..SYNC_CELLS + 1)
             .map(|i| vec![Value::Text(format!("2026-10-15 10:{:02}:{:02}", (i / 60) % 60, i % 60))])
             .collect();
         let data = QueryResult {
@@ -1309,8 +1340,162 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the worker did not finish");
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        assert_eq!(model.rows(), SYNC_ROWS + 1);
+        assert_eq!(model.rows(), SYNC_CELLS + 1);
         assert_eq!(rs.depth.series, [0]);
+    }
+
+    fn wait_for_model(rs: &mut ResultSet, ctx: &egui::Context) -> Arc<DepthModel> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some((_, model)) = rs.depth_analysis(ctx) {
+                return model.unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "the worker did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn wide_pages_are_analysed_off_the_ui_thread_by_cells_not_rows() {
+        // 2 000 rows are few, but 40 timestamp columns make 80 000 cells to parse.
+        let mut rs = wide(2_000, 40, 0);
+        rs.toggle_depth_view();
+        let ctx = egui::Context::default();
+        assert!(rs.depth_analysis(&ctx).is_none(), "a wide page is parsed on a worker");
+        let model = wait_for_model(&mut rs, &ctx);
+        assert_eq!(model.rows(), 2_000);
+        // Choosing other series reads only those columns, at once.
+        rs.depth.series = vec![3, 7];
+        let (_, model) = rs.depth_analysis(&ctx).expect("two series of 2 000 rows are parsed at once");
+        assert_eq!(model.unwrap().series, [3, 7]);
+        // A small page stays synchronous.
+        let mut small = wide(100, 4, 0);
+        small.toggle_depth_view();
+        assert!(small.depth_analysis(&ctx).is_some());
+    }
+
+    #[test]
+    fn replaced_and_dropped_analyses_stop_and_release_the_result() {
+        let mut rs = wide(4_000, 60, 0);
+        let data = Arc::downgrade(&rs.data);
+        rs.toggle_depth_view();
+        let ctx = egui::Context::default();
+        assert!(rs.depth_analysis(&ctx).is_none());
+        let first = Arc::clone(&rs.depth.pending.as_ref().unwrap().cancel);
+        // Reloading replaces the data; the next frame asks again and cancels the old work.
+        let mut fresh = wide(4_000, 60, 0);
+        fresh.depth.carry_from(&mut rs.depth);
+        drop(rs);
+        assert!(first.load(std::sync::atomic::Ordering::Relaxed), "dropping the result cancels its analysis");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while data.strong_count() > 0 {
+            assert!(std::time::Instant::now() < deadline, "the cancelled worker kept the old result");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(fresh.depth_analysis(&ctx).is_none());
+        let model = wait_for_model(&mut fresh, &ctx);
+        assert_eq!(model.rows(), 4_000);
+    }
+
+    #[test]
+    fn button_check_reads_a_bounded_sample_of_mostly_null_columns() {
+        let mut rs = wide(5_000, 0, 50);
+        assert!(!rs.depth_may_apply());
+        // An undeclared text column whose first values are times is found.
+        let data = Arc::make_mut(&mut rs.data);
+        for (i, row) in data.rows.iter_mut().enumerate().take(40) {
+            row[10] = Value::Text(format!("2026-10-15 10:00:{:02}", i % 60));
+        }
+        let mut rs = ResultSet::new("t".into(), "select".into(), (*rs.data).clone(), Page::first(5_000));
+        assert!(rs.depth_may_apply());
+    }
+
+    fn percentiles(mut times: Vec<f64>) -> String {
+        times.sort_by(f64::total_cmp);
+        let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+        format!("p50={:.3} p95={:.3} p99={:.3} ms", at(0.5), at(0.95), at(0.99))
+    }
+
+    /// A page of `rows` rows with `times` declared timestamp columns and
+    /// `nulls` undeclared columns that are all NULL.
+    fn wide(rows: usize, times: usize, nulls: usize) -> ResultSet {
+        let mut columns: Vec<Column> = (0..times)
+            .map(|c| Column { name: format!("t{c}"), type_name: "timestamp".into() })
+            .collect();
+        columns.extend((0..nulls).map(|c| Column { name: format!("n{c}"), type_name: "text".into() }));
+        let data = QueryResult {
+            columns,
+            rows: (0..rows)
+                .map(|r| {
+                    let mut row: Vec<Value> = (0..times)
+                        .map(|c| {
+                            Value::Text(format!(
+                                "2026-10-{:02} {:02}:{:02}:{:02}",
+                                1 + (r + c) % 28,
+                                r % 24,
+                                (r / 24) % 60,
+                                c % 60
+                            ))
+                        })
+                        .collect();
+                    row.extend((0..nulls).map(|_| Value::Null));
+                    row
+                })
+                .collect(),
+            ..Default::default()
+        };
+        ResultSet::new("wide".into(), "select".into(), data, Page::first(rows))
+    }
+
+    /// Run with `cargo test --release --lib depth_view_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn depth_view_benchmark() {
+        let ctx = egui::Context::default();
+        for (rows, times, nulls) in [(5000, 4, 0), (5000, 60, 0), (5000, 0, 400)] {
+            let mut rs = wide(rows, times, nulls);
+            let t = std::time::Instant::now();
+            let may = rs.depth_may_apply();
+            let check = t.elapsed();
+            if times == 0 {
+                eprintln!("{rows} rows, {nulls} all-NULL columns: button check {check:?} (applies: {may})");
+                continue;
+            }
+            rs.toggle_depth_view();
+            let t = std::time::Instant::now();
+            let first = rs.depth_analysis(&ctx);
+            let first_frame = t.elapsed();
+            while rs.depth_analysis(&ctx).is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let done = t.elapsed();
+            rs.depth.series = (0..times.min(depth::MAX_SERIES)).collect();
+            let model = loop {
+                if let Some((_, m)) = rs.depth_analysis(&ctx)
+                    && m.as_ref().is_ok_and(|m| m.series.len() == times.min(depth::MAX_SERIES))
+                {
+                    break m.unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            drop(first);
+            let _ = model.rows();
+            // Dragging the window: a new range every frame.
+            let (lo, hi) = (model.min, model.max);
+            let mut drag = Vec::new();
+            for step in 0..200 {
+                let shift = (hi - lo) / 400 * step;
+                rs.depth.window = Some((lo + shift, lo + shift + (hi - lo) / 3));
+                let t = std::time::Instant::now();
+                let _ = rs.depth_rows(&model).len();
+                drag.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            eprintln!(
+                "{rows} rows x {times} timestamp columns: button check {check:?}, first frame {first_frame:?}, analysis done {done:?}; window drag with {} series {}",
+                model.series.len(),
+                percentiles(drag)
+            );
+        }
     }
 
     #[test]

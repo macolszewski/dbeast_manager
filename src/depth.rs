@@ -97,8 +97,11 @@ fn temporal_type(type_name: &str) -> bool {
 
 /// Cheap test for showing Depth View: a declared date type, or an undeclared
 /// column whose first non-null values parse. [`time_columns`] decides exactly.
+/// Each column looks at a bounded number of rows, so columns that are mostly
+/// NULL do not make the check scan the whole page.
 pub fn may_have_time_columns(data: &QueryResult) -> bool {
     const SAMPLE: usize = 32;
+    const SAMPLE_ROWS: usize = 256;
     data.columns.iter().enumerate().any(|(index, column)| {
         if column.type_name.eq_ignore_ascii_case("time") {
             return false;
@@ -109,6 +112,7 @@ pub fn may_have_time_columns(data: &QueryResult) -> bool {
         let mut sample = data
             .rows
             .iter()
+            .take(SAMPLE_ROWS)
             .filter_map(|row| row.get(index))
             .filter(|value| !matches!(value, Value::Null))
             .take(SAMPLE)
@@ -121,6 +125,14 @@ pub fn may_have_time_columns(data: &QueryResult) -> bool {
 /// may contain unreadable values (reported as invalid); undeclared columns
 /// qualify only when every non-null value parses. One pass over the page.
 pub fn time_columns(data: &QueryResult) -> Vec<TimeColumn> {
+    time_columns_until(data, &|| false).unwrap_or_default()
+}
+
+/// Rows parsed between checks of a cancellation flag.
+const CHECK_ROWS: usize = 1024;
+
+/// [`time_columns`] that gives up with `None` once `cancelled` returns true.
+pub fn time_columns_until(data: &QueryResult, cancelled: &dyn Fn() -> bool) -> Option<Vec<TimeColumn>> {
     let mut out = Vec::new();
     for (index, column) in data.columns.iter().enumerate() {
         if column.type_name.eq_ignore_ascii_case("time") {
@@ -131,7 +143,10 @@ pub fn time_columns(data: &QueryResult) -> Vec<TimeColumn> {
         let mut date_only = true;
         let mut invalid = 0;
         let mut ok = true;
-        for row in &data.rows {
+        for (number, row) in data.rows.iter().enumerate() {
+            if number % CHECK_ROWS == 0 && cancelled() {
+                return None;
+            }
             match row.get(index) {
                 None | Some(Value::Null) => {}
                 Some(value) => match parse_time(value) {
@@ -156,7 +171,7 @@ pub fn time_columns(data: &QueryResult) -> Vec<TimeColumn> {
             });
         }
     }
-    out
+    Some(out)
 }
 
 /// No value: below any representable instant, which starts at year -262143.
@@ -180,18 +195,27 @@ pub struct DepthModel {
 impl DepthModel {
     /// `candidates` are the result's [`time_columns`], computed once per result.
     pub fn build(data: &QueryResult, series: &[usize], candidates: &[TimeColumn]) -> Result<Self, String> {
+        Self::build_until(data, series, candidates, &|| false).unwrap_or_else(|| Err("Cancelled.".into()))
+    }
+
+    /// [`DepthModel::build`] that gives up with `None` once `cancelled` returns true.
+    pub fn build_until(
+        data: &QueryResult,
+        series: &[usize],
+        candidates: &[TimeColumn],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<Result<Self, String>> {
         if series.is_empty() || series.len() > MAX_SERIES {
-            return Err(format!("Choose one to {MAX_SERIES} time columns."));
+            return Some(Err(format!("Choose one to {MAX_SERIES} time columns.")));
         }
         let mut domain = None;
         let mut precisions = Vec::new();
         for &column in series {
-            let candidate = candidates
-                .iter()
-                .find(|candidate| candidate.index == column)
-                .ok_or("A chosen column is not a date or time column.")?;
+            let Some(candidate) = candidates.iter().find(|candidate| candidate.index == column) else {
+                return Some(Err("A chosen column is not a date or time column.".into()));
+            };
             if domain.is_some_and(|d| d != candidate.domain) {
-                return Err("Columns with and without a time zone cannot share one time axis. Choose columns of the same kind.".into());
+                return Some(Err("Columns with and without a time zone cannot share one time axis. Choose columns of the same kind.".into()));
             }
             domain = Some(candidate.domain);
             precisions.push(candidate.date_only);
@@ -200,7 +224,10 @@ impl DepthModel {
         let mut times = Vec::with_capacity(data.rows.len() * width);
         let mut missing = vec![0; width];
         let (mut min, mut max) = (i64::MAX, i64::MIN);
-        for row in &data.rows {
+        for (number, row) in data.rows.iter().enumerate() {
+            if number % CHECK_ROWS == 0 && cancelled() {
+                return None;
+            }
             for (slot, &column) in series.iter().enumerate() {
                 let time = row.get(column).and_then(parse_time).map(|p| p.micros);
                 match time {
@@ -214,9 +241,9 @@ impl DepthModel {
             }
         }
         if min > max {
-            return Err("The chosen columns have no readable dates in this result.".into());
+            return Some(Err("The chosen columns have no readable dates in this result.".into()));
         }
-        Ok(Self {
+        Some(Ok(Self {
             series: series.to_vec(),
             domain: domain.unwrap_or(Domain::Wall),
             mixed_precision: precisions.iter().any(|d| *d) && precisions.iter().any(|d| !d),
@@ -224,7 +251,7 @@ impl DepthModel {
             min,
             max,
             missing,
-        })
+        }))
     }
 
     pub fn rows(&self) -> usize {
