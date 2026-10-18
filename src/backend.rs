@@ -391,7 +391,72 @@ type Session = Arc<tokio::sync::Mutex<SessionState>>;
 /// uses it or before the first one.
 type ActivityConnections = Arc<Mutex<HashMap<u64, Option<Connection>>>>;
 
+/// Decoded result bytes sent to the UI and not taken by it yet. A script waits
+/// before its next statement while this is over [`PENDING_RESULT_BYTES`], so
+/// results do not pile up in the event channel when the UI is not drawing.
+pub struct PendingResults {
+    bytes: std::sync::atomic::AtomicUsize,
+    limit: std::sync::atomic::AtomicUsize,
+    taken: tokio::sync::Notify,
+}
+
+impl Default for PendingResults {
+    fn default() -> Self {
+        Self {
+            bytes: Default::default(),
+            limit: PENDING_RESULT_BYTES.into(),
+            taken: Default::default(),
+        }
+    }
+}
+
+pub const PENDING_RESULT_BYTES: usize = 256 << 20;
+
+impl PendingResults {
+    fn bytes_of(event: &Event) -> usize {
+        match event {
+            Event::StatementDone {
+                result: Ok(result), ..
+            } => result.rows.iter().map(|row| crate::model::row_bytes(row)).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Called by the UI for every event it takes from the channel.
+    pub fn taken(&self, event: &Event) {
+        let bytes = Self::bytes_of(event);
+        if bytes > 0 {
+            let _ = self.bytes.try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(bytes)),
+            );
+            self.taken.notify_waiters();
+        }
+    }
+
+    pub fn pending(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Changes [`PENDING_RESULT_BYTES`], for tests.
+    pub fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn wait_below_limit(&self) {
+        loop {
+            let taken = self.taken.notified();
+            if self.pending() <= self.limit.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            taken.await;
+        }
+    }
+}
+
 pub struct Backend {
+    pub pending_results: Arc<PendingResults>,
     pub mcp: crate::mcp::McpController,
     rt: Runtime,
     persistence: Option<Sender<crate::persistence::Command>>,
@@ -447,6 +512,7 @@ impl Backend {
             mcp_ctx.request_repaint();
         });
         Self {
+            pending_results: Arc::default(),
             mcp,
             rt,
             persistence: None,
@@ -544,8 +610,17 @@ impl Backend {
     fn send(&self) -> impl Fn(Event) + Send + Clone + 'static {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        let pending = self.pending_results.clone();
         move |e| {
-            let _ = tx.send(e);
+            let bytes = PendingResults::bytes_of(&e);
+            pending
+                .bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+            if tx.send(e).is_err() {
+                pending
+                    .bytes
+                    .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+            }
             ctx.request_repaint();
         }
     }
@@ -986,6 +1061,7 @@ impl Backend {
         let send = self.send();
         let session = self.session(&req.ds.id, &req.console_id.to_string());
         let cancels = self.cancels.clone();
+        let pending_results = self.pending_results.clone();
         self.rt.spawn(async move {
             let mut registration = Some(registration);
             let console = req.console_id;
@@ -1056,7 +1132,12 @@ impl Backend {
                     state.in_tx = open;
                     // Whether an implicit commit could make earlier changes permanent.
                     let mut tx_has_work = open;
+                    let pending_results = pending_results.clone();
                     for (index, sql) in statements.into_iter().enumerate() {
+                        // Results the UI has not taken yet bound what is read next.
+                        if index > 0 {
+                            pending_results.wait_below_limit().await;
+                        }
                         let control = tx_effect(&sql);
                         // Manual mode keeps every statement in a transaction, also
                         // after one ended in the middle of a script.

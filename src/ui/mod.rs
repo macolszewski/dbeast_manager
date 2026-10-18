@@ -794,6 +794,7 @@ impl App {
     // ---------------------------------------------------------------- events
 
     fn handle_events(&mut self) {
+        let pending_results = self.backend.pending_results.clone();
         if let Some(loading) = &self.session_loading {
             match loading.try_recv() {
                 Ok(saved) => {
@@ -808,6 +809,7 @@ impl App {
             }
         }
         while let Ok(ev) = self.backend.rx.try_recv() {
+            pending_results.taken(&ev);
             match ev {
                 Event::McpChanged => self.mcp_changed(),
                 Event::ConfigLoaded(result) => self.loaded_config(result),

@@ -2563,3 +2563,34 @@ fn table_pages_reuse_the_primary_key_until_ddl() {
     let (cleanup, ..) = run(&backend, req(1, &direct, &[&format!("drop table public.{table}")], false));
     assert!(cleanup[0].1.is_ok());
 }
+
+#[test]
+fn a_script_waits_while_the_ui_has_not_taken_its_results() {
+    let dir = std::env::temp_dir().join(format!("dbeast-pending-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ds = DataSource::new(DriverKind::Sqlite);
+    ds.file = dir.join("pending.db").to_string_lossy().into_owned();
+    let backend = Backend::new(egui::Context::default());
+    backend.pending_results.set_limit(1);
+    backend.run(req(
+        7,
+        &ds,
+        &["select 'first'", "select 'second'", "select 'third'"],
+        false,
+    ));
+    let next = || backend.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let first = next();
+    assert!(matches!(&first, Event::StatementDone { sql, .. } if sql == "select 'first'"));
+    // Not taken by the UI yet: the next statement waits.
+    assert!(backend.rx.recv_timeout(Duration::from_millis(500)).is_err());
+    assert!(backend.pending_results.pending() > 0);
+    backend.pending_results.taken(&first);
+    let second = next();
+    assert!(matches!(&second, Event::StatementDone { sql, .. } if sql == "select 'second'"));
+    backend.pending_results.taken(&second);
+    let third = next();
+    backend.pending_results.taken(&third);
+    assert!(matches!(next(), Event::RunFinished { .. }));
+    assert_eq!(backend.pending_results.pending(), 0);
+    std::fs::remove_dir_all(dir).ok();
+}
