@@ -895,9 +895,77 @@ async fn postgres_paging_cost() {
         let client = time(&mut conn, base, window).await;
         let (sql, server_window) = dbeast::drivers::page_query(DriverKind::Postgres, base, &["id".into()], window);
         let server = time(&mut conn, &sql, server_window).await;
-        eprintln!("table page at offset {skip} of 20000 rows: {client:?} skipped by the client, {server:?} with LIMIT/OFFSET");
+        let mut limited = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            conn.execute_limited_with_context(&sql, server_window, None).await.unwrap();
+            limited = limited.min(started.elapsed());
+        }
+        eprintln!("table page at offset {skip} of 20000 rows: {client:?} skipped by the client, {server:?} with LIMIT/OFFSET and a cancel request, {limited:?} with LIMIT/OFFSET read to the end");
     }
+    let mut key = std::time::Duration::MAX;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        conn.primary_key(Some("public"), "dbeast_paging_cost").await.unwrap();
+        key = key.min(started.elapsed());
+    }
+    eprintln!("primary key lookup before each table page: {key:?}");
     conn.execute("drop table dbeast_paging_cost", Page::first(0)).await.unwrap();
+}
+
+/// Forwards TCP connections to the test PostgreSQL and counts them.
+async fn counting_proxy() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut server) = tokio::net::TcpStream::connect("127.0.0.1:55432").await {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    (port, accepted)
+}
+
+/// Table pages carry their own LIMIT, so the row after the page is read and
+/// no cancel connection is opened; a console SELECT still stops early.
+#[tokio::test]
+async fn postgres_limited_pages_open_no_cancel_connection() {
+    if std::net::TcpStream::connect("127.0.0.1:55432").is_err() {
+        eprintln!("skipping, PostgreSQL unavailable");
+        return;
+    }
+    let (port, accepted) = counting_proxy().await;
+    let mut ds = pg();
+    ds.host = "127.0.0.1".into();
+    ds.port = port;
+    let mut conn = Connection::open(&ds).await.unwrap();
+    let opened = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    let page = Page { skip: 1000, limit: 500 };
+    let base = "select g from generate_series(1, 5000) g";
+    let (sql, window) = dbeast::drivers::page_query(DriverKind::Postgres, base, &[], page);
+    for _ in 0..3 {
+        let r = conn.execute_limited_with_context(&sql, window, None).await.unwrap();
+        assert_eq!((r.rows.len(), r.truncated), (500, true));
+        assert_eq!(r.rows[0][0], Value::Int(1001));
+    }
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), opened, "no cancel connections");
+    // An error in the row after the page still fails the page.
+    let failing = "select g, 1 / (g - 1501) from generate_series(1, 5000) g";
+    let (sql_error, window) = dbeast::drivers::page_query(DriverKind::Postgres, failing, &[], page);
+    let error = conn.execute_limited_with_context(&sql_error, window, None).await.unwrap_err();
+    assert!(error.to_string().contains("division by zero"), "{error}");
+    let next = conn.execute_with_context("select 42", Page::first(500), None).await.unwrap();
+    assert_eq!(next.rows, vec![vec![Value::Int(42)]], "the next statement is not cancelled");
+    // The general path for console SQL keeps its early cancel.
+    let r = conn.execute_with_context(base, Page::first(500), None).await.unwrap();
+    assert_eq!((r.rows.len(), r.truncated), (500, true));
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), opened + 1, "one cancel connection");
 }
 
 /// Errors in, at and after the page boundary (page size 500) fail the

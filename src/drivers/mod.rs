@@ -267,10 +267,33 @@ impl Connection {
         page: Page,
         expected: Option<&ResolvedContext>,
     ) -> Result<QueryResult> {
+        self.execute_with_context_as(sql, page, expected, false).await
+    }
+
+    /// Like [`Self::execute_with_context`] for SQL whose own `LIMIT` already
+    /// ends the result at most one row after `page` (see [`page_query`]). The
+    /// row after the page is read instead of cancelling the statement, so no
+    /// cancel connection is opened.
+    pub async fn execute_limited_with_context(
+        &mut self,
+        sql: &str,
+        page: Page,
+        expected: Option<&ResolvedContext>,
+    ) -> Result<QueryResult> {
+        self.execute_with_context_as(sql, page, expected, true).await
+    }
+
+    async fn execute_with_context_as(
+        &mut self,
+        sql: &str,
+        page: Page,
+        expected: Option<&ResolvedContext>,
+        limited: bool,
+    ) -> Result<QueryResult> {
         let started = std::time::Instant::now();
         let mut result = match &mut self.kind {
             Kind::Postgres(c) => c
-                .execute_with_context(sql, page, expected)
+                .execute_with_context(sql, page, expected, !limited)
                 .await
                 .map_err(postgres::describe),
             Kind::MySql(c) => c.execute_with_context(sql, page, expected).await,

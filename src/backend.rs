@@ -1005,7 +1005,7 @@ impl Backend {
                                 conn.execute(&sql, page).await
                             } else if let Some(table) = &table_page {
                                 let (paged, window) = table_page_query(conn, ds.driver, table, &sql, page).await;
-                                conn.execute_with_context(&paged, window, expected_context.as_ref())
+                                conn.execute_limited_with_context(&paged, window, expected_context.as_ref())
                                     .await
                             } else {
                                 conn.execute_with_context(&sql, page, expected_context.as_ref())

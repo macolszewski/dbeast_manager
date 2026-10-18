@@ -167,16 +167,19 @@ impl PgConn {
     }
 
     pub async fn execute(&mut self, sql: &str, page: Page) -> Result<QueryResult> {
-        self.execute_inner(sql, page, false, None).await
+        self.execute_inner(sql, page, false, None, false).await
     }
 
+    /// `may_cancel` allows stopping a long read-only SELECT after the page;
+    /// SQL limited by the application has at most one row left to read.
     pub async fn execute_with_context(
         &mut self,
         sql: &str,
         page: Page,
         expected: Option<&ResolvedContext>,
+        may_cancel: bool,
     ) -> Result<QueryResult> {
-        self.execute_inner(sql, page, true, expected).await
+        self.execute_inner(sql, page, true, expected, may_cancel).await
     }
 
     async fn execute_inner(
@@ -185,12 +188,14 @@ impl PgConn {
         page: Page,
         capture: bool,
         expected: Option<&ResolvedContext>,
+        may_cancel: bool,
     ) -> Result<QueryResult> {
         // The snapshot and the existing prepare are pipelined. Poll the snapshot
         // first so it describes the namespace before parsing/executing user SQL.
         // Do not short-circuit on a snapshot error: ROLLBACK must still execute
         // in an aborted transaction, where the context SELECT is rejected.
-        let may_stop_early = capture
+        let may_stop_early = may_cancel
+            && capture
             && self.page_cancel.is_some()
             && page.limit != usize::MAX
             && read_only_select(sql);
