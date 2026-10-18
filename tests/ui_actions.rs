@@ -216,15 +216,20 @@ fn verify_editor_actions(h: &mut H<'_>, context: &egui::Context, config_path: &P
             .chars()
             .all(|character| dbeast::folding::placeholder_index(character).is_none())
     );
-    let config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-    let saved = config["consoles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|console| console["title"] == "Alpha")
-        .unwrap();
-    assert_eq!(saved["sql"].as_str(), Some(formatted.as_str()));
+    // The configuration is written once edits pause.
+    let saved_alpha = |_: &H<'_>| {
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        config["consoles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|console| console["title"] == "Alpha")
+            .and_then(|console| console["sql"].as_str().map(str::to_owned))
+    };
+    wait_until(h, "formatted console saved", |h| {
+        saved_alpha(h).as_deref() == Some(formatted.as_str())
+    });
     key(h, Modifiers::COMMAND, Key::Z);
     assert_eq!(sql(h), ALPHA_SQL);
     assert_eq!(editor_selection(context, editor), tail_selection);
@@ -513,9 +518,11 @@ fn verify_closing(h: &mut H<'_>, db: &rusqlite::Connection, config_path: &Path) 
     click(h, "Close and Discard");
     assert!(h.query_by_label("QL Alpha").is_none());
     assert!(h.query_by_role(Role::MultilineTextInput).is_none());
-    let config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-    assert!(config["consoles"].as_array().unwrap().is_empty());
+    wait_until(h, "closed consoles removed from the configuration", |_| {
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        config["consoles"].as_array().unwrap().is_empty()
+    });
     let stored: String = db
         .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
             row.get(0)

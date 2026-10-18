@@ -7,7 +7,8 @@ use std::path::PathBuf;
 pub struct SavedConsole {
     pub title: String,
     pub ds_id: String,
-    pub sql: String,
+    /// Shared with the console tab, so a snapshot copies no text.
+    pub sql: std::sync::Arc<str>,
     /// Database of the server the console runs in, when not the data source's default.
     #[serde(default)]
     pub database: Option<String>,
@@ -18,7 +19,7 @@ pub struct SavedConsole {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub ds_id: String,
-    pub sql: String,
+    pub sql: std::sync::Arc<str>,
     pub at: chrono::DateTime<chrono::Local>,
 }
 
@@ -225,10 +226,10 @@ impl Config {
 
     /// Records a statement, moving a repeated one to the top instead of duplicating it.
     pub fn remember(&mut self, ds_id: &str, sql: &str) {
-        self.history.retain(|h| !(h.ds_id == ds_id && h.sql == sql));
+        self.history.retain(|h| !(h.ds_id == ds_id && &*h.sql == sql));
         self.history.push(HistoryEntry {
             ds_id: ds_id.to_string(),
-            sql: sql.to_string(),
+            sql: sql.into(),
             at: chrono::Local::now(),
         });
         let count = self.history.iter().filter(|h| h.ds_id == ds_id).count();
@@ -299,6 +300,13 @@ pub(crate) fn atomic_write<T: Serialize>(
     path: &std::path::Path,
     config: &T,
 ) -> Result<bool, String> {
+    let data =
+        serde_json::to_vec_pretty(config).map_err(|_| "Cannot encode configuration".to_string())?;
+    atomic_write_bytes(path, &data)
+}
+
+/// [`atomic_write`] of an already encoded file.
+pub(crate) fn atomic_write_bytes(path: &std::path::Path, data: &[u8]) -> Result<bool, String> {
     use std::io::Write;
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(parent)
@@ -315,9 +323,7 @@ pub(crate) fn atomic_write<T: Serialize>(
         let mut file = options
             .open(&temp)
             .map_err(|_| "Cannot create temporary configuration".to_string())?;
-        let data = serde_json::to_vec_pretty(config)
-            .map_err(|_| "Cannot encode configuration".to_string())?;
-        file.write_all(&data)
+        file.write_all(data)
             .and_then(|_| file.sync_all())
             .map_err(|_| "Cannot write configuration".to_string())?;
         replace_durably(&temp, path, parent)

@@ -1273,6 +1273,7 @@ pub(super) mod tests {
             config_apply_pending: None,
             config_dirty: false,
             config_saves_pending: 0,
+            autosave: Default::default(),
             closing: false,
             close_ready: false,
             filter: String::new(),

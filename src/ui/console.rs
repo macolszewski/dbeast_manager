@@ -754,7 +754,7 @@ fn console_history_menu(
                 };
                 if ui
                     .button(RichText::new(format!("{line}{more}")).monospace())
-                    .on_hover_text(sql)
+                    .on_hover_text(&**sql)
                     .clicked()
                 {
                     tab.editor_history.checkpoint();

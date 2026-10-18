@@ -1,6 +1,6 @@
 //! Serialized, transactional configuration and credential persistence, run off the UI thread.
 use crate::{
-    config::{Config, atomic_write},
+    config::{Config, atomic_write, atomic_write_bytes},
     credentials::{CredentialStore, Secrets, VAULT_ACCOUNT, Vault},
     model::PasswordStorage,
 };
@@ -181,10 +181,10 @@ impl Persistence {
         if self.fail_config_write {
             return Err("Synthetic config write failure".into());
         }
-        let durable = atomic_write(&self.path, config)?;
-        self.disk_revision = Some(digest(
-            &serde_json::to_vec_pretty(config).map_err(|_| "Cannot encode configuration")?,
-        ));
+        // One encoding serves both the file and the revision it is compared by.
+        let data = serde_json::to_vec_pretty(config).map_err(|_| "Cannot encode configuration")?;
+        let durable = atomic_write_bytes(&self.path, &data)?;
+        self.disk_revision = Some(digest(&data));
         #[cfg(test)]
         if self.force_nondurable {
             return Ok(false);

@@ -39,6 +39,7 @@ mod transfers;
 mod zoom;
 
 use crate::backend::{Backend, Event, RunRequest};
+use std::time::{Duration, Instant};
 use crate::completion::Item;
 use crate::config::{Config, SavedConsole};
 use crate::drivers::select_all;
@@ -159,6 +160,20 @@ struct CompletionPopup {
     selected: usize,
 }
 
+/// Pause in edits after which the configuration is written.
+const AUTOSAVE_PAUSE: Duration = Duration::from_millis(400);
+/// Longest delay of a write while edits continue.
+const AUTOSAVE_MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// Ordinary configuration saves: whether one is waiting and whether one is
+/// being written. Apply, Load and credential operations are not coalesced.
+#[derive(Default)]
+struct Autosave {
+    dirty_since: Option<Instant>,
+    last_change: Option<Instant>,
+    in_flight: bool,
+}
+
 struct Tab {
     id: u64,
     title: String,
@@ -175,6 +190,8 @@ struct Tab {
     /// connecting. The first attempt to edit them reloads the page so edits
     /// use fresh data and metadata.
     refresh_on_activate: bool,
+    /// Console text as last handed to the configuration writer, shared with it.
+    saved_sql: Option<std::sync::Arc<str>>,
     /// Last known caret/selection as char offsets.
     cursor: Option<Range<usize>>,
     manual_tx: bool,
@@ -283,6 +300,7 @@ pub struct App {
     config_apply_pending: Option<(bool, Option<String>)>,
     config_dirty: bool,
     config_saves_pending: usize,
+    autosave: Autosave,
     closing: bool,
     close_ready: bool,
     filter: String,
@@ -392,6 +410,7 @@ impl App {
             config_apply_pending: None,
             config_dirty: false,
             config_saves_pending: 0,
+            autosave: Autosave::default(),
             closing: false,
             close_ready: false,
             filter: String::new(),
@@ -442,8 +461,11 @@ impl App {
                     let i = self.add_tab(
                         console.title,
                         console.ds_id,
-                        TabKind::Console { sql: console.sql },
+                        TabKind::Console {
+                            sql: console.sql.to_string(),
+                        },
                     );
+                    self.tabs[i].saved_sql = Some(console.sql);
                     self.tabs[i].database = console.database;
                     self.tabs[i].schema = console.schema;
                     self.update_metadata_key(i);
@@ -563,29 +585,68 @@ impl App {
         find_source(&self.config, &self.files, id)
     }
 
+    /// Marks the configuration as changed. The snapshot is taken later by
+    /// [`Self::flush_config`], after edits pause, so typing does not copy the
+    /// configuration on every frame.
     fn save_config(&mut self) {
-        self.config.consoles = self
-            .tabs
-            .iter()
-            .filter(|t| !t.ds_id.starts_with("file:") && t.bound_query.is_none())
-            .filter_map(|t| match &t.kind {
-                TabKind::Console { sql } => Some(SavedConsole {
-                    title: t.title.clone(),
-                    ds_id: t.ds_id.clone(),
-                    sql: sql.clone(),
-                    database: t.database.clone(),
-                    schema: t.schema.clone(),
-                }),
-                TabKind::Table { .. } => None,
-            })
-            .collect();
-        if !self.config_loaded {
+        let now = Instant::now();
+        self.autosave.dirty_since.get_or_insert(now);
+        self.autosave.last_change = Some(now);
+        self.backend.ctx().request_repaint_after(AUTOSAVE_PAUSE);
+    }
+
+    /// Hands the configuration to the writer when it changed and edits paused
+    /// (or `now`), with at most one ordinary save in flight. A change made
+    /// meanwhile stays a flag and is written after the save in flight finishes.
+    fn flush_config(&mut self, now: bool) {
+        let Some(since) = self.autosave.dirty_since else {
+            return;
+        };
+        if !self.config_loaded || self.autosave.in_flight {
             return;
         }
         if self.config_apply_pending.is_some() {
             self.config_dirty = true;
+            self.autosave = Autosave::default();
             return;
         }
+        let paused = self
+            .autosave
+            .last_change
+            .is_none_or(|at| at.elapsed() >= AUTOSAVE_PAUSE);
+        if !(now || paused || since.elapsed() >= AUTOSAVE_MAX_DELAY) {
+            self.backend.ctx().request_repaint_after(AUTOSAVE_PAUSE);
+            return;
+        }
+        self.autosave.dirty_since = None;
+        self.autosave.last_change = None;
+        let mut consoles = Vec::new();
+        for tab in &mut self.tabs {
+            let TabKind::Console { sql } = &tab.kind else {
+                continue;
+            };
+            if tab.ds_id.starts_with("file:") || tab.bound_query.is_some() {
+                continue;
+            }
+            // Unchanged text keeps the buffer the writer already has.
+            let shared = match &tab.saved_sql {
+                Some(saved) if **saved == **sql => saved.clone(),
+                _ => {
+                    let shared: std::sync::Arc<str> = sql.as_str().into();
+                    tab.saved_sql = Some(shared.clone());
+                    shared
+                }
+            };
+            consoles.push(SavedConsole {
+                title: tab.title.clone(),
+                ds_id: tab.ds_id.clone(),
+                sql: shared,
+                database: tab.database.clone(),
+                schema: tab.schema.clone(),
+            });
+        }
+        self.config.consoles = consoles;
+        self.autosave.in_flight = true;
         self.config_saves_pending += 1;
         self.backend.save_config(self.config.clone(), false);
     }
@@ -610,6 +671,7 @@ impl App {
             kind,
             bound_query: None,
             refresh_on_activate: false,
+            saved_sql: None,
             results: Vec::new(),
             plan: None,
             log: Default::default(),
@@ -747,6 +809,9 @@ impl App {
                 }
                 Event::ConfigSaved { apply, result } => {
                     self.config_saves_pending = self.config_saves_pending.saturating_sub(1);
+                    if !apply {
+                        self.autosave.in_flight = false;
+                    }
                     if result.is_err() {
                         self.closing = false;
                     }
@@ -2256,7 +2321,12 @@ impl eframe::App for App {
                 self.save_config();
             }
         }
-        if self.closing && self.config_saves_pending == 0 && self.config_apply_pending.is_none() {
+        self.flush_config(self.closing);
+        if self.closing
+            && self.config_saves_pending == 0
+            && self.config_apply_pending.is_none()
+            && self.autosave.dirty_since.is_none()
+        {
             self.close_ready = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -2541,6 +2611,115 @@ fn guess_title(sql: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::active_tab_after_close;
+
+    #[test]
+    fn autosave_coalesces_edits_and_shares_unchanged_console_text() {
+        use super::*;
+        let ctx = egui::Context::default();
+        let mut app = actions::tests::isolated_app(&ctx);
+        app.config_loaded = true;
+        let source = DataSource::new(DriverKind::Sqlite);
+        app.config.data_sources.push(source.clone());
+        let big = "select 1;\n".repeat(1 << 20);
+        let quiet = app.add_tab("quiet".into(), source.id.clone(), TabKind::Console { sql: big });
+        let busy = app.add_tab("busy".into(), source.id.clone(), TabKind::Console { sql: String::new() });
+        let ack = |app: &mut App| {
+            app.config_saves_pending -= 1;
+            app.autosave.in_flight = false;
+        };
+        // A burst of edits takes no snapshot until the edits pause.
+        for i in 0..1000 {
+            if let TabKind::Console { sql } = &mut app.tabs[busy].kind {
+                *sql = format!("select {i}");
+            }
+            app.save_config();
+            app.flush_config(false);
+        }
+        assert_eq!(app.config_saves_pending, 0);
+        app.flush_config(true);
+        assert_eq!(app.config_saves_pending, 1);
+        let first = app.config.consoles.clone();
+        assert_eq!(&*first[1].sql, "select 999");
+        // While a save is in flight, further edits only mark the state dirty.
+        for i in 0..1000 {
+            if let TabKind::Console { sql } = &mut app.tabs[busy].kind {
+                *sql = format!("select again {i}");
+            }
+            app.save_config();
+            app.flush_config(true);
+        }
+        assert_eq!(app.config_saves_pending, 1, "one ordinary save in flight");
+        ack(&mut app);
+        app.flush_config(true);
+        assert_eq!(app.config_saves_pending, 1);
+        let second = app.config.consoles.clone();
+        assert_eq!(&*second[1].sql, "select again 999", "the latest revision is written");
+        assert!(
+            std::sync::Arc::ptr_eq(&first[0].sql, &second[0].sql),
+            "an unchanged console is not copied again"
+        );
+        ack(&mut app);
+        app.flush_config(true);
+        assert_eq!(app.config_saves_pending, 0, "nothing changed, nothing written");
+
+        // A change during Apply waits for Apply and is then saved.
+        app.config_apply_pending = Some((false, None));
+        app.save_config();
+        app.flush_config(true);
+        assert_eq!(app.config_saves_pending, 0);
+        assert!(app.config_dirty);
+        app.finish_config_apply(Err("synthetic".into()));
+        app.flush_config(true);
+        assert_eq!(app.config_saves_pending, 1);
+        let _ = quiet;
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release --lib autosave_cost -- --ignored --nocapture"]
+    fn autosave_cost_benchmark() {
+        use super::*;
+        let ctx = egui::Context::default();
+        let mut app = actions::tests::isolated_app(&ctx);
+        app.config_loaded = true;
+        let source = DataSource::new(DriverKind::Sqlite);
+        app.config.data_sources.push(source.clone());
+        // 20 MiB of console text in 10 tabs, one of them being edited.
+        for t in 0..10 {
+            let sql = format!("-- tab {t}\n{}", "select 1;\n".repeat((2 << 20) / 10));
+            app.add_tab(format!("t{t}"), source.id.clone(), TabKind::Console { sql });
+        }
+        app.flush_config(true);
+        app.config_saves_pending = 0;
+        app.autosave.in_flight = false;
+        const EDITS: u32 = 200;
+        let start = Instant::now();
+        for _ in 0..EDITS {
+            // The work save_config did on every change before.
+            let consoles: Vec<String> = app
+                .tabs
+                .iter()
+                .filter_map(|tab| match &tab.kind {
+                    TabKind::Console { sql } => Some(sql.clone()),
+                    TabKind::Table { .. } => None,
+                })
+                .collect();
+            std::hint::black_box((consoles, app.config.clone()));
+        }
+        let before = start.elapsed() / EDITS;
+        let start = Instant::now();
+        for i in 0..EDITS {
+            if let TabKind::Console { sql } = &mut app.tabs[0].kind {
+                sql.push_str(if i % 2 == 0 { " " } else { "\n" });
+            }
+            app.save_config();
+            app.flush_config(false);
+        }
+        let per_change = start.elapsed() / EDITS;
+        let start = Instant::now();
+        app.flush_config(true);
+        let snapshot = start.elapsed();
+        println!("20 MiB in 10 consoles: before {before:?} per change; after {per_change:?} per change, {snapshot:?} per snapshot (one changed console)");
+    }
 
     #[test]
     fn settings_reload_replaces_draft_only_on_success_and_invalidates_changed_sources() {

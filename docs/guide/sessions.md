@@ -49,7 +49,7 @@ The configuration (`config.json`) stores data sources, query history, recently u
 | Linux | `~/.config/dbeast/config.json` |
 | Windows | `%APPDATA%\dbeast\dbeast\config\config.json` |
 
-The file is written with 0600 permissions. If a configuration from an earlier version of the application exists at its older location, DBeast keeps using that path, because saved passwords in the system keychain are bound to the location of the file.
+The file is written with 0600 permissions, in the background, about half a second after changes pause (at most every 2 seconds while you keep typing) and when the application closes. If a configuration from an earlier version of the application exists at its older location, DBeast keeps using that path, because saved passwords in the system keychain are bound to the location of the file.
 
 Files stored next to the configuration:
 

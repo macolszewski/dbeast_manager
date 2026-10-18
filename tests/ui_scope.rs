@@ -135,6 +135,12 @@ fn choose_databases_and_schemas() {
         .click();
     h.run_steps(3);
     shot(&mut h, "22-database-chooser");
+    // The configuration is written once changes pause.
+    wait_until(&mut h, "schema selection saved", |_| {
+        std::fs::read_to_string(&config).is_ok_and(|saved| {
+            saved.contains("\"dbeast_archive\"") && saved.contains("hidden_schemas")
+        })
+    });
     let saved = std::fs::read_to_string(&config).unwrap();
     assert!(
         saved.contains("\"dbeast_archive\"") && saved.contains("hidden_schemas"),
