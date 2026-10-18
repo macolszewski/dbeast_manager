@@ -752,7 +752,9 @@ impl Backend {
                         path: None,
                         result: Ok(root),
                     });
-                    let meta = guard.conn.as_mut().unwrap().completion_metadata().await;
+                    // Expanding the tree must not wait for the whole catalog.
+                    drop(guard);
+                    let meta = completion_metadata(&ds).await;
                     send(Event::Completion {
                         key: MetadataKey::for_source(&ds),
                         request_id,
@@ -779,10 +781,8 @@ impl Backend {
     /// session. Callers deduplicate requests by MetadataKey::for_source.
     pub fn load_completion(&self, ds: DataSource, request_id: u64) {
         let send = self.send();
-        let session = self.session(&ds.id, &meta_session(&ds));
         self.spawn_metadata(ds.id.clone(), async move {
-            let mut guard = session.lock().await;
-            let result = async { guard.conn(&ds).await?.completion_metadata().await }.await;
+            let result = completion_metadata(&ds).await;
             send(Event::Completion {
                 key: MetadataKey::for_source(&ds),
                 request_id,
@@ -1532,6 +1532,14 @@ fn validate_edit_metadata(
 }
 
 /// Explorer session of a data source; PostgreSQL has one per database.
+/// Completion reads whole catalogs, which takes long on large servers. It
+/// runs on a connection of its own, closed afterwards, so explorer requests
+/// on the metadata session never queue behind it.
+async fn completion_metadata(ds: &DataSource) -> anyhow::Result<crate::model::CompletionMetadata> {
+    let mut state = SessionState::default();
+    state.conn(ds).await?.completion_metadata().await
+}
+
 fn meta_session(ds: &DataSource) -> String {
     match ds.driver {
         crate::model::DriverKind::Postgres => format!("meta:{}", ds.database),

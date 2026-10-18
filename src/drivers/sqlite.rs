@@ -333,7 +333,7 @@ impl LiteConn {
 
     pub async fn completion_meta(&mut self) -> Result<Vec<TableMeta>> {
         self.with(|conn| {
-            let mut rows = Vec::new();
+            let mut out = super::MetaGrouper::default();
             let schemas: Vec<String> = conn
                 .prepare("select name from pragma_database_list order by seq")?
                 .query_map([], |r| r.get(0))?
@@ -358,10 +358,11 @@ impl LiteConn {
                     ))
                 })?;
                 for row in found {
-                    rows.push(row?);
+                    let (schema, name, is_view, col, ty) = row?;
+                    out.push(schema, name, is_view, col, ty);
                 }
             }
-            Ok(super::group_meta(rows.into_iter()))
+            Ok(out.tables)
         })
         .await
     }

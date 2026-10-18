@@ -2399,3 +2399,88 @@ fn mysql_stop_closes_an_abandoned_connection_without_draining_it() {
     let (cleanup, ..) = run(&backend, req(90, &direct, &[&format!("drop table {table}")], false));
     assert!(cleanup[0].1.is_ok());
 }
+
+/// Forwards connections to the test MySQL, passing at most `chunk` bytes per
+/// `delay` from the server, like a slow link.
+fn throttled_mysql_proxy(chunk: usize, delay: Duration) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(mut client) = client else { return };
+            let Ok(mut server) = std::net::TcpStream::connect("127.0.0.1:53306") else { continue };
+            let (mut client_in, mut server_out) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_in, &mut server_out);
+                let _ = server_out.shutdown(std::net::Shutdown::Both);
+            });
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; chunk];
+                while let Ok(n) = server.read(&mut buffer) {
+                    if n == 0 || client.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                    if n == chunk {
+                        std::thread::sleep(delay);
+                    }
+                }
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    port
+}
+
+/// The completion catalog loads on a connection of its own: expanding the
+/// explorer right after connecting does not wait for the whole catalog.
+#[test]
+fn explorer_expands_while_the_completion_catalog_loads() {
+    let Some(direct) = mysql() else { return };
+    let backend = Backend::new(egui::Context::default());
+    let prefix = format!("dbeast_catalog_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let columns: Vec<String> = (0..30).map(|c| format!("column_number_{c} varchar(20)")).collect();
+    let create: Vec<String> = (0..150)
+        .map(|t| format!("create table {prefix}_{t} (id int primary key, {})", columns.join(", ")))
+        .collect();
+    let refs: Vec<&str> = create.iter().map(String::as_str).collect();
+    let (setup, ..) = run(&backend, req(90, &direct, &refs, false));
+    assert!(setup.iter().all(|(_, result)| result.is_ok()));
+    let mut ds = direct.clone();
+    ds.id = uuid::Uuid::new_v4().to_string();
+    ds.port = throttled_mysql_proxy(2048, Duration::from_millis(20));
+    backend.connect(ds.clone(), 7);
+    let mut order = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while order.len() < 2 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match backend.rx.recv_timeout(left).expect("explorer event") {
+            Event::Children { path: None, result, .. } => {
+                let root = result.unwrap();
+                let schema = root
+                    .iter()
+                    .find(|node| node.name == "dbeast")
+                    .expect("dbeast schema")
+                    .clone();
+                backend.load_children(ds.clone(), schema);
+            }
+            Event::Children { path: Some(_), result, .. } => {
+                assert!(result.is_ok());
+                order.push("children");
+            }
+            Event::Completion { result, .. } => {
+                let tables = result.unwrap().tables;
+                assert!(tables.iter().filter(|table| table.name.starts_with(&prefix)).all(|table| table.columns.len() == 31));
+                order.push("completion");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(order, ["children", "completion"]);
+    backend.disconnect(&ds.id);
+    let drop: Vec<String> = (0..150).map(|t| format!("drop table {prefix}_{t}")).collect();
+    let refs: Vec<&str> = drop.iter().map(String::as_str).collect();
+    let (cleanup, ..) = run(&backend, req(90, &direct, &refs, false));
+    assert!(cleanup.iter().all(|(_, result)| result.is_ok()));
+}
+

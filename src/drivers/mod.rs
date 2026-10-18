@@ -895,17 +895,22 @@ pub fn page_query(driver: DriverKind, sql: &str, keys: &[String], page: Page) ->
     (out, Page::first(page.limit))
 }
 
-/// Groups (schema, table, is_view, column, type) rows ordered by table into [`TableMeta`].
-fn group_meta(
-    rows: impl Iterator<Item = (String, String, bool, Option<String>, Option<String>)>,
-) -> Vec<TableMeta> {
-    let mut out: Vec<TableMeta> = Vec::new();
-    for (schema, name, is_view, col, ty) in rows {
-        let same = out
+/// Builds [`TableMeta`] from (schema, table, is_view, column, type) catalog
+/// rows ordered by table as they are read,
+/// so a large catalog is not also held as a list of rows.
+#[derive(Default)]
+struct MetaGrouper {
+    tables: Vec<TableMeta>,
+}
+
+impl MetaGrouper {
+    fn push(&mut self, schema: String, name: String, is_view: bool, col: Option<String>, ty: Option<String>) {
+        let same = self
+            .tables
             .last()
             .is_some_and(|t| t.schema == schema && t.name == name);
         if !same {
-            out.push(TableMeta {
+            self.tables.push(TableMeta {
                 schema,
                 name,
                 is_view,
@@ -913,13 +918,13 @@ fn group_meta(
             });
         }
         if let Some(col) = col {
-            out.last_mut()
+            self.tables
+                .last_mut()
                 .unwrap()
                 .columns
                 .push((col, ty.unwrap_or_default()));
         }
     }
-    out
 }
 
 /// Opening transaction statement for manual transaction mode.

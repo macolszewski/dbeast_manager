@@ -772,9 +772,10 @@ impl PgConn {
     }
 
     pub async fn completion_meta(&mut self) -> Result<Vec<TableMeta>> {
+        use futures_util::TryStreamExt;
         let rows = self
             .client
-            .query(
+            .query_raw(
                 "select n.nspname, c.relname, c.relkind in ('v', 'm'),
                         a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
                    from pg_catalog.pg_class c
@@ -785,18 +786,15 @@ impl PgConn {
                     and n.nspname not in ('pg_catalog', 'information_schema')
                     and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp%'
                   order by n.nspname, c.relname, a.attnum",
-                &[],
+                std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>(),
             )
             .await?;
-        Ok(super::group_meta(rows.iter().map(|r| {
-            (
-                r.get(0),
-                r.get(1),
-                r.get(2),
-                r.get::<_, Option<String>>(3),
-                r.get::<_, Option<String>>(4),
-            )
-        })))
+        futures_util::pin_mut!(rows);
+        let mut out = super::MetaGrouper::default();
+        while let Some(r) = rows.try_next().await? {
+            out.push(r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+        }
+        Ok(out.tables)
     }
 
     pub async fn primary_key(&mut self, schema: &str, table: &str) -> Result<Vec<String>> {

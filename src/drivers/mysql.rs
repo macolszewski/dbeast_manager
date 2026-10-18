@@ -695,9 +695,9 @@ impl MyConn {
     }
 
     pub async fn completion_meta(&mut self) -> Result<Vec<TableMeta>> {
-        let rows: Vec<MetaRow> = self
+        let mut rows = self
             .conn
-            .query(
+            .query_iter(
                 "select t.table_schema, t.table_name, t.table_type, c.column_name, c.column_type
                    from information_schema.tables t
                    left join information_schema.columns c
@@ -706,9 +706,12 @@ impl MyConn {
                   order by t.table_schema, t.table_name, c.ordinal_position",
             )
             .await?;
-        Ok(super::group_meta(rows.into_iter().map(
-            |(s, t, ty, c, ct)| (s, t, ty.contains("VIEW"), c, ct),
-        )))
+        let mut out = super::MetaGrouper::default();
+        while let Some(row) = rows.next().await? {
+            let (s, t, ty, c, ct): MetaRow = mysql_async::from_row_opt(row)?;
+            out.push(s, t, ty.contains("VIEW"), c, ct);
+        }
+        Ok(out.tables)
     }
 
     pub async fn primary_key(&mut self, schema: Option<&str>, table: &str) -> Result<Vec<String>> {
