@@ -8,6 +8,7 @@ use crate::{model::Value, sqlgen::CellEdit};
 use std::{
     borrow::{Borrow, Cow},
     collections::HashSet,
+    sync::Arc,
     fmt::Write,
     hash::{Hash, Hasher},
 };
@@ -115,7 +116,7 @@ impl<'a> FilterValue<'a> {
         }
     }
 
-    fn as_borrowed(&self) -> FilterValue<'_> {
+    pub fn as_borrowed(&self) -> FilterValue<'_> {
         match self {
             Self::Null => FilterValue::Null,
             Self::Default => FilterValue::Default,
@@ -236,9 +237,28 @@ fn bounded_text(text: &str, quoted: bool) -> String {
 
 /// A set of explicitly selected values. An empty set matches no values; callers
 /// represent an absent column filter separately from an empty selection.
+/// Values are shared, so a filter's value list can show retained values
+/// without copying them again.
 #[derive(Clone, Debug, Default)]
 pub struct SelectedValues {
-    values: HashSet<FilterValue<'static>>,
+    values: HashSet<Shared>,
+}
+
+#[derive(Clone, Debug)]
+struct Shared(Arc<FilterValue<'static>>);
+
+impl PartialEq for Shared {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Shared {}
+
+impl Hash for Shared {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
 }
 
 impl SelectedValues {
@@ -247,12 +267,17 @@ impl SelectedValues {
         if self.contains(&value) {
             return false;
         }
-        self.values.insert(value.into_owned())
+        self.values.insert(Shared(Arc::new(value.into_owned())))
+    }
+
+    /// Adds a value another selection already owns, without copying it.
+    pub fn insert_shared(&mut self, value: Arc<FilterValue<'static>>) -> bool {
+        self.values.insert(Shared(value))
     }
 
     /// Borrowed lookup: no text/binary copying or numeric-to-text conversion.
     pub fn contains(&self, value: &FilterValue<'_>) -> bool {
-        self.values.contains(value)
+        self.values.contains(value as &dyn BorrowedIdentity)
     }
 
     /// Remove by borrowed identity without copying even a large text/binary key.
@@ -273,7 +298,11 @@ impl SelectedValues {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &FilterValue<'static>> {
-        self.values.iter()
+        self.values.iter().map(|value| value.0.as_ref())
+    }
+
+    pub fn iter_shared(&self) -> impl Iterator<Item = &Arc<FilterValue<'static>>> {
+        self.values.iter().map(|value| &value.0)
     }
 }
 
@@ -304,9 +333,9 @@ impl Hash for dyn BorrowedIdentity + '_ {
     }
 }
 
-impl<'a> Borrow<dyn BorrowedIdentity + 'a> for FilterValue<'static> {
+impl<'a> Borrow<dyn BorrowedIdentity + 'a> for Shared {
     fn borrow(&self) -> &(dyn BorrowedIdentity + 'a) {
-        self
+        self.0.as_ref()
     }
 }
 

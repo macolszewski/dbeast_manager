@@ -110,8 +110,12 @@ impl LocalFilterState {
         true
     }
 
+    /// The first change of a column turns "all values" into an explicit set of
+    /// the listed values, so values that appear only on a later page stay
+    /// excluded. Retained values are shared, page values are copied once.
     fn set_choice(
         &mut self,
+        rs: &ResultSet,
         column: usize,
         value: &FilterValue<'_>,
         selected: bool,
@@ -120,7 +124,10 @@ impl LocalFilterState {
         let selection = self.conditions[column].get_or_insert_with(|| {
             let mut selection = SelectedValues::default();
             for choice in choices {
-                selection.insert(choice.value.clone());
+                match &choice.value {
+                    ChoiceValue::Cell(row) => selection.insert(cell_key(rs, *row, column)),
+                    ChoiceValue::Retained(value) => selection.insert_shared(value.clone()),
+                };
             }
             selection
         });
@@ -135,8 +142,15 @@ impl LocalFilterState {
     }
 }
 
+/// Where a listed value is read from: a cell of the page, or a selected value
+/// that is not on this page. Neither copies the value.
+enum ChoiceValue {
+    Cell(GridRow),
+    Retained(std::sync::Arc<FilterValue<'static>>),
+}
+
 struct Choice {
-    value: FilterValue<'static>,
+    value: ChoiceValue,
     label: String,
     count: usize,
     hover: std::cell::OnceCell<String>,
@@ -155,6 +169,15 @@ struct ValuePopup {
     selected_shown: usize,
     selection_dirty: bool,
     focus_search: bool,
+}
+
+impl Choice {
+    fn key<'a>(&'a self, rs: &'a ResultSet, column: usize) -> FilterValue<'a> {
+        match &self.value {
+            ChoiceValue::Cell(row) => cell_key(rs, *row, column),
+            ChoiceValue::Retained(value) => value.as_borrowed(),
+        }
+    }
 }
 
 impl ValuePopup {
@@ -181,30 +204,32 @@ impl ValuePopup {
         if !self.choices_dirty {
             return;
         }
-        let mut counts = HashMap::<FilterValue<'_>, usize>::new();
+        let mut counts = HashMap::<FilterValue<'_>, (usize, GridRow)>::new();
         for row in (0..rs.data.rows.len())
             .map(GridRow::Data)
             .chain((0..rs.edits.inserted.len()).map(GridRow::New))
         {
-            *counts.entry(cell_key(rs, row, self.column)).or_default() += 1;
+            counts.entry(cell_key(rs, row, self.column)).or_insert((0, row)).0 += 1;
         }
+        self.choices.clear();
         if let Some(selected) = selected {
-            for value in selected.iter() {
-                if !counts.contains_key(value) {
-                    counts.insert(value.clone(), 0);
+            for value in selected.iter_shared() {
+                if !counts.contains_key(value.as_ref()) {
+                    self.choices.push(Choice {
+                        label: value.display_label(),
+                        value: ChoiceValue::Retained(value.clone()),
+                        count: 0,
+                        hover: std::cell::OnceCell::new(),
+                    });
                 }
             }
         }
-        self.choices.clear();
         self.choices
-            .extend(counts.into_iter().map(|(value, count)| {
-                let label = value.display_label();
-                Choice {
-                    value: value.into_owned(),
-                    label,
-                    count,
-                    hover: std::cell::OnceCell::new(),
-                }
+            .extend(counts.into_iter().map(|(value, (count, row))| Choice {
+                label: value.display_label(),
+                value: ChoiceValue::Cell(row),
+                count,
+                hover: std::cell::OnceCell::new(),
             }));
         self.choices.sort_by(|a, b| a.label.cmp(&b.label));
         self.choices_dirty = false;
@@ -212,7 +237,7 @@ impl ValuePopup {
         self.selection_dirty = true;
     }
 
-    fn refresh_query(&mut self, selected: Option<&SelectedValues>) {
+    fn refresh_query(&mut self, rs: &ResultSet, selected: Option<&SelectedValues>) {
         if self.pattern_dirty {
             self.pattern = (!self.query.is_empty())
                 .then(|| SearchPattern::new(&self.query, SearchOptions::default()));
@@ -229,7 +254,7 @@ impl ValuePopup {
                             .as_ref()
                             .is_none_or(|pattern| {
                                 pattern.is_match(&choice.label)
-                                    || match &choice.value {
+                                    || match &choice.key(rs, self.column) {
                                         FilterValue::Text(text) | FilterValue::Decimal(text) => {
                                             pattern.is_match(text)
                                         }
@@ -247,7 +272,9 @@ impl ValuePopup {
                 .shown
                 .iter()
                 .filter(|&&index| {
-                    selected.is_none_or(|values| values.contains(&self.choices[index].value))
+                    selected.is_none_or(|values| {
+                        values.contains(&self.choices[index].key(rs, self.column))
+                    })
                 })
                 .count();
             self.selection_dirty = false;
@@ -343,7 +370,7 @@ impl ResultSet {
             .filter(|popup| popup.column < self.data.columns.len())
         {
             popup.refresh_choices(self, state.conditions[popup.column].as_ref());
-            popup.refresh_query(state.conditions[popup.column].as_ref());
+            popup.refresh_query(self, state.conditions[popup.column].as_ref());
             let escaped = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
             let mut open = !escaped;
             let mut filter_action = false;
@@ -384,7 +411,7 @@ impl ResultSet {
                         popup.query_dirty = true;
                         popup.pattern_dirty = true;
                     }
-                    popup.refresh_query(state.conditions[popup.column].as_ref());
+                    popup.refresh_query(self, state.conditions[popup.column].as_ref());
                     ui.horizontal(|ui| {
                         let mut all =
                             !popup.shown.is_empty() && popup.selected_shown == popup.shown.len();
@@ -393,8 +420,9 @@ impl ResultSet {
                         if master.changed() {
                             for &index in &popup.shown {
                                 state.set_choice(
+                                    self,
                                     popup.column,
-                                    &popup.choices[index].value,
+                                    &popup.choices[index].key(self, popup.column),
                                     all,
                                     &popup.choices,
                                 );
@@ -419,7 +447,9 @@ impl ResultSet {
                                     ui.horizontal(|ui| {
                                         let mut selected = state.conditions[popup.column]
                                             .as_ref()
-                                            .is_none_or(|values| values.contains(&choice.value));
+                                            .is_none_or(|values| {
+                                                values.contains(&choice.key(self, popup.column))
+                                            });
                                         let checkbox =
                                             value_checkbox(ui, &mut selected, &choice.label, false);
                                         checkbox.widget_info(|| {
@@ -431,11 +461,14 @@ impl ResultSet {
                                             )
                                         });
                                         let checkbox =
-                                            checkbox.on_hover_ui(|ui| full_value_hover(ui, choice));
+                                            checkbox.on_hover_ui(|ui| {
+                                                full_value_hover(ui, choice, self, popup.column)
+                                            });
                                         if checkbox.changed() {
                                             state.set_choice(
+                                                self,
                                                 popup.column,
-                                                &choice.value,
+                                                &choice.key(self, popup.column),
                                                 selected,
                                                 &popup.choices,
                                             );
@@ -569,9 +602,11 @@ pub(super) fn header_button(ui: &mut Ui, rs: &ResultSet, column: usize) -> Optio
     clicked.then_some(rect)
 }
 
-fn full_value_hover(ui: &mut Ui, choice: &Choice) {
+fn full_value_hover(ui: &mut Ui, choice: &Choice, rs: &ResultSet, column: usize) {
     ui.set_max_width(600.0);
-    let preview = choice.hover.get_or_init(|| hover_preview(&choice.value));
+    let preview = choice
+        .hover
+        .get_or_init(|| hover_preview(&choice.key(rs, column)));
     egui::ScrollArea::vertical()
         .max_height(240.0)
         .show(ui, |ui| {
@@ -715,6 +750,76 @@ mod tests {
         assert_eq!(state.filtered_rows().unwrap(), [GridRow::New(0)]);
     }
 
+    fn big_text_page(prefix: char, rows: usize) -> ResultSet {
+        let mut rs = result();
+        let data = std::sync::Arc::make_mut(&mut rs.data);
+        data.rows = (0..rows)
+            .map(|i| {
+                vec![
+                    Value::Text(format!("{prefix}{i}{}", "x".repeat(1 << 16))),
+                    Value::Text("Active".into()),
+                ]
+            })
+            .collect();
+        rs.order = (0..rows).collect();
+        rs
+    }
+
+    #[test]
+    fn value_list_reads_page_cells_and_shares_retained_values() {
+        let first = big_text_page('a', 50);
+        let mut popup = ValuePopup::new(0, Rect::NOTHING);
+        popup.refresh_choices(&first, None);
+        assert_eq!(popup.choices.len(), 50);
+        assert!(
+            popup
+                .choices
+                .iter()
+                .all(|choice| matches!(choice.value, ChoiceValue::Cell(_))),
+            "the list does not copy page values"
+        );
+        // Unchecking one value selects the other 49 explicitly.
+        let mut state = filter(&first);
+        state.conditions[0] = None;
+        let excluded = popup.choices[0].key(&first, 0).into_owned();
+        state.set_choice(&first, 0, &excluded, false, &popup.choices);
+        state.dirty = true;
+        state.refresh(&first);
+        let selection = state.conditions[0].as_ref().unwrap();
+        assert_eq!(selection.len(), 49);
+        assert!(!selection.contains(&excluded));
+        assert_eq!(state.filtered_rows().unwrap().len(), 49);
+
+        // On another page, values seen only on the first page are listed from
+        // the selection itself, and new values stay excluded.
+        let mut old = first;
+        old.local_filter = state;
+        let mut next = big_text_page('b', 10);
+        next.take_local_filters_from(&mut old);
+        drop(old);
+        next.local_filter.dirty = true;
+        let mut state = std::mem::take(&mut next.local_filter);
+        state.refresh(&next);
+        assert_eq!(state.filtered_rows().unwrap().len(), 0);
+        let mut popup = ValuePopup::new(0, Rect::NOTHING);
+        popup.refresh_choices(&next, state.conditions[0].as_ref());
+        assert_eq!(popup.choices.len(), 59);
+        let retained: Vec<_> = popup
+            .choices
+            .iter()
+            .filter_map(|choice| match &choice.value {
+                ChoiceValue::Retained(value) => Some(std::sync::Arc::downgrade(value)),
+                ChoiceValue::Cell(_) => None,
+            })
+            .collect();
+        assert_eq!(retained.len(), 49);
+        assert!(retained.iter().all(|value| value.strong_count() == 2));
+        // Clearing the filter and the list releases the retained values.
+        state.conditions[0] = None;
+        drop(popup);
+        assert!(retained.iter().all(|value| value.strong_count() == 0));
+    }
+
     #[test]
     fn choices_include_all_page_values_and_retained_zero_counts() {
         let rs = result();
@@ -742,12 +847,12 @@ mod tests {
             0
         );
         popup.query = "łód".into();
-        popup.refresh_query(Some(&values));
+        popup.refresh_query(&rs, Some(&values));
         assert_eq!(popup.shown.len(), 1);
         assert_eq!(popup.selected_shown, 0);
         let choices = popup.choices.as_ptr();
         popup.refresh_choices(&rs, Some(&values));
-        popup.refresh_query(Some(&values));
+        popup.refresh_query(&rs, Some(&values));
         assert_eq!(choices, popup.choices.as_ptr());
     }
 
