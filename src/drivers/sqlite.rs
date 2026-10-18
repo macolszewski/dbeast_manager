@@ -97,27 +97,28 @@ impl LiteConn {
             let mut rows = Vec::new();
             let mut truncated = false;
             let mut seen = 0usize;
+            let mut bytes = 0usize;
             let mut cursor = stmt.query(rusqlite::params_from_iter(&params))?;
             while let Some(row) = cursor.next()? {
                 seen += 1;
                 if seen <= page.skip {
                     continue;
                 }
-                if rows.len() == page.limit {
+                if page.is_full(rows.len(), bytes) {
                     truncated = true;
                     break;
                 }
-                rows.push(
-                    (0..n)
-                        .map(|i| {
-                            let raw = row.get_ref_unwrap(i);
-                            if let ValueRef::Text(bytes) = raw {
-                                exact_columns[i] &= std::str::from_utf8(bytes).is_ok();
-                            }
-                            value(raw)
-                        })
-                        .collect(),
-                );
+                let row: Vec<Value> = (0..n)
+                    .map(|i| {
+                        let raw = row.get_ref_unwrap(i);
+                        if let ValueRef::Text(bytes) = raw {
+                            exact_columns[i] &= std::str::from_utf8(bytes).is_ok();
+                        }
+                        value(raw)
+                    })
+                    .collect();
+                bytes += crate::model::row_bytes(&row);
+                rows.push(row);
             }
             Ok(QueryResult {
                 columns,
@@ -174,19 +175,17 @@ impl LiteConn {
             tx.blocking_send(super::RowBatch::Origins(column_origins(&stmt))).map_err(|_| super::stopped())?;
             tx.blocking_send(super::RowBatch::Columns(columns)).map_err(|_| super::stopped())?;
             let mut cursor = stmt.query(rusqlite::params_from_iter(&params))?;
-            let mut batch = Vec::with_capacity(super::STREAM_BATCH);
+            let mut batcher = super::Batcher::new();
             let mut total = 0u64;
             while let Some(row) = cursor.next()? {
-                batch.push((0..n).map(|i| value(row.get_ref_unwrap(i))).collect());
-                if batch.len() == super::STREAM_BATCH {
-                    total += batch.len() as u64;
-                    let full = std::mem::replace(&mut batch, Vec::with_capacity(super::STREAM_BATCH));
+                if let Some(full) = batcher.push((0..n).map(|i| value(row.get_ref_unwrap(i))).collect()) {
+                    total += full.len() as u64;
                     tx.blocking_send(super::RowBatch::Rows(full)).map_err(|_| super::stopped())?;
                 }
             }
-            total += batch.len() as u64;
-            if !batch.is_empty() {
-                tx.blocking_send(super::RowBatch::Rows(batch)).map_err(|_| super::stopped())?;
+            if let Some(rest) = batcher.rest() {
+                total += rest.len() as u64;
+                tx.blocking_send(super::RowBatch::Rows(rest)).map_err(|_| super::stopped())?;
             }
             Ok(total)
         })

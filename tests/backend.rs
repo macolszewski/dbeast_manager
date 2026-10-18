@@ -2227,3 +2227,52 @@ fn stop_releases_a_submit_on_an_unresponsive_connection() {
     assert_eq!(in_tx, Some(false));
     assert_eq!(stored.rows, data.rows);
 }
+
+/// Six rows of just over 16 MiB: the first page ends on the byte budget after
+/// four rows and reports more, the next page starts after the rows kept, and
+/// every value arrives whole.
+fn exercise_wide_row_pages(ds: DataSource) {
+    const WIDE: usize = (16 << 20) + 1;
+    let backend = Backend::new(egui::Context::default());
+    let sql = match ds.driver {
+        DriverKind::Postgres => format!("select g, repeat('x', {WIDE}) as wide from generate_series(1, 6) g"),
+        DriverKind::MySql => format!(
+            "with recursive s(g) as (select 1 union all select g + 1 from s where g < 6) select g, repeat('x', {WIDE}) as wide from s"
+        ),
+        DriverKind::Sqlite => format!(
+            "with recursive s(g) as (select 1 union all select g + 1 from s where g < 6) select g, printf('%.*c', {WIDE}, 'x') as wide from s"
+        ),
+    };
+    let page = |skip: usize| {
+        let mut request = req(9700, &ds, &[&sql], false);
+        request.page = Page { skip, limit: 500 };
+        let (mut done, _) = run(&backend, request);
+        done.remove(0).1.unwrap()
+    };
+    let check = |data: &QueryResult, ids: &[i64], truncated: bool| {
+        let got: Vec<i64> = data.rows.iter().map(|row| match row[0] { Value::Int(id) => id, ref other => panic!("{other:?}") }).collect();
+        assert_eq!((got.as_slice(), data.truncated), (ids, truncated), "{:?}", ds.driver);
+        assert!(data.rows.iter().all(|row| matches!(&row[1], Value::Text(text) if text.len() == WIDE)), "values are whole");
+    };
+    let first = page(0);
+    check(&first, &[1, 2, 3, 4], true);
+    drop(first);
+    check(&page(4), &[5, 6], false);
+    backend.close_session(&ds.id, 9700);
+}
+
+#[test]
+fn wide_rows_end_a_page_on_its_byte_budget() {
+    let directory = std::env::temp_dir().join(format!("dbeast_wide_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut sqlite = DataSource::new(DriverKind::Sqlite);
+    sqlite.file = directory.join("wide.sqlite").to_string_lossy().into_owned();
+    exercise_wide_row_pages(sqlite);
+    std::fs::remove_dir_all(directory).unwrap();
+    if let Some(ds) = pg() {
+        exercise_wide_row_pages(ds);
+    }
+    if let Some(ds) = mysql() {
+        exercise_wide_row_pages(ds);
+    }
+}

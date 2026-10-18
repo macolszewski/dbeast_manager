@@ -397,11 +397,11 @@ impl PgConn {
             .await?;
         let mut stream = std::pin::pin!(stream);
         let mut exact = vec![true; statement.columns().len()];
-        let mut batch = Vec::with_capacity(super::STREAM_BATCH);
+        let mut batcher = super::Batcher::new();
         let mut total = 0u64;
         while let Some(row) = stream.next().await {
             let mut lossy = None;
-            batch.push(row_values(&row?, &mut exact, &mut lossy));
+            let row = row_values(&row?, &mut exact, &mut lossy);
             // A placeholder in a file would silently replace the stored value.
             if let Some(index) = lossy {
                 let column = &statement.columns()[index];
@@ -411,15 +411,14 @@ impl PgConn {
                     column.type_().name()
                 );
             }
-            if batch.len() == super::STREAM_BATCH {
-                total += batch.len() as u64;
-                let full = std::mem::replace(&mut batch, Vec::with_capacity(super::STREAM_BATCH));
+            if let Some(full) = batcher.push(row) {
+                total += full.len() as u64;
                 tx.send(super::RowBatch::Rows(full)).await.map_err(|_| super::stopped())?;
             }
         }
-        total += batch.len() as u64;
-        if !batch.is_empty() {
-            tx.send(super::RowBatch::Rows(batch)).await.map_err(|_| super::stopped())?;
+        if let Some(rest) = batcher.rest() {
+            total += rest.len() as u64;
+            tx.send(super::RowBatch::Rows(rest)).await.map_err(|_| super::stopped())?;
         }
         Ok(total)
     }
@@ -1220,17 +1219,20 @@ async fn collect_rows(
     let mut stream = std::pin::pin!(stream);
     let mut rows = Vec::new();
     let mut seen = 0usize;
+    let mut bytes = 0usize;
     while let Some(row) = stream.next().await {
         let row = row?;
         seen += 1;
         if seen <= page.skip {
             continue;
         }
-        if rows.len() == page.limit {
+        if page.is_full(rows.len(), bytes) {
             finish_stream(stream, cancel).await?;
             return Ok((rows, true));
         }
-        rows.push(row_values(&row, exact_columns, &mut None));
+        let row = row_values(&row, exact_columns, &mut None);
+        bytes += crate::model::row_bytes(&row);
+        rows.push(row);
     }
     Ok((rows, false))
 }

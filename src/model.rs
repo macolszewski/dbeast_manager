@@ -361,6 +361,21 @@ mod float_text {
     }
 }
 
+/// Decoded size of a row: the values and the text or bytes they own.
+pub fn row_bytes(row: &[Value]) -> usize {
+    row.iter()
+        .map(|value| {
+            std::mem::size_of::<Value>()
+                + match value {
+                    Value::Decimal(text) | Value::Text(text) => text.capacity(),
+                    Value::Bytes(bytes) => bytes.capacity(),
+                    _ => 0,
+                }
+        })
+        .sum::<usize>()
+        + std::mem::size_of::<Vec<Value>>()
+}
+
 impl Value {
     pub fn is_numeric(&self) -> bool {
         matches!(self, Value::Int(_) | Value::Float(_) | Value::Decimal(_))
@@ -609,9 +624,22 @@ pub struct Page {
     pub limit: usize,
 }
 
+/// Decoded bytes a paged read keeps (see [`Page::is_full`]). Each driver
+/// decodes a whole row before it is counted, so one row can exceed it.
+pub const PAGE_BYTES: usize = 64 << 20;
+
 impl Page {
     pub fn first(limit: usize) -> Self {
         Self { skip: 0, limit }
+    }
+
+    /// Whether a page holding `rows` rows of `bytes` (see [`row_bytes`]) takes
+    /// no more rows. Besides the row limit a paged read stops at [`PAGE_BYTES`],
+    /// keeping at least one row; the next row then marks the result truncated
+    /// and the next page starts after the rows kept. [`Page::ALL`] reads,
+    /// which internal callers rely on to be complete, have no byte limit.
+    pub fn is_full(&self, rows: usize, bytes: usize) -> bool {
+        rows >= self.limit || (self.limit != usize::MAX && rows > 0 && bytes >= PAGE_BYTES)
     }
 
     pub const ALL: Page = Page {

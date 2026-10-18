@@ -147,16 +147,19 @@ impl MyConn {
         let mut rows = Vec::new();
         let mut truncated = false;
         let mut seen = 0usize;
+        let mut bytes = 0usize;
         while let Some(row) = result.next().await? {
             seen += 1;
             if seen <= page.skip {
                 continue;
             }
-            if rows.len() == page.limit {
+            if page.is_full(rows.len(), bytes) {
                 truncated = true;
                 break;
             }
-            rows.push(row_values(row, &types));
+            let row = row_values(row, &types);
+            bytes += crate::model::row_bytes(&row);
+            rows.push(row);
         }
         // The text protocol has no partial fetch: the rest must be read off the wire.
         result.drop_result().await?;
@@ -255,13 +258,11 @@ impl MyConn {
             .collect();
         tx.send(super::RowBatch::Origins(column_origins(result.columns_ref()))).await.map_err(|_| super::stopped())?;
         tx.send(super::RowBatch::Columns(columns)).await.map_err(|_| super::stopped())?;
-        let mut batch = Vec::with_capacity(super::STREAM_BATCH);
+        let mut batcher = super::Batcher::new();
         let mut total = 0u64;
         while let Some(row) = result.next().await? {
-            batch.push(row_values(row, &types));
-            if batch.len() == super::STREAM_BATCH {
-                total += batch.len() as u64;
-                let full = std::mem::replace(&mut batch, Vec::with_capacity(super::STREAM_BATCH));
+            if let Some(full) = batcher.push(row_values(row, &types)) {
+                total += full.len() as u64;
                 if tx.send(super::RowBatch::Rows(full)).await.is_err() {
                     // The text protocol has no partial fetch; drain before reporting.
                     result.drop_result().await?;
@@ -269,9 +270,9 @@ impl MyConn {
                 }
             }
         }
-        total += batch.len() as u64;
-        if !batch.is_empty() {
-            tx.send(super::RowBatch::Rows(batch)).await.map_err(|_| super::stopped())?;
+        if let Some(rest) = batcher.rest() {
+            total += rest.len() as u64;
+            tx.send(super::RowBatch::Rows(rest)).await.map_err(|_| super::stopped())?;
         }
         Ok(total)
     }

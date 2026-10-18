@@ -560,8 +560,17 @@ pub fn grid_toolbar(
         let n = rs.data.rows.len();
         let from = rs.page.skip + 1;
         let more = if rs.data.truncated { "+" } else { "" };
+        // A page that stopped on its byte budget holds fewer rows than asked.
+        let size_limited = rs.data.truncated && n < rs.page.limit;
         let range = if n == 0 {
             "0 rows".to_string()
+        } else if size_limited {
+            format!(
+                "{from}-{} of {}{more} ({} MB page limit)",
+                rs.page.skip + n,
+                rs.page.skip + n,
+                crate::model::PAGE_BYTES >> 20
+            )
         } else {
             format!("{from}-{} of {}{more}", rs.page.skip + n, rs.page.skip + n)
         };

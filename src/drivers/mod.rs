@@ -48,6 +48,38 @@ pub enum RowBatch {
 /// small enough to keep memory flat.
 pub const STREAM_BATCH: usize = 1000;
 
+/// Decoded bytes after which a streamed batch is sent even when it has fewer
+/// than [`STREAM_BATCH`] rows, so wide rows do not multiply the memory held
+/// by the batches in flight.
+pub const STREAM_BATCH_BYTES: usize = 8 << 20;
+
+/// Collects streamed rows into batches bounded by rows and decoded bytes.
+pub(crate) struct Batcher {
+    rows: Vec<Vec<crate::model::Value>>,
+    bytes: usize,
+}
+
+impl Batcher {
+    pub(crate) fn new() -> Self {
+        Self { rows: Vec::with_capacity(STREAM_BATCH), bytes: 0 }
+    }
+
+    /// Adds a row and returns the batch when it is full.
+    pub(crate) fn push(&mut self, row: Vec<crate::model::Value>) -> Option<Vec<Vec<crate::model::Value>>> {
+        self.bytes += crate::model::row_bytes(&row);
+        self.rows.push(row);
+        (self.rows.len() == STREAM_BATCH || self.bytes >= STREAM_BATCH_BYTES).then(|| {
+            self.bytes = 0;
+            std::mem::replace(&mut self.rows, Vec::with_capacity(STREAM_BATCH))
+        })
+    }
+
+    /// The rows left after the last full batch, if any.
+    pub(crate) fn rest(self) -> Option<Vec<Vec<crate::model::Value>>> {
+        (!self.rows.is_empty()).then_some(self.rows)
+    }
+}
+
 /// Table and columns that imported rows go into.
 #[derive(Clone, Debug)]
 pub struct InsertTarget {
@@ -966,6 +998,36 @@ mod context_tests {
                 (captured[SAMPLES / 2].as_secs_f64() - plain[SAMPLES / 2].as_secs_f64()) * 1000.0,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod byte_budget_tests {
+    use super::*;
+    use crate::model::{PAGE_BYTES, Value, row_bytes};
+
+    #[test]
+    fn pages_end_on_bytes_but_keep_a_row_and_complete_reads_are_unlimited() {
+        let page = Page::first(500);
+        assert!(!page.is_full(0, usize::MAX), "a page always keeps one row");
+        assert!(!page.is_full(499, PAGE_BYTES - 1));
+        assert!(page.is_full(1, PAGE_BYTES));
+        assert!(page.is_full(500, 0));
+        assert!(!Page::ALL.is_full(10, PAGE_BYTES * 10), "internal complete reads");
+        let wide = vec![Value::Text("x".repeat(1000)), Value::Bytes(vec![0; 500]), Value::Int(1)];
+        assert!(row_bytes(&wide) >= 1500);
+    }
+
+    #[test]
+    fn stream_batches_end_on_rows_or_bytes() {
+        let mut batcher = Batcher::new();
+        let narrow = || vec![Value::Int(1)];
+        let full = (0..STREAM_BATCH).find_map(|_| batcher.push(narrow())).unwrap();
+        assert_eq!(full.len(), STREAM_BATCH);
+        let wide = || vec![Value::Text("x".repeat(STREAM_BATCH_BYTES / 4))];
+        let sizes: Vec<usize> = (0..10).filter_map(|_| batcher.push(wide())).map(|batch| batch.len()).collect();
+        assert_eq!(sizes, [4, 4], "about STREAM_BATCH_BYTES per batch");
+        assert_eq!(batcher.rest().map(|rest| rest.len()), Some(2));
     }
 }
 

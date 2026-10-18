@@ -49,6 +49,10 @@ fn batch_size(driver: DriverKind) -> usize {
     }
 }
 
+/// Text held by one batch after which it is sent with fewer rows than
+/// [`batch_size`], so wide records do not multiply the queued memory.
+const BATCH_BYTES: usize = 16 << 20;
+
 /// Parsed records: the file line each starts on, the mapped values and the
 /// raw fields. Kept as parallel vectors so any range of values goes to the
 /// driver as a slice, without copying.
@@ -126,17 +130,21 @@ impl Backend {
                         }
                     };
                     let mut batch = Rows::with_capacity(size);
+                    let mut batch_bytes = 0usize;
                     loop {
                         match records.next_fields() {
                             Ok(Some(raw)) => {
-                                let values = sources
+                                let values: Vec<Option<String>> = sources
                                     .iter()
                                     .map(|&i| raw.get(i).and_then(|field| csv.value(field)))
                                     .collect();
+                                batch_bytes += raw.iter().map(String::len).sum::<usize>()
+                                    + values.iter().flatten().map(String::len).sum::<usize>();
                                 batch.lines.push(records.line);
                                 batch.values.push(values);
                                 batch.raw.push(raw);
-                                if batch.len() == size {
+                                if batch.len() == size || batch_bytes >= BATCH_BYTES {
+                                    batch_bytes = 0;
                                     read_bytes.store(records.position(), Ordering::Relaxed);
                                     let full = std::mem::replace(&mut batch, Rows::with_capacity(size));
                                     if tx.blocking_send(Batch::Rows(full)).is_err() {
