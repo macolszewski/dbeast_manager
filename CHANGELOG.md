@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-18
+
+### Changed
+
+- Settings are saved in the background about half a second after edits
+  pause, with at most one save in progress, instead of after every keystroke.
+- A restored work session shows its tabs at once; the saved rows of a tab are
+  read when the tab is first shown. Results in memory are kept within 1 GiB:
+  above that, clean results of the tabs unused for longest go back to their
+  session files and are read again when shown.
+- A script returning many large results waits while results it already
+  sent have not been shown yet; Stop ends the wait.
+- MySQL: a plain console SELECT outside a transaction ends on the server
+  after the page, so the first page of a large result no longer waits for the
+  whole result.
+- Completion suggests schemas and tables before the columns of a large
+  catalog have loaded; the catalog is read on a connection of its own.
+- Import and export previews read a bounded sample and say when values are
+  shortened; the import and export themselves keep full values.
+- The Geo Viewer button can appear a moment after a result with large
+  values, which are checked in the background.
+- Depth View reads times of wide pages in the background; the Files panel
+  lists folders in the background and searches after a short pause.
+
+### Fixed
+
+- Stop ends an import whose statement waits for a lock, and batches being
+  split after errors.
+- Stopped MySQL connections are closed instead of reading the rest of their
+  result in the background.
+- Messages longer than 64 KiB in the Output log no longer keep their whole
+  allocation, and the undo history of a console is limited to 16 MiB.
+- Value panel data of a closed result or hidden panel is released.
+- Map and Database Graph no longer rebuild the whole picture when the
+  pointer moves; large map objects are clipped to the view.
+- The primary key ordering table pages is read once per table instead of
+  before every page.
+- Syntax highlighting of large scripts is about twice as fast.
+
 ## [0.3.0] - 2026-10-18
 
 ### Changed
