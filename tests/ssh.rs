@@ -142,6 +142,35 @@ async fn ssh_tunnel_auth_methods_and_host_key() {
         "{err}"
     );
 
+    // An SSH server that accepts TCP but never answers does not hold up
+    // tunnels to other servers, nor reuse of an open tunnel.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_port = silent.local_addr().unwrap().port();
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
+    let mut stuck = tunneled(DriverKind::Postgres);
+    stuck.ssh.port = silent_port;
+    let stuck_open = tokio::spawn(async move { Connection::open(&stuck).await.is_ok() });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let conn = tokio::time::timeout(std::time::Duration::from_secs(10), Connection::open(&pg))
+        .await
+        .expect("an unresponsive SSH server must not block other tunnels")
+        .unwrap();
+    let mut reused =
+        tokio::time::timeout(std::time::Duration::from_secs(10), Connection::open(&pg))
+            .await
+            .expect("reusing an open tunnel must not wait")
+            .unwrap();
+    assert_eq!(scalar(&mut reused, "select 4").await, Value::Int(4));
+    assert!(!stuck_open.is_finished());
+    stuck_open.abort();
+    hold.abort();
+    drop((conn, reused));
+
     // Keys from a running ssh-agent.
     let _agent = start_agent(&dir);
     let mut via_agent = tunneled(DriverKind::Postgres);

@@ -31,23 +31,66 @@ impl Drop for Tunnel {
     }
 }
 
+/// Live shared values keyed by a string. Each key has its own slot lock, so a
+/// slow initializer only delays callers of the same key; the map lock is held
+/// only to find or create the slot, never across an await.
+struct Registry<T> {
+    slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Weak<T>>>>>,
+}
+
+impl<T> Default for Registry<T> {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+        }
+    }
+}
+
+impl<T> Registry<T> {
+    /// Returns the live value for `key`, or runs `init` once for all concurrent
+    /// callers of that key. A failed or cancelled `init` leaves the slot empty,
+    /// so the next waiter tries again instead of hanging.
+    async fn get_or_open<F>(&self, key: String, alive: fn(&T) -> bool, init: F) -> Result<Arc<T>>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let slot = {
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            // Drop slots nobody waits on and whose value is gone.
+            slots.retain(|_, s| {
+                Arc::strong_count(s) > 1 || s.try_lock().map_or(true, |w| w.strong_count() > 0)
+            });
+            slots.entry(key).or_default().clone()
+        };
+        let mut current = slot.lock().await;
+        if let Some(value) = current.upgrade()
+            && alive(&value)
+        {
+            return Ok(value);
+        }
+        let value = Arc::new(init.await?);
+        *current = Arc::downgrade(&value);
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
+}
+
 /// Open tunnels keyed by SSH settings and target, so sessions can share them.
-static TUNNELS: LazyLock<tokio::sync::Mutex<HashMap<String, Weak<Tunnel>>>> =
-    LazyLock::new(Default::default);
+static TUNNELS: LazyLock<Registry<Tunnel>> = LazyLock::new(Default::default);
 
 /// Returns a tunnel to the data source's host and port, reusing an open one.
 pub async fn open(ds: &DataSource) -> Result<Arc<Tunnel>> {
-    let key = tunnel_key(ds)?;
-    let mut tunnels = TUNNELS.lock().await;
-    if let Some(t) = tunnels.get(&key).and_then(Weak::upgrade)
-        && t.is_alive()
-    {
-        return Ok(t);
-    }
-    let tunnel = Arc::new(connect(&ds.ssh, &ds.host, ds.port).await?);
-    tunnels.retain(|_, t| t.strong_count() > 0);
-    tunnels.insert(key, Arc::downgrade(&tunnel));
-    Ok(tunnel)
+    TUNNELS
+        .get_or_open(
+            tunnel_key(ds)?,
+            Tunnel::is_alive,
+            connect(&ds.ssh, &ds.host, ds.port),
+        )
+        .await
 }
 
 async fn connect(ssh: &SshConfig, db_host: &str, db_port: u16) -> Result<Tunnel> {
@@ -246,6 +289,109 @@ fn tunnel_key(ds: &DataSource) -> Result<String> {
         &ds.host,
         ds.port,
     ))?)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Dummy(bool);
+
+    fn alive(d: &Dummy) -> bool {
+        d.0
+    }
+
+    #[tokio::test]
+    async fn slow_key_does_not_block_other_keys() {
+        let registry = Registry::<Dummy>::default();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let slow = registry.get_or_open("a".into(), alive, async {
+            let _ = wait.await;
+            bail!("unreachable")
+        });
+        let fast = async {
+            let b = tokio::time::timeout(
+                Duration::from_secs(1),
+                registry.get_or_open("b".into(), alive, async { Ok(Dummy(true)) }),
+            )
+            .await
+            .expect("B must not wait for A")
+            .unwrap();
+            // The live B is reused without running its initializer again.
+            let again = tokio::time::timeout(
+                Duration::from_secs(1),
+                registry.get_or_open("b".into(), alive, async { bail!("reconnected") }),
+            )
+            .await
+            .expect("reuse must not wait for A")
+            .unwrap();
+            assert!(Arc::ptr_eq(&b, &again));
+            let _ = release.send(());
+        };
+        let (a, ()) = tokio::join!(slow, fast);
+        assert!(a.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_of_one_key_share_a_single_open() {
+        let registry = Registry::<Dummy>::default();
+        let opens = AtomicUsize::new(0);
+        let init = || async {
+            opens.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(Dummy(true))
+        };
+        let (x, y) = tokio::join!(
+            registry.get_or_open("a".into(), alive, init()),
+            registry.get_or_open("a".into(), alive, init()),
+        );
+        assert!(Arc::ptr_eq(&x.unwrap(), &y.unwrap()));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_open_lets_the_next_caller_retry() {
+        let registry = Registry::<Dummy>::default();
+        let failed = registry
+            .get_or_open("a".into(), alive, async { bail!("down") })
+            .await;
+        assert!(failed.is_err());
+        // Cancel an initializer while it holds the slot.
+        let pending = registry.get_or_open("a".into(), alive, std::future::pending());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pending)
+                .await
+                .is_err()
+        );
+        let ok = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.get_or_open("a".into(), alive, async { Ok(Dummy(true)) }),
+        )
+        .await
+        .expect("cancelled open must release the slot");
+        assert!(ok.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dead_values_are_reopened_and_unused_slots_dropped() {
+        let registry = Registry::<Dummy>::default();
+        let dead = registry
+            .get_or_open("a".into(), alive, async { Ok(Dummy(false)) })
+            .await
+            .unwrap();
+        let fresh = registry
+            .get_or_open("a".into(), alive, async { Ok(Dummy(true)) })
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&dead, &fresh));
+        drop((dead, fresh));
+        registry
+            .get_or_open("b".into(), alive, async { Ok(Dummy(true)) })
+            .await
+            .unwrap();
+        assert_eq!(registry.len(), 1, "slot of the dropped tunnel is removed");
+    }
 }
 
 #[cfg(test)]
