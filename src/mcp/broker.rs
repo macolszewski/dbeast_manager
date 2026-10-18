@@ -182,7 +182,10 @@ fn cancel(request: &mut Request, status: &'static str) {
         status
     };
     request.result = None;
-    request.finished = Some(Instant::now());
+    // A running read keeps its own copy of the document until it returns.
+    request.file = None;
+    // Revoking an already finished request must not extend its retention.
+    request.finished.get_or_insert_with(Instant::now);
 }
 impl State {
     /// Whether `request` may still start or release its result. Automatic
@@ -698,7 +701,12 @@ impl McpController {
             .iter()
             .map(|(id, session)| (id.clone(), session.client_id.clone()))
             .collect();
-        for r in s.requests.values_mut() {
+        // Finished requests without a result have nothing left to revoke.
+        for r in s
+            .requests
+            .values_mut()
+            .filter(|r| r.finished.is_none() || r.result.is_some())
+        {
             let valid = match &r.operation {
                 Operation::ReadFile { file_id, .. } => next_files.contains_key(file_id),
                 op => op.source_id().is_some_and(|id| {
@@ -1286,6 +1294,7 @@ impl McpController {
             }
         }
         r.finished = Some(Instant::now());
+        r.file = None;
         let status = r.status;
         if let Some(grant_id) = invalid_grant
             && let Some(session) = s.sessions.get_mut(&sid)
@@ -1682,6 +1691,70 @@ mod tests {
             "resource_unavailable"
         );
         assert!(c.approve(rid, Approval::Once).is_err());
+    }
+    #[tokio::test]
+    async fn finished_document_reads_release_old_snapshots_without_renewing_retention() {
+        let (c, p, token, _) = setup();
+        let share = |version: u64, text: &Arc<str>| {
+            c.update_resources(
+                Vec::new(),
+                vec![SharedFile {
+                    id: "/private/document.sql".into(),
+                    alias: "Open document 1".into(),
+                    version,
+                    text: Arc::clone(text),
+                }],
+            );
+            let file_id = c.inner.lock().unwrap().files.keys().next().unwrap().clone();
+            Operation::ReadFile {
+                file_id,
+                version,
+                start: 0,
+                max_chars: 64,
+            }
+        };
+        let mut old_versions = Vec::new();
+        let mut completed = None;
+        for version in 1..=4u64 {
+            let text: Arc<str> = Arc::from(format!("-- v{version}\n{}", "x".repeat(1 << 20)));
+            old_versions.push(Arc::downgrade(&text));
+            let op = share(version, &text);
+            drop(text);
+            let rid = c.submit(&p, &token, &id(), op).unwrap()["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if version % 2 == 0 {
+                c.cancel_request(&p, &token, &rid).unwrap();
+            } else {
+                c.approve(&rid, Approval::Once).unwrap();
+                for _ in 0..100 {
+                    if c.get_request(&p, &token, &rid).unwrap()["status"] != "running" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(c.get_request(&p, &token, &rid).unwrap()["status"], "completed");
+                completed.get_or_insert(rid);
+            }
+        }
+        // Only the version still shared is alive; finished and cancelled
+        // requests no longer own the documents they read.
+        let latest = c.inner.lock().unwrap().files.values().next().unwrap().text.clone();
+        assert!(old_versions[3].upgrade().is_some_and(|t| Arc::ptr_eq(&t, &latest)));
+        for old in &old_versions[..3] {
+            assert!(old.upgrade().is_none(), "an old document version is retained");
+        }
+        // Later sharing changes revoke the result once and keep its finish time.
+        let rid = completed.unwrap();
+        let first_finish = c.inner.lock().unwrap().requests[&rid].finished;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        share(5, &Arc::from("v5"));
+        share(6, &Arc::from("v6"));
+        let state = c.inner.lock().unwrap();
+        let request = &state.requests[&rid];
+        assert_eq!(request.finished, first_finish);
+        assert!(request.result.is_none());
     }
     #[tokio::test]
     async fn readonly_source_cannot_request_full_sql() {
