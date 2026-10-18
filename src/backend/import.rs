@@ -12,7 +12,8 @@ use crate::import::{CsvOptions, Records};
 use crate::model::{BoundQuery, DataSource, DriverKind, Page, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnError {
@@ -83,9 +84,15 @@ impl Backend {
             let started = std::time::Instant::now();
             let driver = job.ds.driver;
             let file_size = std::fs::metadata(&job.path)?.len();
-            let mut conn = Connection::open(&job.ds).await?;
+            let mut conn = tokio::select! {
+                biased;
+                () = token.cancelled() => return Err(crate::drivers::stopped()),
+                conn = Connection::open(&job.ds) => conn?,
+            };
             if let Some(ddl) = &job.create {
                 sender.log(format!("{ddl};"));
+                // Not interrupted: a cancelled CREATE could not be told apart
+                // from a table that already existed, which must not be dropped.
                 conn.execute(ddl, Page::first(0)).await?;
             }
             let target = InsertTarget {
@@ -117,9 +124,11 @@ impl Backend {
             };
             let transactional = engine.is_none();
             let read_bytes = Arc::new(AtomicU64::new(0));
+            // Ends the reader between records once the writer no longer needs them.
+            let reader_stop = Arc::new(AtomicBool::new(false));
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Batch>(4);
             let reader = {
-                let (path, csv, sources, read_bytes) = (job.path.clone(), job.csv.clone(), job.sources.clone(), read_bytes.clone());
+                let (path, csv, sources, read_bytes, reader_stop) = (job.path.clone(), job.csv.clone(), job.sources.clone(), read_bytes.clone(), reader_stop.clone());
                 let size = batch_size(driver);
                 tokio::task::spawn_blocking(move || {
                     let mut records = match Records::open(&path, &csv) {
@@ -132,6 +141,9 @@ impl Backend {
                     let mut batch = Rows::with_capacity(size);
                     let mut batch_bytes = 0usize;
                     loop {
+                        if reader_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
                         match records.next_fields() {
                             Ok(Some(raw)) => {
                                 let values: Vec<Option<String>> = sources
@@ -169,11 +181,13 @@ impl Backend {
                 Some(path) => Some(csv::WriterBuilder::new().delimiter(job.csv.delimiter).from_path(path)?),
                 None => None,
             };
-            conn.execute(crate::drivers::begin_statement(driver), Page::first(0)).await?;
             let work = async {
+                let cancel = conn.cancel_handle();
+                stoppable(&token, cancel, conn.execute(crate::drivers::begin_statement(driver), Page::first(0))).await?;
                 if job.clear {
                     sender.log(format!("DELETE FROM {qualified};"));
-                    conn.execute(&format!("DELETE FROM {qualified}"), Page::first(0)).await?;
+                    let cancel = conn.cancel_handle();
+                    stoppable(&token, cancel, conn.execute(&format!("DELETE FROM {qualified}"), Page::first(0))).await?;
                 }
                 let mut imported = 0u64;
                 let mut failed = 0u64;
@@ -203,10 +217,19 @@ impl Backend {
                         ranges.extend((0..rows.len()).rev().map(|row| row..row + 1));
                     }
                     while let Some(range) = ranges.pop() {
+                        // Halving a batch with many bad rows can take thousands of tries.
+                        if token.is_cancelled() {
+                            return Err(crate::drivers::stopped());
+                        }
+                        let cancel = conn.cancel_handle();
                         let inserted = if transactional {
-                            insert_batch(&mut conn, &target, &rows.values[range.clone()]).await
+                            stoppable(&token, cancel, insert_batch(&mut conn, &target, &rows.values[range.clone()])).await
                         } else {
-                            conn.insert_text_rows(&target, &rows.values[range.clone()]).await
+                            stoppable(&token, cancel, conn.insert_text_rows(&target, &rows.values[range.clone()])).await
+                        };
+                        let inserted = match inserted {
+                            Err(error) if token.is_cancelled() => return Err(error),
+                            other => other,
                         };
                         match inserted {
                             Ok(()) => imported += range.len() as u64,
@@ -232,9 +255,15 @@ impl Backend {
                         }
                     }
                 }
+                // The last point where Stop rolls back. COMMIT itself is not
+                // interrupted: its outcome would be unknown.
+                if token.is_cancelled() {
+                    return Err(crate::drivers::stopped());
+                }
                 anyhow::Ok((imported, failed))
             };
             let outcome = work.await;
+            reader_stop.store(true, Ordering::Relaxed);
             drop(rx);
             let _ = reader.await;
             if let Some(mut out) = errors_out {
@@ -253,12 +282,33 @@ impl Backend {
                     }
                     Ok(summary)
                 }
+                Err(error) if error.is::<Abandoned>() => {
+                    // The statement did not end after a cancel request, so the
+                    // connection is closed; the server then rolls back.
+                    drop(conn);
+                    if job.create.is_some() {
+                        let dropped = tokio::time::timeout(CLEANUP_LIMIT, async {
+                            let mut conn = Connection::open(&job.ds).await?;
+                            conn.execute(&format!("DROP TABLE {qualified}"), Page::first(0)).await
+                        })
+                        .await;
+                        if !matches!(dropped, Ok(Ok(_))) {
+                            return Err(error.context(format!("The new table {} could not be removed; drop it when the server has ended the stopped session", job.table)));
+                        }
+                    } else if let Some(engine) = &engine {
+                        return Err(error.context(format!(
+                            "Rows imported before this point stay in {}: the {engine} engine cannot roll them back",
+                            job.table
+                        )));
+                    }
+                    Err(error)
+                }
                 Err(error) => {
                     // Nothing of a failed or stopped import stays in the table.
-                    let _ = conn.execute("ROLLBACK", Page::first(0)).await;
+                    let _ = tokio::time::timeout(CLEANUP_LIMIT, conn.execute("ROLLBACK", Page::first(0))).await;
                     if job.create.is_some() {
                         // The new table was created before the transaction began.
-                        let _ = conn.execute(&format!("DROP TABLE {qualified}"), Page::first(0)).await;
+                        let _ = tokio::time::timeout(CLEANUP_LIMIT, conn.execute(&format!("DROP TABLE {qualified}"), Page::first(0))).await;
                     } else if let Some(engine) = &engine {
                         return Err(error.context(format!(
                             "Rows imported before this point stay in {}: the {engine} engine cannot roll them back",
@@ -325,6 +375,49 @@ fn refusal(job: &ImportJob, engine: &str) -> String {
     format!(
         "{subject}, which cannot roll back changes, so \"{option}\" could leave the table partly changed. Nothing was changed. To import, {fix}, or choose \"Skip row\" without deleting existing rows."
     )
+}
+
+/// How long Stop waits for a cancelled statement to end, and for the cancel
+/// request itself, before the connection is given up.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound for ROLLBACK and removing a new table after a failure or Stop.
+const CLEANUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A statement that did not end after Stop sent a cancel request; its
+/// connection is in an unknown state and must be closed, not reused.
+#[derive(Debug)]
+struct Abandoned;
+
+impl std::fmt::Display for Abandoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Stopped; the database did not end the running statement, so its connection was closed")
+    }
+}
+
+impl std::error::Error for Abandoned {}
+
+/// Runs one database operation of an import so Stop ends it even while it
+/// waits for a lock: the server is asked to cancel the statement, which then
+/// fails, and the import rolls back. A statement still running after
+/// [`STOP_GRACE`] gives [`Abandoned`].
+async fn stoppable<T>(
+    token: &CancellationToken,
+    cancel: Option<crate::drivers::CancelHandle>,
+    operation: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => return result,
+        () = token.cancelled() => {}
+    }
+    if let Some(cancel) = cancel {
+        let _ = tokio::time::timeout(STOP_GRACE, cancel.cancel()).await;
+    }
+    match tokio::time::timeout(STOP_GRACE, &mut operation).await {
+        Ok(_) => Err(crate::drivers::stopped()),
+        Err(_) => Err(anyhow::Error::new(Abandoned)),
+    }
 }
 
 /// One batch under a savepoint, so a failure leaves earlier batches in place.

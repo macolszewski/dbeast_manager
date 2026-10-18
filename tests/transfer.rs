@@ -717,3 +717,145 @@ fn postgres_export_stops_at_a_value_it_cannot_read_exactly() {
     assert!(!target.exists());
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// Runs `statements` on a connection of its own and keeps it, with its locks,
+/// until the returned sender is dropped; then runs `release`.
+fn hold(ds: &DataSource, statements: Vec<String>, release: &'static str) -> std::sync::mpsc::Sender<()> {
+    let (ready_tx, ready) = std::sync::mpsc::channel();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let ds = ds.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut conn = dbeast::drivers::Connection::open(&ds).await.unwrap();
+            for statement in &statements {
+                conn.execute(statement, dbeast::model::Page::ALL).await.unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            let _ = tokio::task::spawn_blocking(move || finished.recv()).await;
+            conn.execute(release, dbeast::model::Page::ALL).await.unwrap();
+        });
+    });
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    done
+}
+
+fn numbers_csv(dir: &Path, rows: usize, value: impl Fn(usize) -> String) -> PathBuf {
+    let mut csv = String::from("id,n\n");
+    for id in 1..=rows {
+        csv.push_str(&format!("{id},{}\n", value(id)));
+    }
+    let file = dir.join("numbers.csv");
+    std::fs::write(&file, csv).unwrap();
+    file
+}
+
+/// Stop while the import waits for a table lock held by another session:
+/// the statement is cancelled on the server, the import rolls back and
+/// ends at once, and nothing stays in the table.
+#[test]
+fn import_stops_while_waiting_for_a_lock() {
+    let sources: Vec<(DataSource, Vec<String>, &str)> = [
+        pg().map(|ds| (ds, "begin; lock table {t} in access exclusive mode", "rollback")),
+        mysql().map(|ds| (ds, "lock tables {t} write", "unlock tables")),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(ds, lock, release)| {
+        let statements = lock.split("; ").map(String::from).collect();
+        (ds, statements, release)
+    })
+    .collect();
+    for (ds, lock, release) in sources {
+        let dir = temp_dir("import_lock");
+        let table = format!("dbeast_import_lock_{}", uuid::Uuid::new_v4().simple());
+        sql(&ds, &[&format!("create table {table} (id int primary key, n int)")]);
+        let file = numbers_csv(&dir, 100, |id| id.to_string());
+        let lock: Vec<String> = lock.iter().map(|s| s.replace("{t}", &table)).collect();
+        let holder = hold(&ds, lock, release);
+        let mut job = import_job(&ds, &file, &table);
+        job.columns = vec!["id".into(), "n".into()];
+        job.sources = vec![0, 1];
+        let backend = Backend::new(egui::Context::default());
+        backend.import_data(40, job);
+        std::thread::sleep(Duration::from_millis(1500));
+        let stopped = Instant::now();
+        backend.stop_task(40);
+        let (result, _) = outcome(&backend, 40, Duration::from_secs(10));
+        let latency = stopped.elapsed();
+        eprintln!("{:?}: import ended {:.0} ms after Stop: {result:?}", ds.driver, latency.as_secs_f64() * 1000.0);
+        assert!(result.unwrap_err().contains("Stopped"), "{:?}", ds.driver);
+        assert!(latency < Duration::from_secs(5), "{:?}: {latency:?}", ds.driver);
+        drop(holder);
+        std::thread::sleep(Duration::from_millis(300));
+        let count = sql(&ds, &[&format!("select count(*) from {table}")]);
+        assert_eq!(count[0][0], dbeast::model::Value::Int(0), "{:?}: nothing imported", ds.driver);
+        sql(&ds, &[&format!("drop table {table}")]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// Forwards to the test PostgreSQL, delaying every chunk in both directions.
+fn delaying_pg_proxy(delay: Duration) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { return };
+            let Ok(server) = std::net::TcpStream::connect("127.0.0.1:55432") else { continue };
+            for (mut from, mut to) in [
+                (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                (server, client),
+            ] {
+                std::thread::spawn(move || {
+                    let mut buffer = vec![0u8; 64 * 1024];
+                    while let Ok(n) = from.read(&mut buffer) {
+                        if n == 0 {
+                            break;
+                        }
+                        std::thread::sleep(delay);
+                        if to.write_all(&buffer[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        }
+    });
+    port
+}
+
+/// A batch where every record fails is split down to single rows, thousands
+/// of round trips over a slow link; Stop ends it between tries.
+#[test]
+fn import_stops_while_splitting_a_failed_batch() {
+    let Some(mut ds) = pg() else { return };
+    let dir = temp_dir("import_split");
+    let table = format!("dbeast_import_split_{}", uuid::Uuid::new_v4().simple());
+    sql(&ds, &[&format!("create table {table} (id int primary key, n int)")]);
+    let file = numbers_csv(&dir, 2000, |_| "not a number".into());
+    ds.host = "127.0.0.1".into();
+    ds.port = delaying_pg_proxy(Duration::from_millis(3));
+    let mut job = import_job(&ds, &file, &table);
+    job.columns = vec!["id".into(), "n".into()];
+    job.sources = vec![0, 1];
+    job.on_error = dbeast::backend::OnError::Skip { max: 1_000_000 };
+    let backend = Backend::new(egui::Context::default());
+    backend.import_data(41, job);
+    std::thread::sleep(Duration::from_millis(1500));
+    let stopped = Instant::now();
+    backend.stop_task(41);
+    let (result, log) = outcome(&backend, 41, Duration::from_secs(30));
+    let latency = stopped.elapsed();
+    let skipped = log.iter().filter(|line| line.starts_with("line ")).count();
+    eprintln!("split batch: ended {:.0} ms after Stop, {skipped} rows tried alone: {result:?}", latency.as_secs_f64() * 1000.0);
+    assert!(result.unwrap_err().contains("Stopped"));
+    assert!(latency < Duration::from_secs(3), "{latency:?}");
+    assert!(skipped < 2000, "stopped before trying every row");
+    ds.port = 55432;
+    ds.host = "localhost".into();
+    sql(&ds, &[&format!("drop table {table}")]);
+    std::fs::remove_dir_all(dir).ok();
+}

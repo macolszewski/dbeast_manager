@@ -94,7 +94,7 @@ The file is read as a stream in a separate thread, and rows are sent to the data
 
 Every batch has a savepoint; only a batch that fails is retried row by row. Progress in the Run window counts the bytes read against the file size.
 
-A failed or stopped import leaves nothing in the table, and a newly created table is dropped.
+A failed or stopped import leaves nothing in the table, and a newly created table is dropped. **Stop** takes effect at once, also while a write waits for a lock held by another session or while a batch with bad rows is being retried: the running statement is cancelled on the server and the import rolls back. If the server does not end the statement within two seconds, DBeast closes the connection and the server rolls the transaction back. A `COMMIT` that has already started is not interrupted.
 
 ### Non-transactional MySQL tables
 
