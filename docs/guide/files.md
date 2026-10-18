@@ -33,11 +33,11 @@ Press `⌘2`, or click the folder icon on the tool window bar, to show the Files
 - The header buttons are **Open File…**, **Open Folder…** (choose the folder to browse), **Refresh** and **−** (Hide).
 - The ↑ button goes to the parent folder; the current folder name is shown next to it.
 - The **Opened** section lists files that are currently open as data sources. Click one to switch to it.
-- The tree below shows the current folder and lists only supported files.
+- The tree below shows the current folder and lists only supported files. Folders and file sizes are read in the background, so a large or slow folder shows a spinner instead of stopping the window; **Refresh** reads them again.
 
 ![Files tool window searching subfolders for "reg" and showing regions.tsv in the archive folder](../images/16-files-search.png)
 
-Type in the search field (**Search CSV, TSV, Data Package, SQLite**) to find files by name in the folder and its subfolders. The search runs in the background and skips hidden folders, `node_modules` and `target`.
+Type in the search field (**Search CSV, TSV, Data Package, SQLite**) to find files by name in the folder and its subfolders. The search starts when you pause typing, runs in the background and skips hidden folders, `node_modules` and `target`. Typing further stops the previous search.
 
 ## Working with CSV and TSV files
 

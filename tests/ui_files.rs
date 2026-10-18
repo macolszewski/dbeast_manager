@@ -79,8 +79,8 @@ fn browse_search_open_and_edit_csv() {
 
     // The Files tool window lists only supported files.
     h.get_all_by_label("🗀").next().unwrap().click();
-    h.run_steps(3);
-    assert!(h.query_by_label("sales.csv").is_some());
+    // Folders are listed in the background.
+    wait_until(&mut h, "folder listing", |h| h.query_by_label("sales.csv").is_some());
     assert!(h.query_by_label("archive").is_some());
     assert!(
         h.query_by_label("notes.md").is_none(),

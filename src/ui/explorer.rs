@@ -16,7 +16,7 @@ use navigation::{
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-const ROW_HEIGHT: f32 = 22.0;
+pub(super) const ROW_HEIGHT: f32 = 22.0;
 
 pub(super) fn tree_focus_id() -> Id {
     Id::new("database_explorer_tree")

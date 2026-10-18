@@ -432,14 +432,23 @@ pub fn list_dir(dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
 }
 
 /// Supported files under `root` whose name contains `query` (case-insensitive),
-/// breadth-first so shallow matches come first. Stops after `limit` results or
-/// a bounded number of visited entries.
-pub fn search(root: &Path, query: &str, limit: usize) -> Vec<PathBuf> {
+/// breadth-first so shallow matches come first. Stops after `limit` results, a
+/// bounded number of visited entries, or as soon as `cancel` is set, checked
+/// before each directory.
+pub fn search(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<PathBuf> {
     let query = query.to_lowercase();
     let mut found = Vec::new();
     let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
     let mut visited = 0usize;
     while let Some(dir) = queue.pop_front() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let Ok((dirs, files)) = list_dir(&dir) else {
             continue;
         };
@@ -653,10 +662,12 @@ mod tests {
         assert_eq!(dirs, [dir.join("sub")]);
         assert_eq!(files, [dir.join("a.csv")]);
         assert_eq!(
-            search(&dir, "SALES", 10),
+            search(&dir, "SALES", 10, &Default::default()),
             [dir.join("sub/sales.csv"), dir.join("sub/deeper/sales.db")]
         );
-        assert_eq!(search(&dir, "", 2).len(), 2);
+        assert_eq!(search(&dir, "", 2, &Default::default()).len(), 2);
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(search(&dir, "", 10, &cancelled).is_empty(), "a cancelled scan stops at once");
         std::fs::remove_dir_all(dir).ok();
     }
 }
