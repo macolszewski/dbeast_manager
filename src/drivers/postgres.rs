@@ -771,23 +771,32 @@ impl PgConn {
         }
     }
 
-    pub async fn completion_meta(&mut self) -> Result<Vec<TableMeta>> {
+    /// User tables and views, with their columns when `columns` is set.
+    pub async fn completion_meta(&mut self, columns: bool) -> Result<Vec<TableMeta>> {
         use futures_util::TryStreamExt;
+        let sql = if columns {
+            "select n.nspname, c.relname, c.relkind in ('v', 'm'),
+                    a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
+               from pg_catalog.pg_class c
+               join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+               left join pg_catalog.pg_attribute a
+                      on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+              where c.relkind in ('r', 'p', 'f', 'v', 'm')
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp%'
+              order by n.nspname, c.relname, a.attnum"
+        } else {
+            "select n.nspname, c.relname, c.relkind in ('v', 'm'), null::name, null::text
+               from pg_catalog.pg_class c
+               join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+              where c.relkind in ('r', 'p', 'f', 'v', 'm')
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp%'
+              order by n.nspname, c.relname"
+        };
         let rows = self
             .client
-            .query_raw(
-                "select n.nspname, c.relname, c.relkind in ('v', 'm'),
-                        a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
-                   from pg_catalog.pg_class c
-                   join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-                   left join pg_catalog.pg_attribute a
-                          on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-                  where c.relkind in ('r', 'p', 'f', 'v', 'm')
-                    and n.nspname not in ('pg_catalog', 'information_schema')
-                    and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp%'
-                  order by n.nspname, c.relname, a.attnum",
-                std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>(),
-            )
+            .query_raw(sql, std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>())
             .await?;
         futures_util::pin_mut!(rows);
         let mut out = super::MetaGrouper::default();

@@ -651,7 +651,7 @@ async fn postgres_paging_keys_meta_and_ddl() {
             .is_empty()
     );
 
-    let meta = conn.completion_meta().await.unwrap();
+    let meta = conn.completion_meta(true).await.unwrap();
     let orders = meta
         .iter()
         .find(|t| t.schema == "shop" && t.name == "orders")
@@ -728,7 +728,7 @@ async fn mysql_paging_keys_meta_and_ddl() {
     assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
     assert!(r.truncated);
     assert_eq!(conn.primary_key(None, "orders").await.unwrap(), ["id"]);
-    let meta = conn.completion_meta().await.unwrap();
+    let meta = conn.completion_meta(true).await.unwrap();
     assert!(meta.iter().any(|t| t.schema == "shop"
         && t.name == "customers"
         && t.columns.iter().any(|(c, _)| c == "email")));
@@ -765,7 +765,7 @@ async fn sqlite_paging_keys_meta_and_ddl() {
     assert_eq!(r.rows, vec![vec![Value::Int(3)]]);
     assert!(!r.truncated);
     assert_eq!(conn.primary_key(None, "k").await.unwrap(), ["b", "a"]);
-    let meta = conn.completion_meta().await.unwrap();
+    let meta = conn.completion_meta(true).await.unwrap();
     assert_eq!(meta[0].columns.len(), 3);
     assert_eq!(meta[0].columns[1], ("b".to_string(), "text".to_string()));
     let roots = conn.children(None).await.unwrap();

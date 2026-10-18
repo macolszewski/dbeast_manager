@@ -907,7 +907,8 @@ impl App {
                     key,
                     request_id,
                     result,
-                } => self.completion_loaded(key, request_id, result),
+                    complete,
+                } => self.completion_loaded(key, request_id, result, complete),
                 Event::SchemaChanged {
                     console_id,
                     ds_id,

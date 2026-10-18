@@ -694,18 +694,22 @@ impl MyConn {
         }
     }
 
-    pub async fn completion_meta(&mut self) -> Result<Vec<TableMeta>> {
-        let mut rows = self
-            .conn
-            .query_iter(
-                "select t.table_schema, t.table_name, t.table_type, c.column_name, c.column_type
-                   from information_schema.tables t
-                   left join information_schema.columns c
-                          on c.table_schema = t.table_schema and c.table_name = t.table_name
-                  where t.table_schema not in ('mysql', 'information_schema', 'performance_schema', 'sys')
-                  order by t.table_schema, t.table_name, c.ordinal_position",
-            )
-            .await?;
+    /// User tables and views, with their columns when `columns` is set.
+    pub async fn completion_meta(&mut self, columns: bool) -> Result<Vec<TableMeta>> {
+        let sql = if columns {
+            "select t.table_schema, t.table_name, t.table_type, c.column_name, c.column_type
+               from information_schema.tables t
+               left join information_schema.columns c
+                      on c.table_schema = t.table_schema and c.table_name = t.table_name
+              where t.table_schema not in ('mysql', 'information_schema', 'performance_schema', 'sys')
+              order by t.table_schema, t.table_name, c.ordinal_position"
+        } else {
+            "select t.table_schema, t.table_name, t.table_type, null, null
+               from information_schema.tables t
+              where t.table_schema not in ('mysql', 'information_schema', 'performance_schema', 'sys')
+              order by t.table_schema, t.table_name"
+        };
+        let mut rows = self.conn.query_iter(sql).await?;
         let mut out = super::MetaGrouper::default();
         while let Some(row) = rows.next().await? {
             let (s, t, ty, c, ct): MetaRow = mysql_async::from_row_opt(row)?;

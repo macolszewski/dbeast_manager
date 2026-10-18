@@ -2468,6 +2468,7 @@ fn explorer_expands_while_the_completion_catalog_loads() {
                 assert!(result.is_ok());
                 order.push("children");
             }
+            Event::Completion { complete: false, .. } => {}
             Event::Completion { result, .. } => {
                 let tables = result.unwrap().tables;
                 assert!(tables.iter().filter(|table| table.name.starts_with(&prefix)).all(|table| table.columns.len() == 31));
@@ -2593,4 +2594,46 @@ fn a_script_waits_while_the_ui_has_not_taken_its_results() {
     assert!(matches!(next(), Event::RunFinished { .. }));
     assert_eq!(backend.pending_results.pending(), 0);
     std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn completion_sends_names_before_columns() {
+    let Some(ds) = pg() else { return };
+    let backend = Backend::new(egui::Context::default());
+    let schema = format!("completion_{}", std::process::id());
+    let tables: usize = std::env::var("DBEAST_COMPLETION_TABLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40);
+    let mut ddl = vec![format!("create schema {schema}")];
+    for t in 0..tables {
+        let columns: Vec<String> = (0..40).map(|c| format!("c{c} text")).collect();
+        ddl.push(format!("create table {schema}.t{t} ({})", columns.join(", ")));
+    }
+    let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+    let (done, _) = run(&backend, req(31, &ds, &ddl, false));
+    assert!(done.iter().all(|(_, result)| result.is_ok()));
+    let start = Instant::now();
+    backend.load_completion(ds.clone(), 7);
+    let mut names_after = None;
+    let full = loop {
+        match backend.rx.recv_timeout(Duration::from_secs(60)).expect("completion") {
+            Event::Completion { request_id: 7, complete: false, result, .. } => {
+                let tables = result.unwrap().tables;
+                let ours: Vec<_> = tables.iter().filter(|t| t.schema == schema).collect();
+                assert!(!ours.is_empty());
+                assert!(ours.iter().all(|t| t.columns.is_empty()), "names only");
+                names_after = Some(start.elapsed());
+            }
+            Event::Completion { request_id: 7, complete: true, result, .. } => break result.unwrap(),
+            _ => {}
+        }
+    };
+    let full_after = start.elapsed();
+    let names_after = names_after.expect("names before columns");
+    let ours: Vec<_> = full.tables.iter().filter(|t| t.schema == schema).collect();
+    assert_eq!(ours.len(), tables);
+    assert!(ours.iter().all(|t| t.columns.len() == 40));
+    eprintln!("completion of {tables} tables x 40 columns: names after {names_after:?}, columns after {full_after:?}");
+    run(&backend, req(31, &ds, &[&format!("drop schema {schema} cascade")], false));
 }

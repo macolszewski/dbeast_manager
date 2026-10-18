@@ -331,22 +331,34 @@ impl LiteConn {
         Ok(self.resolved_context())
     }
 
-    pub async fn completion_meta(&mut self) -> Result<Vec<TableMeta>> {
-        self.with(|conn| {
+    /// User tables and views, with their columns when `columns` is set.
+    pub async fn completion_meta(&mut self, columns: bool) -> Result<Vec<TableMeta>> {
+        self.with(move |conn| {
             let mut out = super::MetaGrouper::default();
             let schemas: Vec<String> = conn
                 .prepare("select name from pragma_database_list order by seq")?
                 .query_map([], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             for schema in schemas {
-                let sql = format!(
-                    "select m.name, m.type = 'view', p.name, p.type
-                       from {}.sqlite_master m
-                       left join pragma_table_info(m.name, ?1) p
-                      where m.type in ('table', 'view') and m.name not like 'sqlite\\_%' escape '\\'
-                      order by m.name, p.cid",
-                    quote_ident(&schema, '"')
-                );
+                let sql = if columns {
+                    format!(
+                        "select m.name, m.type = 'view', p.name, p.type
+                           from {}.sqlite_master m
+                           left join pragma_table_info(m.name, ?1) p
+                          where m.type in ('table', 'view') and m.name not like 'sqlite\\_%' escape '\\'
+                          order by m.name, p.cid",
+                        quote_ident(&schema, '"')
+                    )
+                } else {
+                    format!(
+                        "select m.name, m.type = 'view', null, null
+                           from {}.sqlite_master m
+                          where m.type in ('table', 'view') and m.name not like 'sqlite\\_%' escape '\\'
+                            and ?1 is not null
+                          order by m.name",
+                        quote_ident(&schema, '"')
+                    )
+                };
                 let mut stmt = conn.prepare(&sql)?;
                 let found = stmt.query_map([&schema], |r| {
                     Ok((

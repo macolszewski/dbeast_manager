@@ -69,7 +69,7 @@ Completion suggests names based on where the caret is in the statement.
 
 Press `Ctrl+Space` to open the list (Ctrl on every system). Use the arrow keys to choose, Enter or Tab to insert, Escape to close.
 
-Completion also works in the **WHERE** and **ORDER BY** fields of the table editor. Metadata is loaded in the background, once per data source (and per PostgreSQL database), on a short-lived connection of its own, so the Database Explorer can be expanded while it loads, and cached. Unqualified names are resolved according to the schema search order confirmed for the console; tables outside that order, or hidden by a table of the same name earlier in the order, are inserted with a qualified name. Quoted identifiers and aliases keep their case. Refreshing the data source reloads the metadata.
+Completion also works in the **WHERE** and **ORDER BY** fields of the table editor. Metadata is loaded in the background, once per data source (and per PostgreSQL database), on a short-lived connection of its own, so the Database Explorer can be expanded while it loads, and cached. Names of schemas and tables arrive first; columns follow, so on a large catalog table completion works before column completion. Unqualified names are resolved according to the schema search order confirmed for the console; tables outside that order, or hidden by a table of the same name earlier in the order, are inserted with a qualified name. Quoted identifiers and aliases keep their case. Refreshing the data source reloads the metadata.
 
 ## Code folding
 

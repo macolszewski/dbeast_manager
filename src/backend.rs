@@ -69,10 +69,13 @@ pub enum Event {
         /// Whether the console session is inside an open transaction afterwards.
         in_tx: bool,
     },
+    /// Sent twice per request: first with only the names of schemas and
+    /// tables (`complete: false`), then with columns.
     Completion {
         key: MetadataKey,
         request_id: u64,
         result: Result<CompletionMetadata, String>,
+        complete: bool,
     },
     SchemaChanged {
         console_id: u64,
@@ -849,12 +852,7 @@ impl Backend {
                     });
                     // Expanding the tree must not wait for the whole catalog.
                     drop(guard);
-                    let meta = completion_metadata(&ds).await;
-                    send(Event::Completion {
-                        key: MetadataKey::for_source(&ds),
-                        request_id,
-                        result: meta.map_err(fmt_err),
-                    });
+                    load_completion_catalog(&ds, request_id, &send).await;
                 }
                 Err(e) => {
                     let error = fmt_err(e);
@@ -866,6 +864,7 @@ impl Backend {
                         key: MetadataKey::for_source(&ds),
                         request_id,
                         result: Err(error),
+                        complete: true,
                     });
                 }
             }
@@ -877,12 +876,7 @@ impl Backend {
     pub fn load_completion(&self, ds: DataSource, request_id: u64) {
         let send = self.send();
         self.spawn_metadata(ds.id.clone(), async move {
-            let result = completion_metadata(&ds).await;
-            send(Event::Completion {
-                key: MetadataKey::for_source(&ds),
-                request_id,
-                result: result.map_err(fmt_err),
-            });
+            load_completion_catalog(&ds, request_id, &send).await;
         });
     }
 
@@ -1646,9 +1640,29 @@ fn validate_edit_metadata(
 /// Completion reads whole catalogs, which takes long on large servers. It
 /// runs on a connection of its own, closed afterwards, so explorer requests
 /// on the metadata session never queue behind it.
-async fn completion_metadata(ds: &DataSource) -> anyhow::Result<crate::model::CompletionMetadata> {
+/// The names of schemas and tables come first, so completion of objects is
+/// ready long before the columns of a large catalog are.
+async fn load_completion_catalog(ds: &DataSource, request_id: u64, send: &impl Fn(Event)) {
+    let key = MetadataKey::for_source(ds);
     let mut state = SessionState::default();
-    state.conn(ds).await?.completion_metadata().await
+    let result = async {
+        let conn = state.conn(ds).await?;
+        let names = conn.completion_metadata(false).await?;
+        send(Event::Completion {
+            key: key.clone(),
+            request_id,
+            result: Ok(names),
+            complete: false,
+        });
+        conn.completion_metadata(true).await
+    }
+    .await;
+    send(Event::Completion {
+        key,
+        request_id,
+        result: result.map_err(fmt_err),
+        complete: true,
+    });
 }
 
 fn meta_session(ds: &DataSource) -> String {

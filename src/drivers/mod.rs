@@ -707,23 +707,25 @@ impl Connection {
         }
     }
 
-    /// All user tables with their columns, for code completion.
-    pub async fn completion_meta(&mut self) -> Result<Vec<TableMeta>> {
+    /// All user tables, with their columns when `columns` is set, for code completion.
+    pub async fn completion_meta(&mut self, columns: bool) -> Result<Vec<TableMeta>> {
         match &mut self.kind {
-            Kind::Postgres(c) => c.completion_meta().await.map_err(postgres::describe),
-            Kind::MySql(c) => c.completion_meta().await,
-            Kind::Sqlite(c) => c.completion_meta().await,
+            Kind::Postgres(c) => c.completion_meta(columns).await.map_err(postgres::describe),
+            Kind::MySql(c) => c.completion_meta(columns).await,
+            Kind::Sqlite(c) => c.completion_meta(columns).await,
         }
     }
 
-    pub async fn completion_metadata(&mut self) -> Result<CompletionMetadata> {
+    /// The catalog for code completion; without `columns` only the names of
+    /// schemas and tables, which a large catalog returns much sooner.
+    pub async fn completion_metadata(&mut self, columns: bool) -> Result<CompletionMetadata> {
         let default_context = self.resolved_context().await?;
         let schemas = match &mut self.kind {
             Kind::Postgres(c) => c.schema_names().await.map_err(postgres::describe)?,
             Kind::MySql(c) => c.schema_names().await?,
             Kind::Sqlite(_) => vec!["main".into()],
         };
-        let tables = self.completion_meta().await?;
+        let tables = self.completion_meta(columns).await?;
         Ok(CompletionMetadata {
             tables,
             schemas,

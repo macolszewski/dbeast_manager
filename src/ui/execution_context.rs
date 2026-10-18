@@ -101,9 +101,20 @@ impl App {
         key: MetadataKey,
         request_id: u64,
         result: Result<CompletionMetadata, String>,
+        complete: bool,
     ) {
         if self.source(&key.ds_id).is_none() || self.metadata_loading.get(&key) != Some(&request_id)
         {
+            return;
+        }
+        if !complete {
+            // Names only: usable now, the request stays open for the columns.
+            if let Ok(metadata) = result {
+                self.meta.insert(key.clone(), metadata);
+                for tab in self.tabs.iter_mut().filter(|tab| tab.metadata_key == key) {
+                    tab.context_ui.invalidate();
+                }
+            }
             return;
         }
         self.metadata_loading.remove(&key);
@@ -368,21 +379,30 @@ mod tests {
                 schemas: vec!["empty".into()],
                 default_context: Default::default(),
             }),
+            true,
         );
-        app.completion_loaded(kb.clone(), rb, Err("catalog unavailable".into()));
+        app.completion_loaded(kb.clone(), rb, Err("catalog unavailable".into()), true);
         assert_eq!(app.meta[&ka].schemas, ["empty"]);
         assert!(!app.meta.contains_key(&kb));
         assert!(!app.metadata_loading.contains_key(&kb));
         assert!(app.metadata_errors.contains_key(&kb));
         app.invalidate_source_metadata(&source.id);
         let fresh = app.begin_metadata_request(ka.clone());
-        app.completion_loaded(ka.clone(), ra, Ok(CompletionMetadata::default()));
+        app.completion_loaded(ka.clone(), ra, Ok(CompletionMetadata::default()), true);
         assert_eq!(app.metadata_loading.get(&ka), Some(&fresh));
         assert!(app.meta.is_empty());
-        app.completion_loaded(ka.clone(), fresh, Err("fresh error".into()));
+        // Names arrive first and are usable while the request stays open.
+        let names = CompletionMetadata {
+            schemas: vec!["named".into()],
+            ..Default::default()
+        };
+        app.completion_loaded(ka.clone(), fresh, Ok(names), false);
+        assert_eq!(app.meta[&ka].schemas, ["named"]);
+        assert_eq!(app.metadata_loading.get(&ka), Some(&fresh));
+        app.completion_loaded(ka.clone(), fresh, Err("fresh error".into()), true);
         assert_eq!(app.metadata_errors[&ka], "fresh error");
         app.invalidate_source_metadata(&source.id);
-        app.completion_loaded(ka, ra, Ok(CompletionMetadata::default()));
+        app.completion_loaded(ka, ra, Ok(CompletionMetadata::default()), true);
         assert!(
             app.meta.is_empty(),
             "a late response cannot restore disconnected metadata"
