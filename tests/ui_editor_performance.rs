@@ -157,6 +157,19 @@ fn saved_sql(fixture: &Fixture) -> String {
     saved["consoles"][0]["sql"].as_str().unwrap().to_owned()
 }
 
+/// The configuration is saved by a background writer, so the file catches up
+/// shortly after the frame that changed the console.
+fn wait_for_saved_sql(fixture: &Fixture, expected: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let saved = saved_sql(fixture);
+        if expected(&saved) || Instant::now() > deadline {
+            return saved;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn large_unicode_console_keeps_search_folds_edits_and_source_changes_in_sync() {
     let _environment_guard = CONFIG_ENVIRONMENT.lock().unwrap();
@@ -218,7 +231,7 @@ fn large_unicode_console_keeps_search_folds_edits_and_source_changes_in_sync() {
     search(&mut h, MARKER);
     assert_eq!(selected_text(&h, &ctx, editor_id), MARKER);
     assert!(editor(&h).len() < sql.len(), "other statements stay folded");
-    assert_eq!(saved_sql(&fixture), sql);
+    assert_eq!(wait_for_saved_sql(&fixture, |saved| saved == sql), sql);
 
     // Replacing a match with itself still unfolds the editor. A text-only
     // invalidation would leave stale placeholders in the cached projection.
@@ -234,7 +247,7 @@ fn large_unicode_console_keeps_search_folds_edits_and_source_changes_in_sync() {
     h.get_by_role_and_label(Role::Button, "Replace All").click();
     h.run_steps(3);
     assert_eq!(editor(&h), sql);
-    let saved = saved_sql(&fixture);
+    let saved = wait_for_saved_sql(&fixture, |saved| saved == sql);
     assert_eq!(saved, sql);
     assert!(
         saved
@@ -257,7 +270,7 @@ fn large_unicode_console_keeps_search_folds_edits_and_source_changes_in_sync() {
     h.run_steps(3);
     let edited = sql.replace(MARKER, REPLACEMENT);
     assert_eq!(editor(&h), edited);
-    assert_eq!(saved_sql(&fixture), edited);
+    assert_eq!(wait_for_saved_sql(&fixture, |saved| saved == edited), edited);
     let after_edit = marker_start + REPLACEMENT.chars().count();
     assert_eq!(selection(&ctx, editor_id), after_edit..after_edit);
     h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
@@ -286,7 +299,7 @@ fn large_unicode_console_keeps_search_folds_edits_and_source_changes_in_sync() {
     assert!(formatted.starts_with(&sql[..tail_byte]));
     assert!(formatted[tail_byte..].starts_with("SELECT\n"));
     assert!(formatted[tail_byte..].contains(MARKER));
-    assert_eq!(saved_sql(&fixture), formatted);
+    assert_eq!(wait_for_saved_sql(&fixture, |saved| saved == formatted), formatted);
     focus_editor(&mut h);
     h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
     h.run_steps(3);
@@ -309,7 +322,7 @@ fn large_unicode_console_keeps_search_folds_edits_and_source_changes_in_sync() {
     h.key_press(Key::Backspace);
     h.run_steps(3);
     assert!(editor(&h).len() > folded.len());
-    assert_eq!(saved_sql(&fixture), formatted);
+    assert_eq!(wait_for_saved_sql(&fixture, |saved| saved == formatted), formatted);
     h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Equals);
     h.run_steps(3);
     assert_eq!(editor(&h), formatted);
@@ -496,8 +509,9 @@ fn editor_cpu_frames_without_accesskit() {
         }
 
         // Three idle frames let egui evict untouched paragraph layout entries.
-        // Time the subsequent text-input frame, including its synchronous config
-        // save. File reads that verify the edit happen outside the timed region.
+        // Time the subsequent text-input frame, which hands the config save to
+        // the background writer. File reads that verify the edit happen outside
+        // the timed region.
         let editor_id = ctx.memory(|memory| memory.focused()).unwrap();
         let mut typing = Vec::with_capacity(5);
         let mut expected_bytes = sql.len();
@@ -515,11 +529,12 @@ fn editor_cpu_frames_without_accesskit() {
             typing.push(start.elapsed().as_secs_f64() * 1000.0);
             assert!(output.platform_output.accesskit_update.is_none());
             expected_bytes += 1;
-            assert_eq!(saved_sql(&fixture).len(), expected_bytes);
+            let saved = wait_for_saved_sql(&fixture, |saved| saved.len() == expected_bytes);
+            assert_eq!(saved.len(), expected_bytes);
         }
         typing.sort_unstable_by(f64::total_cmp);
         eprintln!(
-            "editor_cpu_without_accesskit bytes={} phase=typing_after_idle samples=5 idle_before_each=3 includes_sync_config_save=true p50_ms={:.3} p95_ms={:.3}",
+            "editor_cpu_without_accesskit bytes={} phase=typing_after_idle samples=5 idle_before_each=3 config_save=handed_to_writer p50_ms={:.3} p95_ms={:.3}",
             sql.len(),
             typing[2],
             typing[4]
