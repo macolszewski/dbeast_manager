@@ -668,4 +668,59 @@ mod tests {
         cache.invalidate();
         assert_eq!(cache.line_col(0), None);
     }
+
+    #[test]
+    #[ignore = "release benchmark: cargo test --release --lib editor_layout_cost -- --ignored --nocapture"]
+    fn editor_layout_cost_benchmark() {
+        use std::time::{Duration, Instant};
+        let block = "-- Batch: Łódź, żółć and 😀\nSELECT item_id, 'Łódź' AS city,\n       (SELECT count(*) FROM inventory WHERE active = true) AS total\nFROM inventory WHERE item_id = 0;\n\n";
+        for target in [100_000usize, 1_000_000] {
+            let mut sql = block.repeat(target / block.len() + 1);
+            let ctx = egui::Context::default();
+            let mut cache = EditorCache::default();
+            for _ in 0..3 {
+                frame(&ctx, |ui| {
+                    cache.prepare(ui, &sql, &[], DriverKind::Postgres);
+                    layout(&mut cache, ui, 900.0);
+                });
+            }
+            let percentiles = |mut samples: Vec<Duration>| {
+                samples.sort();
+                let at = |p: f64| samples[((samples.len() - 1) as f64 * p).round() as usize];
+                format!("p50={:?} p95={:?} p99={:?}", at(0.5), at(0.95), at(0.99))
+            };
+            let (mut idle, mut typing, mut highlight) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..30 {
+                // A new pass with unchanged text: the keep-alive relayout.
+                frame(&ctx, |ui| {
+                    cache.prepare(ui, &sql, &[], DriverKind::Postgres);
+                    let start = Instant::now();
+                    layout(&mut cache, ui, 900.0);
+                    idle.push(start.elapsed());
+                });
+                // A typed character, as the console sees it on the next pass:
+                // the source changed, so folding regions, projection,
+                // highlighting and layout are rebuilt.
+                sql.insert(i, 'x');
+                frame(&ctx, |ui| {
+                    let start = Instant::now();
+                    cache.invalidate();
+                    cache.prepare(ui, &sql, &[], DriverKind::Postgres);
+                    layout(&mut cache, ui, 900.0);
+                    typing.push(start.elapsed());
+                });
+                let start = Instant::now();
+                let job = crate::ui::highlight::layout_with_folds(&sql, 13.0, &|_| None);
+                highlight.push(start.elapsed());
+                drop(job);
+            }
+            println!(
+                "editor layout {} bytes: idle keep-alive {}; typed char {}; highlight only {}",
+                sql.len(),
+                percentiles(idle),
+                percentiles(typing),
+                percentiles(highlight)
+            );
+        }
+    }
 }
