@@ -177,6 +177,7 @@ fn find_replace_and_go_to_line() {
     h.run_steps(3);
     set_field(&mut h, "Find", "łódź");
     assert_eq!(editor(&h), SQL);
+    wait_for_saved_sql(&mut h, &config, SQL);
     assert_eq!(saved_sql(&config), SQL);
     assert_eq!(selected_text(&h, &ctx, editor_id), "Łódź");
 
@@ -193,6 +194,7 @@ fn find_replace_and_go_to_line() {
     h.run_steps(3);
     assert_eq!(editor(&h), expected_single);
     wait_for_saved_sql(&mut h, &config, &expected_single);
+    wait_for_saved_sql(&mut h, &config, &expected_single);
     assert_eq!(saved_sql(&config), expected_single);
     focus_editor(&mut h);
     h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
@@ -208,6 +210,7 @@ fn find_replace_and_go_to_line() {
     h.run_steps(3);
     let expected_all = SQL.replace("Łódź", "Gdańsk");
     assert_eq!(editor(&h), expected_all);
+    wait_for_saved_sql(&mut h, &config, &expected_all);
     wait_for_saved_sql(&mut h, &config, &expected_all);
     assert_eq!(saved_sql(&config), expected_all);
     focus_editor(&mut h);
@@ -268,6 +271,7 @@ fn find_replace_and_go_to_line() {
         - 1;
     assert_eq!(selection(&ctx, editor_id), line_5_end..line_5_end);
     assert_eq!(editor(&h), expected_all);
+    wait_for_saved_sql(&mut h, &config, &expected_all);
     assert_eq!(saved_sql(&config), expected_all);
 
     // A fresh editor change after Undo discards the abandoned replacement redo.
@@ -285,6 +289,7 @@ fn find_replace_and_go_to_line() {
     h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
     h.run_steps(3);
     assert_eq!(editor(&h), edited);
+    wait_for_saved_sql(&mut h, &config, &edited);
     assert_eq!(saved_sql(&config), edited);
 
     std::fs::remove_dir_all(dir).ok();

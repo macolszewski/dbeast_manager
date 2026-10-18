@@ -2635,5 +2635,12 @@ fn completion_sends_names_before_columns() {
     assert_eq!(ours.len(), tables);
     assert!(ours.iter().all(|t| t.columns.len() == 40));
     eprintln!("completion of {tables} tables x 40 columns: names after {names_after:?}, columns after {full_after:?}");
-    run(&backend, req(31, &ds, &[&format!("drop schema {schema} cascade")], false));
+    // One statement per table: a single DROP SCHEMA ... CASCADE of thousands
+    // of tables exceeds the server's lock table. A schema left behind would
+    // push other schemas out of view in UI tests that pick one from the list.
+    let mut cleanup: Vec<String> = (0..tables).map(|t| format!("drop table {schema}.t{t}")).collect();
+    cleanup.push(format!("drop schema {schema}"));
+    let cleanup: Vec<&str> = cleanup.iter().map(String::as_str).collect();
+    let (done, _) = run(&backend, req(31, &ds, &cleanup, false));
+    assert!(done.iter().all(|(_, result)| result.is_ok()), "cleanup failed");
 }
