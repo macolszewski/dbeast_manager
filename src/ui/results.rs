@@ -142,6 +142,8 @@ pub struct ResultSet {
     /// The value panel's cache that may hold views of this result.
     value_cache: Option<std::sync::Weak<std::sync::Mutex<value::ViewCache>>>,
     /// `data` as JSON for the saved session; rows never change after fetching.
+    /// Decoded size of the rows, counted once; see [`crate::model::row_bytes`].
+    pub(super) data_bytes: usize,
     /// File the work session keeps these rows in, written once.
     pub(super) session_file: String,
 }
@@ -262,7 +264,9 @@ pub enum GridAction {
 impl ResultSet {
     pub fn new(title: String, sql: String, data: QueryResult, page: Page) -> Self {
         let order = (0..data.rows.len()).collect();
+        let data_bytes = data.rows.iter().map(|row| crate::model::row_bytes(row)).sum();
         Self {
+            data_bytes,
             origin: None,
             action_id: NEXT_RESULT_ID.fetch_add(1, Ordering::Relaxed),
             action_focus: Default::default(),
@@ -300,6 +304,14 @@ impl ResultSet {
             value_cache: None,
             session_file: super::session::new_result_file(),
         }
+    }
+
+    /// Typing into a cell, or waiting for an action that uses this result.
+    pub(super) fn is_editing(&self) -> bool {
+        self.edits.editing.is_some()
+            || self.pending_related_rows
+            || self.pending_compare_data
+            || self.edit_metadata_pending()
     }
 
     /// Columns holding geometries. A bounded check runs here once; columns

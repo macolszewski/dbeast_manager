@@ -34,7 +34,9 @@ Some restored content needs a fresh read before you can change it:
 
 The session is stored in `session.json` next to the configuration file, and the rows of saved results in the `session-results` folder beside it, one file per result. The files have 0600 permissions because they contain query results.
 
-It is written at most every 2 seconds after a change, and when the application closes. The rows of a result are written once, in the background; later saves rewrite only `session.json` and remove files of results that are no longer open. On start, the session is read in the background and the tabs appear when it has been read. A `session.json` from an earlier version, which held the rows itself, is still restored.
+It is written at most every 2 seconds after a change, and when the application closes. The rows of a result are written once, in the background; later saves rewrite only `session.json` and remove files of results that are no longer open. On start, the session is read in the background and the tabs appear when it has been read; the saved rows of a tab are read when the tab is first shown, so a large session opens as fast as a small one. A `session.json` from an earlier version, which held the rows itself, is still restored.
+
+Results in memory are kept within 1 GiB of decoded values across all tabs. Above that, the results of the tabs unused for longest go back to their files in `session-results` and are read again when the tab is shown. The active tab, a running tab, results with pending changes and results of opened files (which are not saved in the session) always stay in memory.
 
 !!! note "Closing a console discards its content"
     The content of a closed console is removed from the saved session, and there is no recovery of closed consoles yet. DBeast therefore asks for confirmation before closing any console that is not empty.

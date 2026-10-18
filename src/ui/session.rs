@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 /// Output lines kept per tab.
 const LOG_LIMIT: usize = 500;
+/// Decoded result rows kept in memory across all tabs; see
+/// [`App::release_results_over`].
+pub(super) const RESULTS_MEMORY: usize = 1 << 30;
 /// How often changes are written while the application runs.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -67,8 +70,8 @@ struct SavedTab {
     log: Vec<LogLine>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SavedResult {
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct SavedResult {
     #[serde(default)]
     origin: Option<super::results::ResultOrigin>,
     title: String,
@@ -303,7 +306,10 @@ mod tests {
         assert!(text.len() < 20_000, "session.json holds no rows: {} bytes", text.len());
         let restored = load_from(&path).unwrap();
         assert!(matches!(&restored.tabs[0].kind, TabKind::Console { sql } if sql == "last"));
-        let rows = |result: &SavedResult| serde_json::to_string(result.rows.as_deref().unwrap()).unwrap();
+        let rows = |result: &SavedResult| {
+            let rows = read_result_file(&results_dir(&path), result.file.as_deref().unwrap());
+            serde_json::to_string(&rows.unwrap()).unwrap()
+        };
         assert_eq!(rows(&restored.tabs[1].results[0]), serde_json::to_string(&*app.tabs[1].results[0].data).unwrap());
         assert_eq!(restored.tabs[1].results[0].file.as_ref(), Some(&app.tabs[1].results[0].session_file));
         let results = results_dir(&path);
@@ -329,6 +335,96 @@ mod tests {
             }
         }
         assert!(!writer.failed.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn wait_for_stored(app: &mut App, index: usize) {
+        for _ in 0..500 {
+            app.load_stored_results();
+            if app.tabs[index].stored.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("stored results of tab {index} were not read");
+    }
+
+    #[test]
+    fn restored_results_are_read_when_their_tab_is_shown_and_keep_their_files() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("dbeast-session-lazy-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("session.json");
+        let mut app = app_with_results(&ctx, 3);
+        app.config_loaded = true;
+        app.session_writer.path = Some(path.clone());
+        app.save_session(true);
+        app.finish_session();
+        let files: Vec<String> = app.tabs.iter().map(|t| t.results[0].session_file.clone()).collect();
+
+        let mut session = load_from(&path).unwrap();
+        assert!(session.tabs.iter().all(|t| t.results[0].rows.is_none()), "only metadata is read");
+        session.active = 1;
+        let mut restored = app_with_results(&ctx, 0);
+        restored.config_loaded = true;
+        restored.session_writer.path = Some(path.clone());
+        restored.restore_session(session);
+        assert!(restored.tabs.iter().all(|t| t.results.is_empty() && t.stored.is_some()));
+        wait_for_stored(&mut restored, 1);
+        assert_eq!(restored.tabs[1].results.len(), 1);
+        assert!(matches!(restored.tabs[1].view, ServicesView::Result(0)));
+        assert_eq!(
+            serde_json::to_string(&*restored.tabs[1].results[0].data).unwrap(),
+            serde_json::to_string(&*app.tabs[1].results[0].data).unwrap()
+        );
+        assert!(restored.tabs[0].stored.as_ref().is_some_and(|s| !s.is_loading()));
+        assert!(restored.tabs[2].stored.as_ref().is_some_and(|s| !s.is_loading()));
+
+        // Saving keeps the files of results that were never read.
+        restored.tabs[0].cursor = Some(3..4);
+        restored.save_session(true);
+        restored.finish_session();
+        for file in &files {
+            assert!(results_dir(&path).join(file).exists(), "{file} kept");
+        }
+        let saved = load_from(&path).unwrap();
+        assert_eq!(saved.tabs[2].results[0].file.as_ref(), Some(&files[2]));
+
+        // Showing another tab reads its rows.
+        restored.active = 2;
+        wait_for_stored(&mut restored, 2);
+        assert_eq!(restored.tabs[2].results[0].data.rows.len(), 500);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn results_over_the_memory_budget_go_back_to_their_files() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("dbeast-session-budget-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("session.json");
+        let mut app = app_with_results(&ctx, 4);
+        app.config_loaded = true;
+        app.session_writer.path = Some(path.clone());
+        let one_tab = app.tabs[0].results[0].data_bytes;
+        // Not written yet: nothing can be released.
+        app.release_results_over(one_tab);
+        assert!(app.tabs.iter().all(|t| t.stored.is_none()));
+        app.save_session(true);
+        app.finish_session();
+        app.active = 3;
+        app.tabs[1].results[0].edits.changed.insert((0, 4), crate::sqlgen::CellEdit::Null);
+        let expected = serde_json::to_string(&*app.tabs[0].results[0].data).unwrap();
+        let weak = Arc::downgrade(&app.tabs[0].results[0].data);
+        app.tabs[0].last_active = Instant::now() - Duration::from_secs(60);
+        app.release_results_over(2 * one_tab);
+        assert!(app.tabs[0].stored.is_some(), "the longest unused tab is released first");
+        assert_eq!(weak.strong_count(), 0, "its rows are freed");
+        assert!(app.tabs[1].stored.is_none(), "pending edits stay in memory");
+        assert!(app.tabs[3].stored.is_none(), "the active tab stays in memory");
+        let in_memory: usize = app.tabs.iter().flat_map(|t| &t.results).map(|rs| rs.data_bytes).sum();
+        assert!(in_memory <= 2 * one_tab + one_tab, "{in_memory}");
+        app.active = 0;
+        wait_for_stored(&mut app, 0);
+        assert_eq!(serde_json::to_string(&*app.tabs[0].results[0].data).unwrap(), expected);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -386,6 +482,11 @@ mod tests {
             restored.restore_session(saved);
             let restore = start.elapsed().as_secs_f64() * 1000.0;
             assert_eq!(restored.tabs.len(), tabs);
+            // The active tab's rows are read on a worker, then shown.
+            let start = Instant::now();
+            let active = restored.active;
+            wait_for_stored(&mut restored, active);
+            let active_ready = start.elapsed().as_secs_f64() * 1000.0;
             let size = std::fs::metadata(dir.join("session.json")).unwrap().len()
                 + std::fs::read_dir(dir.join("session-results"))
                     .unwrap()
@@ -412,7 +513,7 @@ mod tests {
             app.finish_session();
             let flush = start.elapsed().as_secs_f64() * 1000.0;
             println!(
-                "{tabs} tabs x 500 rows x 20 cols, session {:.1} MB: UI thread first save={first:.1} ms, unchanged={:.3} ms, changed={:.3} ms (median of 21); final flush={flush:.1} ms; background read={read:.1} ms, UI restore={restore:.1} ms",
+                "{tabs} tabs x 500 rows x 20 cols, session {:.1} MB: UI thread first save={first:.1} ms, unchanged={:.3} ms, changed={:.3} ms (median of 21); final flush={flush:.1} ms; background read={read:.1} ms, UI restore={restore:.1} ms, active tab rows ready after {active_ready:.1} ms",
                 size as f64 / 1e6,
                 median(&mut unchanged),
                 median(&mut changed),
@@ -432,6 +533,14 @@ pub(super) struct SessionWriter {
     worker: Option<mpsc::Sender<Job>>,
     /// Set by the writer when a write failed, so the next save tries again.
     failed: Arc<AtomicBool>,
+    /// session.json of this application; tests point it at a temporary folder.
+    path: Option<PathBuf>,
+}
+
+impl SessionWriter {
+    fn path(&self) -> PathBuf {
+        self.path.clone().unwrap_or_else(path)
+    }
 }
 
 enum Job {
@@ -575,21 +684,13 @@ fn load_from(path: &Path) -> Option<Session> {
             return None;
         }
     };
-    let dir = results_dir(path);
     for result in session.tabs.iter_mut().flat_map(|tab| &mut tab.results) {
-        let rows = if let Some(raw) = result.data.take() {
-            // An older session: the rows get their own file on the next save.
+        // An older session holds the rows inline; they get their own file on
+        // the next save. Rows in files are read when their tab is shown.
+        if let Some(raw) = result.data.take() {
             result.file = None;
-            serde_json::from_str::<QueryResult>(raw.get()).ok()
-        } else {
-            result
-                .file
-                .as_deref()
-                .filter(|name| result_file_name(name))
-                .and_then(|name| std::fs::File::open(dir.join(name)).ok())
-                .and_then(|file| serde_json::from_reader(std::io::BufReader::new(file)).ok())
-        };
-        result.rows = rows.map(Arc::new);
+            result.rows = serde_json::from_str::<QueryResult>(raw.get()).ok().map(Arc::new);
+        }
     }
     Some(session)
 }
@@ -644,6 +745,67 @@ fn kept(ds_id: &str) -> bool {
     !ds_id.starts_with("file:")
 }
 
+/// Results of a tab kept in their session files instead of memory: restored
+/// and not shown yet, or released to stay within the results memory budget.
+/// They are read back when the tab is activated.
+pub(super) struct StoredResults {
+    results: Vec<SavedResult>,
+    view: Option<usize>,
+    loading: Option<mpsc::Receiver<Vec<Option<QueryResult>>>>,
+}
+
+impl StoredResults {
+    pub(super) fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+}
+
+fn read_result_file(dir: &Path, name: &str) -> Option<QueryResult> {
+    if !result_file_name(name) {
+        return None;
+    }
+    let file = std::fs::File::open(dir.join(name)).ok()?;
+    serde_json::from_reader(std::io::BufReader::new(file)).ok()
+}
+
+fn result_file_exists(session: &Path, name: &str) -> bool {
+    result_file_name(name) && results_dir(session).join(name).exists()
+}
+
+/// A result rebuilt from its saved settings and rows.
+fn saved_result(r: SavedResult, data: QueryResult) -> ResultSet {
+    let mut rs = ResultSet::new(r.title, r.sql, data, r.page);
+    // These rows are already in this file; the next save keeps it.
+    if let Some(file) = r.file {
+        rs.session_file = file;
+    }
+    rs.origin = r.origin;
+    rs.transposed = r.transposed;
+    rs.record_view = r.record_view && !r.aggregate_view;
+    rs.aggregate_view = r.aggregate_view;
+    rs.show_value_editor = r.show_value_editor;
+    rs.set_sort(r.sort);
+    rs
+}
+
+/// The settings of a result whose rows stay in its session file.
+fn stored_result(rs: &ResultSet) -> SavedResult {
+    SavedResult {
+        origin: rs.origin.clone(),
+        title: rs.title.clone(),
+        sql: rs.sql.clone(),
+        page: rs.page,
+        sort: rs.sort,
+        transposed: rs.transposed,
+        record_view: rs.record_view,
+        aggregate_view: rs.aggregate_view,
+        show_value_editor: rs.show_value_editor,
+        data: None,
+        file: Some(rs.session_file.clone()),
+        rows: None,
+    }
+}
+
 impl App {
     fn session(&self) -> Session {
         let tabs = self
@@ -663,7 +825,10 @@ impl App {
                 show_value_editor: t.show_value_editor,
                 cursor: t.cursor.clone(),
                 folds: t.folds.clone(),
-                results: t
+                results: match &t.stored {
+                    // Not read back yet: keep naming their files.
+                    Some(stored) => stored.results.clone(),
+                    None => t
                     .results
                     .iter()
                     .map(|rs| SavedResult {
@@ -681,9 +846,11 @@ impl App {
                             rows: Some(rs.data.clone()),
                     })
                     .collect(),
-                view: match t.view {
-                    ServicesView::Result(i) => Some(i),
-                    ServicesView::Output | ServicesView::Plan => None,
+                },
+                view: match (&t.stored, t.view) {
+                    (Some(stored), _) => stored.view,
+                    (None, ServicesView::Result(i)) => Some(i),
+                    (None, ServicesView::Output | ServicesView::Plan) => None,
                 },
                 log: t.log.recent(LOG_LIMIT),
             })
@@ -760,30 +927,145 @@ impl App {
             tab.cursor = saved.cursor;
             tab.folds = saved.folds;
             tab.log = super::results::OutputLog::from_lines(saved.log);
-            for r in saved.results {
-                let Some(rows) = r.rows else {
-                    continue;
-                };
-                let data = Arc::try_unwrap(rows).unwrap_or_else(|rows| (*rows).clone());
-                let mut rs = ResultSet::new(r.title, r.sql, data, r.page);
-                // These rows are already in this file; the next save keeps it.
-                if let Some(file) = r.file {
-                    rs.session_file = file;
+            if saved.results.iter().any(|r| r.rows.is_some()) {
+                // An older session with rows inline; results without rows are left out.
+                for mut r in saved.results {
+                    let Some(rows) = r.rows.take() else {
+                        continue;
+                    };
+                    let data = Arc::try_unwrap(rows).unwrap_or_else(|rows| (*rows).clone());
+                    tab.results.push(saved_result(r, data));
                 }
-                rs.origin = r.origin;
-                rs.transposed = r.transposed;
-                rs.record_view = r.record_view && !r.aggregate_view;
-                rs.aggregate_view = r.aggregate_view;
-                rs.show_value_editor = r.show_value_editor;
-                rs.set_sort(r.sort);
-                tab.results.push(rs);
+                tab.view = match saved.view {
+                    Some(v) if v < tab.results.len() => ServicesView::Result(v),
+                    _ => ServicesView::Output,
+                };
+            } else {
+                // Rows in their own files are read when the tab is shown.
+                let results: Vec<SavedResult> = saved
+                    .results
+                    .into_iter()
+                    .filter(|r| r.file.as_deref().is_some_and(result_file_name))
+                    .collect();
+                tab.view = ServicesView::Output;
+                if !results.is_empty() {
+                    tab.stored = Some(StoredResults {
+                        view: saved.view.filter(|&v| v < results.len()),
+                        results,
+                        loading: None,
+                    });
+                }
             }
-            tab.view = match saved.view {
-                Some(v) if v < tab.results.len() => ServicesView::Result(v),
-                _ => ServicesView::Output,
-            };
         }
         self.active = session.active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Reads back the stored results of the active tab, on a worker, and
+    /// shows the results of any tab whose rows have been read.
+    pub(super) fn load_stored_results(&mut self) {
+        let active = self.active;
+        let ctx = self.backend.ctx().clone();
+        let session_path = self.session_writer.path();
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if index == active {
+                tab.last_active = Instant::now();
+            }
+            let Some(stored) = &mut tab.stored else {
+                continue;
+            };
+            if index == active && stored.loading.is_none() {
+                let files: Vec<String> = stored
+                    .results
+                    .iter()
+                    .map(|r| r.file.clone().unwrap_or_default())
+                    .collect();
+                let (sender, receiver) = mpsc::channel();
+                let dir = results_dir(&session_path);
+                let ctx = ctx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("session-results".into())
+                    .spawn(move || {
+                        let rows = files.iter().map(|name| read_result_file(&dir, name)).collect();
+                        // The tab may have been closed or rerun meanwhile.
+                        if sender.send(rows).is_ok() {
+                            ctx.request_repaint();
+                        }
+                    });
+                if spawned.is_ok() {
+                    stored.loading = Some(receiver);
+                }
+            }
+            let Some(loading) = &stored.loading else {
+                continue;
+            };
+            let rows = match loading.try_recv() {
+                Ok(rows) => rows,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                Err(mpsc::TryRecvError::Disconnected) => Vec::new(),
+            };
+            let Some(stored) = tab.stored.take() else {
+                continue;
+            };
+            let mut view = None;
+            for (position, (saved, data)) in stored.results.into_iter().zip(rows).enumerate() {
+                // A missing or damaged file leaves its result out.
+                let Some(data) = data else {
+                    continue;
+                };
+                if stored.view == Some(position) {
+                    view = Some(tab.results.len());
+                }
+                tab.results.push(saved_result(saved, data));
+            }
+            tab.view = view.map_or(ServicesView::Output, ServicesView::Result);
+        }
+    }
+
+    /// Keeps results in memory within `budget` ([`RESULTS_MEMORY`]): while over it, the
+    /// clean results of the tab unused for longest go back to their session
+    /// files, to be read again when the tab is shown. The active tab, running
+    /// tabs, pending edits and rows not yet written to a file stay in memory.
+    pub(super) fn release_results_over(&mut self, budget: usize) {
+        let in_memory = |tab: &super::Tab| tab.results.iter().map(|rs| rs.data_bytes).sum::<usize>();
+        let session_path = self.session_writer.path();
+        let mut total: usize = self.tabs.iter().map(in_memory).sum();
+        if total <= budget {
+            return;
+        }
+        let mut candidates: Vec<usize> = (0..self.tabs.len())
+            .filter(|&index| {
+                let tab = &self.tabs[index];
+                index != self.active
+                    && kept(&tab.ds_id)
+                    && !tab.is_running()
+                    && tab.stored.is_none()
+                    && !tab.results.is_empty()
+                    && tab.results.iter().all(|rs| {
+                        rs.edits.is_empty()
+                            && !rs.is_editing()
+                            && result_file_exists(&session_path, &rs.session_file)
+                    })
+            })
+            .collect();
+        candidates.sort_by_key(|&index| self.tabs[index].last_active);
+        for index in candidates {
+            if total <= budget {
+                break;
+            }
+            let tab = &mut self.tabs[index];
+            total -= in_memory(tab);
+            let view = match tab.view {
+                ServicesView::Result(i) => Some(i),
+                ServicesView::Output | ServicesView::Plan => None,
+            };
+            let results = tab.results.drain(..).map(|rs| stored_result(&rs)).collect();
+            tab.stored = Some(StoredResults {
+                results,
+                view,
+                loading: None,
+            });
+            tab.view = ServicesView::Output;
+        }
     }
 
     /// Writes the session when it changed, at most every [`SAVE_INTERVAL`]
@@ -814,7 +1096,7 @@ impl App {
         }
         self.session_writer.saved = Some(fingerprint);
         self.session_writer
-            .send(Job::Write(path(), Box::new(session)));
+            .send(Job::Write(self.session_writer.path(), Box::new(session)));
     }
 
     /// Saves the session and waits until it is on disk; used when the

@@ -192,6 +192,11 @@ struct Tab {
     refresh_on_activate: bool,
     /// Console text as last handed to the configuration writer, shared with it.
     saved_sql: Option<std::sync::Arc<str>>,
+    /// Results kept in their session files until the tab is shown again.
+    stored: Option<session::StoredResults>,
+    /// When the tab was last the active one, to release results of the
+    /// longest unused tabs first.
+    last_active: Instant,
     /// Last known caret/selection as char offsets.
     cursor: Option<Range<usize>>,
     manual_tx: bool,
@@ -361,9 +366,12 @@ impl App {
     }
 
     /// Test fixtures explicitly inject an isolated store; config overrides never select one.
-    /// True until the configuration is loaded and the saved session restored.
+    /// True until the configuration is loaded, the saved session restored and
+    /// the saved results of the active tab read.
     pub fn starting(&self) -> bool {
-        !self.config_loaded || self.session_loading.is_some()
+        !self.config_loaded
+            || self.session_loading.is_some()
+            || self.tabs.get(self.active).is_some_and(|tab| tab.stored.is_some())
     }
 
     pub fn new_for_test(cc: &eframe::CreationContext<'_>) -> Self {
@@ -672,6 +680,8 @@ impl App {
             bound_query: None,
             refresh_on_activate: false,
             saved_sql: None,
+            stored: None,
+            last_active: Instant::now(),
             results: Vec::new(),
             plan: None,
             log: Default::default(),
@@ -1453,6 +1463,7 @@ impl App {
         };
         if kind == RunKind::Query {
             tab.results.clear();
+            tab.stored = None;
             tab.view = ServicesView::Output;
         }
         // Mirror the transaction statements the backend adds, so every result line has its SQL.
@@ -2105,7 +2116,18 @@ impl App {
                         egui::Frame::new()
                             .fill(theme::BG_EDITOR)
                             .inner_margin(6)
-                            .show(ui, |ui| results::output(ui, &tab.log))
+                            .show(ui, |ui| {
+                                if tab.stored.as_ref().is_some_and(|s| s.is_loading()) {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(
+                                            RichText::new("Reading saved results…")
+                                                .color(theme::TEXT_MUTED),
+                                        );
+                                    });
+                                }
+                                results::output(ui, &tab.log)
+                            })
                             .inner
                     }
                 }
@@ -2309,6 +2331,8 @@ impl eframe::App for App {
             return;
         }
         self.handle_events();
+        self.load_stored_results();
+        self.release_results_over(session::RESULTS_MEMORY);
         self.refresh_restored_table();
         if ui.ctx().input(|i| i.viewport().close_requested())
             && !self.close_ready

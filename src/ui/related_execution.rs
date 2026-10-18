@@ -113,6 +113,7 @@ impl App {
         let tab = &mut self.tabs[index];
         if kind == RunKind::Query {
             tab.results.clear();
+            tab.stored = None;
             tab.view = ServicesView::Output;
         }
         tab.log(
