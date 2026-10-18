@@ -65,6 +65,8 @@ cargo test --test drivers postgres_paging_cost -- --ignored --nocapture
 
 "Read to the end" is the time until the page is shown and the session is free for the next statement when the rest of the result is read and discarded. A cancel request costs about one millisecond locally and a few network round trips to a remote server, which is why a small result gains nothing from it; the gain grows with the size of the rest. See [Paging](../guide/results-grid.md#paging).
 
+A table page already ends one row after the page through its own `LIMIT`, so since 18 October 2026 that row is read instead of cancelled: no cancel connection and no extra transaction-state query. Release build, best of 5, page of 500 out of 20,000 rows: 3.772 ms with a cancel request and 1.060 ms read to the end at offset 0; 3.003 and 2.623 ms at offset 19,800; 2.120 and 2.662 ms past the end, where no row follows and nothing is cancelled anyway (host under parallel load). The primary key used for the page order is still read before every page: 1.861 ms locally, one round trip to a remote server.
+
 
 ### Layout preparation
 
@@ -251,7 +253,9 @@ Backend response times, medians of 7 runs, without UI and GPU. Opening the conne
 cargo test --release --test backend console_update_metadata_and_submit_latency -- --ignored --nocapture
 ```
 
-The PostgreSQL cache keeps up to 128 prepared `UPDATE` templates; a session keeps metadata for up to 256 tables. A cached metadata read checks the context but does not query the catalogs again. Scrolling never fetches metadata. PostgreSQL sends up to 32 `UPDATE` statements of one Submit before reading their results, so a remote server costs about one round trip per 32 changes instead of one per change: 100 changes through a local proxy with 2 ms one-way delay took 873 ms one at a time and 70 ms pipelined (debug build, best of 5, `postgres_update_batch_latency`, 18 October 2026). SQLite runs the whole Submit in one background task with cached statements. MySQL still sends one statement at a time, so there its cost grows with network latency.
+The same benchmark before and after pipelined PostgreSQL Submit and single-task SQLite Submit, release build, 18 October 2026, both runs under parallel host load (medians, Submit of 100 rows): SQLite 2.639 → 0.850 ms, PostgreSQL 23.132 → 7.727 ms. MySQL, whose path did not change, measured 25.229 and 31.264 ms, which shows the noise of that host.
+
+The PostgreSQL cache keeps up to 128 prepared `UPDATE` templates; a session keeps metadata for up to 256 tables. A cached metadata read checks the context but does not query the catalogs again. Scrolling never fetches metadata. PostgreSQL sends up to 32 `UPDATE` statements of one Submit before reading their results, so a remote server costs about one round trip per 32 changes instead of one per change: 100 changes through a local proxy with 2 ms one-way delay took 906.6 ms one at a time and 103.8 ms pipelined (release build, best of 5, `postgres_update_batch_latency`, 18 October 2026). SQLite runs the whole Submit in one background task with cached statements. MySQL still sends one statement at a time, so there its cost grows with network latency.
 
 ## Related Rows
 
