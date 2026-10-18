@@ -316,7 +316,13 @@ pub struct MapFeature {
     /// End of each line in `coords`.
     line_ends: Vec<u32>,
     polygons: Vec<MapPolygon>,
+    /// Bounds of each run of [`BLOCK`] coordinates, so drawing and picking
+    /// skip whole runs far from the view or the pointer.
+    blocks: Vec<WorldBox>,
 }
+
+/// Coordinates per entry of [`MapFeature::blocks`].
+const BLOCK: usize = 256;
 
 impl MapFeature {
     fn points(&self) -> &[[f64; 2]] {
@@ -330,6 +336,11 @@ impl MapFeature {
             start = end as usize;
             line
         })
+    }
+
+    /// Index in `coords` of the first coordinate of `part`, a line or a ring.
+    fn offset(&self, part: &[[f64; 2]]) -> usize {
+        (part.as_ptr() as usize - self.coords.as_ptr() as usize) / std::mem::size_of::<[f64; 2]>()
     }
 
     fn rings<'a>(&'a self, p: &'a MapPolygon) -> impl Iterator<Item = &'a [[f64; 2]]> {
@@ -356,6 +367,41 @@ impl MapFeature {
 pub struct MapLayer {
     features: Vec<MapFeature>,
     bounds: Option<WorldBox>,
+    /// Shapes of the last drawn view, reused while the view and the selected
+    /// row stay the same; hovering does not change them.
+    drawn: std::cell::RefCell<Option<DrawnView>>,
+}
+
+/// What `DrawnView` was built for: the view, the map's rect and the selected row.
+#[derive(Clone, Copy, PartialEq)]
+struct ViewKey {
+    center: [u64; 2],
+    zoom: u64,
+    rect: [u32; 4],
+    selected: Option<usize>,
+}
+
+impl ViewKey {
+    fn of(view: &MapView, rect: Rect, selected: Option<usize>) -> Self {
+        Self {
+            center: view.center.map(f64::to_bits),
+            zoom: view.zoom.to_bits(),
+            rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y].map(f32::to_bits),
+            selected,
+        }
+    }
+}
+
+struct DrawnView {
+    key: ViewKey,
+    /// Features in view other than the selected row.
+    base: Vec<egui::Shape>,
+    /// The selected row's features, drawn once on top.
+    selected: Vec<egui::Shape>,
+    features: usize,
+    /// Screen coordinates computed to build the shapes.
+    #[cfg(test)]
+    transformed: usize,
 }
 
 impl MapLayer {
@@ -372,6 +418,7 @@ pub fn prepare(features: Vec<Feature>, cancelled: &dyn Fn() -> bool) -> Option<M
     let mut out = MapLayer {
         features: Vec::with_capacity(features.len()),
         bounds: None,
+        drawn: Default::default(),
     };
     for f in features {
         if cancelled() {
@@ -431,6 +478,7 @@ pub fn prepare(features: Vec<Feature>, cancelled: &dyn Fn() -> bool) -> Option<M
                 [hi[0].max(bounds.1[0]), hi[1].max(bounds.1[1])],
             ),
         });
+        let blocks = coords.chunks(BLOCK).filter_map(box_of).collect();
         out.features.push(MapFeature {
             row: f.row,
             bounds,
@@ -438,6 +486,7 @@ pub fn prepare(features: Vec<Feature>, cancelled: &dyn Fn() -> bool) -> Option<M
             points,
             line_ends,
             polygons,
+            blocks,
         });
     }
     Some(out)
@@ -660,30 +709,24 @@ pub fn show(
     let to = |w: [f64; 2]| view.screen_pos(rect, w);
     if let Some(p) = pointer {
         let pw = view.world_pos(rect, p);
+        let world_px = 1.0 / view.scale();
         for (i, f) in features.iter().enumerate() {
-            if f.screen_bounds(view, rect, HIT_TOLERANCE).contains(p) && feature_hit(f, p, pw, &to)
+            if f.screen_bounds(view, rect, HIT_TOLERANCE).contains(p)
+                && feature_hit(f, p, pw, world_px, &to)
             {
                 hovered = Some(i);
             }
         }
     }
-    let visible = rect.expand(STROKE_MARGIN);
-    let mut drawn = 0;
-    for (i, f) in features.iter().enumerate() {
-        if !f.screen_bounds(view, rect, 0.0).intersects(visible) {
-            continue;
-        }
-        drawn += 1;
-        let accent = hovered == Some(i) || selected == Some(f.row);
-        draw_feature(&painter, f, &to, accent);
-    }
-    // Hovered and selected features on top.
-    for (i, f) in features.iter().enumerate() {
-        if (hovered == Some(i) || selected == Some(f.row))
-            && f.screen_bounds(view, rect, 0.0).intersects(visible)
-        {
-            draw_feature(&painter, f, &to, true);
-        }
+    let drawn = draw_layer(&painter, layer, view, rect, selected);
+    // The hovered feature on top, unless it is already drawn as selected.
+    if let Some(i) = hovered
+        && selected != Some(features[i].row)
+    {
+        let mut shapes = Vec::new();
+        let clip = WorldRect::of(view, rect, STROKE_MARGIN);
+        feature_shapes(&mut shapes, &features[i], &clip, &to, true);
+        painter.extend(shapes);
     }
 
     // Zoom buttons and attribution, as on any OSM map.
@@ -830,12 +873,106 @@ const HIT_TOLERANCE: f32 = 7.0;
 /// Pixels a feature's outline or point marker reaches beyond its bounds.
 const STROKE_MARGIN: f32 = 8.0;
 
-fn draw_feature(
+/// The view in world coordinates, grown by a margin in pixels.
+#[derive(Clone, Copy)]
+struct WorldRect {
+    min: [f64; 2],
+    max: [f64; 2],
+}
+
+impl WorldRect {
+    fn of(view: &MapView, rect: Rect, margin: f32) -> Self {
+        Self {
+            min: view.world_pos(rect, rect.min - vec2(margin, margin)),
+            max: view.world_pos(rect, rect.max + vec2(margin, margin)),
+        }
+    }
+
+    fn contains_box(&self, b: &WorldBox) -> bool {
+        b.0[0] >= self.min[0]
+            && b.0[1] >= self.min[1]
+            && b.1[0] <= self.max[0]
+            && b.1[1] <= self.max[1]
+    }
+
+    /// Whether the box spanned by `a` and `b` meets the view; never misses a
+    /// segment that crosses it.
+    fn meets(&self, a: [f64; 2], b: [f64; 2]) -> bool {
+        a[0].max(b[0]) >= self.min[0]
+            && a[0].min(b[0]) <= self.max[0]
+            && a[1].max(b[1]) >= self.min[1]
+            && a[1].min(b[1]) <= self.max[1]
+    }
+}
+
+/// Draws the layer for this view. Shapes are rebuilt only when the view or the
+/// selected row changes. Returns the number of features in view.
+fn draw_layer(
     painter: &egui::Painter,
+    layer: &MapLayer,
+    view: &MapView,
+    rect: Rect,
+    selected: Option<usize>,
+) -> usize {
+    let key = ViewKey::of(view, rect, selected);
+    let mut drawn = layer.drawn.borrow_mut();
+    if drawn.as_ref().is_none_or(|d| d.key != key) {
+        *drawn = Some(build_view(layer, view, rect, key));
+    }
+    let drawn = drawn.as_ref().expect("built above");
+    painter.extend(drawn.base.iter().cloned());
+    painter.extend(drawn.selected.iter().cloned());
+    drawn.features
+}
+
+fn build_view(layer: &MapLayer, view: &MapView, rect: Rect, key: ViewKey) -> DrawnView {
+    let clip = WorldRect::of(view, rect, STROKE_MARGIN);
+    let visible = rect.expand(STROKE_MARGIN);
+    let (mut base, mut selected, mut features) = (Vec::new(), Vec::new(), 0);
+    #[cfg(test)]
+    let transformed = std::cell::Cell::new(0);
+    let to = |w: [f64; 2]| {
+        #[cfg(test)]
+        transformed.set(transformed.get() + 1);
+        view.screen_pos(rect, w)
+    };
+    for f in &layer.features {
+        if !f.screen_bounds(view, rect, 0.0).intersects(visible) {
+            continue;
+        }
+        features += 1;
+        if key.selected == Some(f.row) {
+            feature_shapes(&mut selected, f, &clip, &to, true);
+        } else {
+            feature_shapes(&mut base, f, &clip, &to, false);
+        }
+    }
+    DrawnView {
+        key,
+        base,
+        selected,
+        features,
+        #[cfg(test)]
+        transformed: transformed.get(),
+    }
+}
+
+/// Shapes of one feature. Of a feature partly in view only the parts that
+/// reach it are kept: line and ring segments and fill triangles outside the
+/// view are skipped before their vertices are transformed.
+fn feature_shapes(
+    out: &mut Vec<egui::Shape>,
     f: &MapFeature,
+    clip: &WorldRect,
     to: &dyn Fn([f64; 2]) -> Pos2,
     accent: bool,
 ) {
+    let inside = clip.contains_box(&f.bounds);
+    let near: Vec<bool> = if inside {
+        Vec::new()
+    } else {
+        f.blocks.iter().map(|b| clip.meets(b.0, b.1)).collect()
+    };
     let line = if accent { HIGHLIGHT } else { LINE };
     for polygon in &f.polygons {
         let fill = if accent {
@@ -846,45 +983,181 @@ fn draw_feature(
         let end = polygon.ring_ends.last().copied().unwrap_or(polygon.start) as usize;
         let vertices = &f.coords[polygon.start as usize..end];
         let mut mesh = egui::Mesh::default();
-        mesh.vertices.reserve_exact(vertices.len());
-        for v in vertices {
-            mesh.colored_vertex(to(*v), fill);
+        if inside {
+            mesh.vertices.reserve_exact(vertices.len());
+            for v in vertices {
+                mesh.colored_vertex(to(*v), fill);
+            }
+            mesh.indices.clone_from(&polygon.triangles);
+        } else {
+            // Only triangles that reach the view, with their vertices renumbered.
+            let mut index = vec![u32::MAX; vertices.len()];
+            for t in polygon.triangles.as_chunks::<3>().0 {
+                let [a, b, c] = t.map(|i| vertices[i as usize]);
+                let lo = [a[0].min(b[0]).min(c[0]), a[1].min(b[1]).min(c[1])];
+                let hi = [a[0].max(b[0]).max(c[0]), a[1].max(b[1]).max(c[1])];
+                if !clip.meets(lo, hi) {
+                    continue;
+                }
+                for &i in t {
+                    let slot = &mut index[i as usize];
+                    if *slot == u32::MAX {
+                        *slot = mesh.vertices.len() as u32;
+                        mesh.colored_vertex(to(vertices[i as usize]), fill);
+                    }
+                    mesh.indices.push(*slot);
+                }
+            }
         }
-        mesh.indices = polygon.triangles.clone();
-        painter.add(egui::Shape::mesh(mesh));
+        if !mesh.indices.is_empty() {
+            out.push(egui::Shape::mesh(mesh));
+        }
         for r in f.rings(polygon) {
-            painter.add(egui::Shape::closed_line(
-                r.iter().map(|p| to(*p)).collect(),
-                Stroke::new(1.5, line),
-            ));
+            let part = Part { pts: r, start: f.offset(r), near: &near };
+            polyline_shapes(out, part, true, inside, clip, to, Stroke::new(1.5, line));
         }
     }
+    let width = if accent { 3.5 } else { 2.5 };
     for l in f.lines() {
-        painter.add(egui::Shape::line(
-            l.iter().map(|p| to(*p)).collect(),
-            Stroke::new(if accent { 3.5 } else { 2.5 }, line),
-        ));
+        let part = Part { pts: l, start: f.offset(l), near: &near };
+        polyline_shapes(out, part, false, inside, clip, to, Stroke::new(width, line));
     }
+    let radius = if accent { 6.5 } else { 5.0 };
     for p in f.points() {
-        let c = to(*p);
-        painter.circle(
-            c,
-            if accent { 6.5 } else { 5.0 },
-            line,
-            Stroke::new(1.5, Color32::WHITE),
-        );
+        if inside || clip.meets(*p, *p) {
+            out.push(egui::Shape::Circle(egui::epaint::CircleShape {
+                center: to(*p),
+                radius,
+                fill: line,
+                stroke: Stroke::new(1.5, Color32::WHITE),
+            }));
+        }
+    }
+}
+
+/// A line or ring of a feature, with which of the feature's blocks reach the view.
+struct Part<'a> {
+    pts: &'a [[f64; 2]],
+    /// Index of `pts[0]` in the feature's coordinates.
+    start: usize,
+    near: &'a [bool],
+}
+
+impl Part<'_> {
+    /// Whether no segment starting at local index `i`'s block can reach the
+    /// view; such a segment ends at most in the next block.
+    fn far(&self, i: usize) -> bool {
+        let block = (self.start + i) / BLOCK;
+        !self.near.get(block).copied().unwrap_or(false)
+            && !self.near.get(block + 1).copied().unwrap_or(false)
+    }
+
+    /// Local index of the first coordinate of the block after `i`'s.
+    fn next_block(&self, i: usize) -> usize {
+        ((self.start + i) / BLOCK + 1) * BLOCK - self.start
+    }
+}
+
+/// A line or ring as one path when the feature is in view, otherwise as the
+/// runs of consecutive segments that reach the view.
+fn polyline_shapes(
+    out: &mut Vec<egui::Shape>,
+    part: Part<'_>,
+    closed: bool,
+    inside: bool,
+    clip: &WorldRect,
+    to: &dyn Fn([f64; 2]) -> Pos2,
+    stroke: Stroke,
+) {
+    let pts = part.pts;
+    if inside {
+        let points = pts.iter().map(|p| to(*p)).collect();
+        out.push(if closed {
+            egui::Shape::closed_line(points, stroke)
+        } else {
+            egui::Shape::line(points, stroke)
+        });
+        return;
+    }
+    let n = pts.len();
+    if n < 2 {
+        return;
+    }
+    let mut run: Vec<Pos2> = Vec::new();
+    let mut i = 0;
+    while i + 1 < n {
+        if part.far(i) {
+            if !run.is_empty() {
+                out.push(egui::Shape::line(std::mem::take(&mut run), stroke));
+            }
+            i = part.next_block(i);
+            continue;
+        }
+        let (a, b) = (pts[i], pts[i + 1]);
+        if clip.meets(a, b) {
+            if run.is_empty() {
+                run.push(to(a));
+            }
+            run.push(to(b));
+        } else if !run.is_empty() {
+            out.push(egui::Shape::line(std::mem::take(&mut run), stroke));
+        }
+        i += 1;
+    }
+    // A ring's closing segment joins the run that ends at its last point.
+    if closed && clip.meets(pts[n - 1], pts[0]) {
+        if run.is_empty() {
+            run.push(to(pts[n - 1]));
+        }
+        run.push(to(pts[0]));
+    }
+    if !run.is_empty() {
+        out.push(egui::Shape::line(run, stroke));
     }
 }
 
 /// Hit test without allocating: points and lines by screen distance,
-/// polygons by the pointer's world position against the rings.
-fn feature_hit(f: &MapFeature, p: Pos2, pw: [f64; 2], to: &dyn Fn([f64; 2]) -> Pos2) -> bool {
-    if f.points().iter().any(|w| to(*w).distance(p) <= HIT_TOLERANCE) {
+/// polygons by the pointer's world position against the rings. Points and
+/// segments far from the pointer are skipped in world space, before they are
+/// transformed; `world_px` is the size of a pixel in world units.
+fn feature_hit(
+    f: &MapFeature,
+    p: Pos2,
+    pw: [f64; 2],
+    world_px: f64,
+    to: &dyn Fn([f64; 2]) -> Pos2,
+) -> bool {
+    let near = |a: [f64; 2], b: [f64; 2], tolerance: f32| {
+        let r = tolerance as f64 * world_px;
+        a[0].min(b[0]) - r <= pw[0]
+            && a[0].max(b[0]) + r >= pw[0]
+            && a[1].min(b[1]) - r <= pw[1]
+            && a[1].max(b[1]) + r >= pw[1]
+    };
+    if f
+        .points()
+        .iter()
+        .any(|w| near(*w, *w, HIT_TOLERANCE) && to(*w).distance(p) <= HIT_TOLERANCE)
+    {
         return true;
     }
+    // Blocks of coordinates far from the pointer are skipped whole.
+    let blocks: Vec<bool> = f.blocks.iter().map(|b| near(b.0, b.1, 5.0)).collect();
     let near_line = |pts: &[[f64; 2]]| {
-        pts.windows(2)
-            .any(|s| segment_distance(p, to(s[0]), to(s[1])) <= 5.0)
+        let part = Part { pts, start: f.offset(pts), near: &blocks };
+        let mut i = 0;
+        while i + 1 < pts.len() {
+            if part.far(i) {
+                i = part.next_block(i);
+                continue;
+            }
+            let (a, b) = (pts[i], pts[i + 1]);
+            if near(a, b, 5.0) && segment_distance(p, to(a), to(b)) <= 5.0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
     };
     if f.lines().any(near_line) {
         return true;
@@ -1105,13 +1378,141 @@ mod tests {
         let to = |w: [f64; 2]| view.screen_pos(rect, w);
         let hit = |lonlat: [f64; 2]| {
             let p = to(world(lonlat));
-            feature_hit(f, p, view.world_pos(rect, p), &to)
+            feature_hit(f, p, view.world_pos(rect, p), 1.0 / view.scale(), &to)
         };
         assert!(hit([11.5, 10.0]), "inside the ring");
         assert!(!hit([10.0, 10.0]), "inside the hole");
         assert!(hit([5.0, 5.0]), "on the point");
         assert!(hit([0.5, 0.5]), "on the line");
         assert!(!hit([7.0, 3.0]), "empty map");
+    }
+
+    fn view_shapes(layer: &MapLayer, view: &MapView, selected: Option<usize>) -> (usize, usize, usize) {
+        let ctx = egui::Context::default();
+        let mut tiles = TileCache::new(String::new(), std::env::temp_dir());
+        let mut view = *view;
+        run_frame(&ctx, vec2(800.0, 600.0), |ui| {
+            show(ui, &mut view, &mut tiles, layer, selected, false, &|_, _| {});
+        });
+        let drawn = layer.drawn.borrow();
+        let drawn = drawn.as_ref().unwrap();
+        (drawn.base.len(), drawn.selected.len(), drawn.transformed)
+    }
+
+    #[test]
+    fn selected_features_are_drawn_once_on_top() {
+        let layer = prepare(
+            vec![
+                feature(0, vec![Shape::Polygon(vec![square(10.0, 10.0, 1.0)])]),
+                feature(1, vec![Shape::Polygon(vec![square(12.0, 10.0, 1.0)])]),
+            ],
+            &|| false,
+        )
+        .unwrap();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let mut view = MapView::default();
+        let (lo, hi) = layer.bounds.unwrap();
+        view.fit(rect, lo, hi);
+        // One fill and one outline per feature, the selected one only on top.
+        assert_eq!(view_shapes(&layer, &view, None), (4, 0, 20));
+        assert_eq!(view_shapes(&layer, &view, Some(1)), (2, 2, 20));
+    }
+
+    #[test]
+    fn shapes_are_kept_while_only_the_pointer_moves() {
+        let layer = prepare(
+            vec![feature(0, vec![Shape::Polygon(vec![square(10.0, 10.0, 1.0)])])],
+            &|| false,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut tiles = TileCache::new(String::new(), std::env::temp_dir());
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let mut view = MapView::default();
+        let (lo, hi) = layer.bounds.unwrap();
+        view.fit(rect, lo, hi);
+        let built = |layer: &MapLayer| layer.drawn.borrow().as_ref().map(|d| d.base.as_ptr());
+        let mut first = None;
+        for x in [100.0, 400.0, 401.0, 402.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(rect),
+                events: vec![egui::Event::PointerMoved(pos2(x, 300.0))],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                show(ui, &mut view, &mut tiles, &layer, None, false, &|_, _| {});
+            });
+            out.textures_delta.clear();
+            let now = built(&layer);
+            assert!(first.is_none_or(|first| first == now), "hovering rebuilt the layer");
+            first = Some(now);
+        }
+        view.zoom += 0.5;
+        run_frame(&ctx, rect.size(), |ui| {
+            show(ui, &mut view, &mut tiles, &layer, None, false, &|_, _| {});
+        });
+        assert_ne!(Some(built(&layer)), first, "a new view is built again");
+    }
+
+    #[test]
+    fn long_line_crossing_the_view_transforms_only_the_part_in_view() {
+        let line: Vec<[f64; 2]> = (0..200_000)
+            .map(|i| [-179.0 + i as f64 * 358.0 / 2e5, if i % 2 == 0 { -1.0 } else { 1.0 }])
+            .collect();
+        let layer = prepare(vec![feature(0, vec![Shape::Line(line)])], &|| false).unwrap();
+        let view = MapView {
+            center: world([0.0, 0.0]),
+            zoom: 9.0,
+        };
+        let (base, _, transformed) = view_shapes(&layer, &view, None);
+        assert_eq!(base, 1, "the part in view is one path");
+        assert!(transformed < 2_000, "{transformed} of 200000 vertices transformed");
+        // Picking still finds the line under the pointer.
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let f = &layer.features[0];
+        let to = |w: [f64; 2]| view.screen_pos(rect, w);
+        let p = to(f.coords[100_000]);
+        assert!(feature_hit(f, p, view.world_pos(rect, p), 1.0 / view.scale(), &to));
+        let away = p + vec2(0.0, 200.0);
+        assert!(!feature_hit(f, away, view.world_pos(rect, away), 1.0 / view.scale(), &to));
+    }
+
+    #[test]
+    fn polygon_partly_in_view_keeps_holes_and_only_nearby_triangles() {
+        // A large square with a hole, viewed close to its hole.
+        let layer = prepare(
+            vec![feature(
+                0,
+                vec![Shape::Polygon(vec![square(0.0, 0.0, 40.0), square(0.0, 0.0, 1.0)])],
+            )],
+            &|| false,
+        )
+        .unwrap();
+        let view = MapView {
+            center: world([0.0, 0.0]),
+            zoom: 8.0,
+        };
+        let (base, _, _) = view_shapes(&layer, &view, None);
+        let drawn = layer.drawn.borrow();
+        let shapes = &drawn.as_ref().unwrap().base;
+        let mesh = shapes
+            .iter()
+            .find_map(|s| match s {
+                egui::Shape::Mesh(mesh) => Some(mesh.clone()),
+                _ => None,
+            })
+            .expect("fill");
+        assert!(base >= 2, "fill and the hole outline");
+        // Every kept triangle reaches the view; none covers the hole's center.
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let hole_center = rect.center();
+        for t in mesh.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| mesh.vertices[i as usize].pos);
+            let area = |p: Pos2, q: Pos2, r: Pos2| (q - p).x * (r - p).y - (q - p).y * (r - p).x;
+            let (d1, d2, d3) = (area(hole_center, a, b), area(hole_center, b, c), area(hole_center, c, a));
+            let inside = (d1 > 0.0 && d2 > 0.0 && d3 > 0.0) || (d1 < 0.0 && d2 < 0.0 && d3 < 0.0);
+            assert!(!inside, "the hole stays empty");
+        }
     }
 
     #[test]
@@ -1292,6 +1693,110 @@ mod tests {
             };
             frame(2);
             eprintln!("frame ({name}): {:?}", frame(20));
+        }
+    }
+
+    fn percentiles(mut times: Vec<f64>) -> String {
+        times.sort_by(f64::total_cmp);
+        let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+        format!("p50={:.3} p95={:.3} p99={:.3} ms", at(0.5), at(0.95), at(0.99))
+    }
+
+    /// Run with `cargo test --release --lib benchmark_map_interaction -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn benchmark_map_interaction() {
+        let scattered: Vec<Feature> = (0..5000)
+            .map(|i| {
+                let (x, y) = (-175.0 + (i % 100) as f64 * 3.5, -70.0 + (i / 100) as f64 * 2.8);
+                feature(i, vec![Shape::Polygon(vec![square(x, y, 0.4)])])
+            })
+            .collect();
+        // One line of 2 million vertices zigzagging across the whole world.
+        let huge = vec![feature(
+            0,
+            vec![Shape::Line(
+                (0..2_000_000)
+                    .map(|i| [-179.0 + i as f64 * 358.0 / 2e6, if i % 2 == 0 { -1.0 } else { 1.0 }])
+                    .collect(),
+            )],
+        )];
+        let size = vec2(1200.0, 800.0);
+        let center = Rect::from_min_size(Pos2::ZERO, size).center();
+        let t = std::time::Instant::now();
+        let scenarios = [
+            (
+                "5000 features, few visible",
+                prepare(scattered, &|| false).unwrap(),
+                MapView { center: world([0.0, 0.0]), zoom: 8.0 },
+                Some(2550),
+            ),
+            (
+                "one polygon with a 50k-vertex ring crossing the view",
+                prepare(
+                    vec![feature(
+                        0,
+                        vec![Shape::Polygon(vec![(0..50_000)
+                            .map(|i| {
+                                let a = i as f64 / 5e4 * std::f64::consts::TAU;
+                                let r = if i % 2 == 0 { 60.0 } else { 59.9 };
+                                [r * a.cos(), r * a.sin()]
+                            })
+                            .collect()])],
+                    )],
+                    &|| false,
+                )
+                .unwrap(),
+                MapView { center: world([60.0, 0.0]), zoom: 9.0 },
+                Some(0),
+            ),
+            (
+                "one 2M-vertex line crossing the view",
+                prepare(huge, &|| false).unwrap(),
+                MapView { center: world([0.0, 0.0]), zoom: 9.0 },
+                Some(0),
+            ),
+        ];
+        eprintln!("prepared in {:?}", t.elapsed());
+        for (name, layer, view, selected) in scenarios {
+            let ctx = egui::Context::default();
+            let mut tiles = TileCache::new(String::new(), std::env::temp_dir());
+            for phase in ["idle", "hover", "pan"] {
+                let mut view = view;
+                let (mut ui_ms, mut tess_ms) = (Vec::new(), Vec::new());
+                for frame in 0..70 {
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                        ..Default::default()
+                    };
+                    if phase != "idle" {
+                        input.events.push(egui::Event::PointerMoved(
+                            center + vec2((frame % 40) as f32 * 5.0, (frame % 7) as f32),
+                        ));
+                    }
+                    if phase == "pan" {
+                        view.center[0] += 1e-6;
+                    }
+                    let t = std::time::Instant::now();
+                    let mut out = ctx.run_ui(input, |ui| {
+                        show(ui, &mut view, &mut tiles, &layer, selected, false, &|_, _| {});
+                    });
+                    let ui_time = t.elapsed().as_secs_f64() * 1000.0;
+                    out.textures_delta.clear();
+                    let t = std::time::Instant::now();
+                    let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+                    let tess_time = t.elapsed().as_secs_f64() * 1000.0;
+                    if frame >= 10 {
+                        ui_ms.push(ui_time);
+                        tess_ms.push(tess_time);
+                    }
+                }
+                eprintln!(
+                    "{name}, {phase}: UI {} | tessellation {}",
+                    percentiles(ui_ms),
+                    percentiles(tess_ms)
+                );
+            }
         }
     }
 }
