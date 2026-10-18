@@ -316,7 +316,7 @@ fn apply_updates(
         {
             assert_eq!(result_id, 8001);
             assert_eq!(request_id, 8003);
-            return (result, in_tx);
+            return (result, in_tx.expect("the batch reached its session"));
         }
     }
 }
@@ -2100,4 +2100,130 @@ fn mysql_batch_conflict_rolls_back_the_whole_submit() {
     if let Some(ds) = mysql() {
         exercise_batch_conflict(ds);
     }
+}
+
+fn updates_outcome(backend: &Backend, console_id: u64) -> (Result<MutationReport, MutationFailure>, Option<bool>) {
+    loop {
+        if let Event::UpdatesDone { console_id: received, in_tx, result, .. } =
+            backend.rx.recv_timeout(Duration::from_secs(15)).expect("updates event")
+            && received == console_id
+        {
+            return (result, in_tx);
+        }
+    }
+}
+
+/// Stop or Disconnect while a Submit waits for a row lock held by another
+/// session: the waiting UPDATE is cancelled, nothing of the batch remains,
+/// the session is closed and the console can Submit again.
+#[test]
+fn stop_and_disconnect_end_a_submit_waiting_for_a_row_lock() {
+    let Some(ds) = pg() else { return };
+    let default = ExecutionContext::default();
+    let table = format!("dbeast_stop_{}", uuid::Uuid::new_v4().simple());
+    let sql = format!("SELECT id, name FROM {table} ORDER BY id");
+    let backend = Backend::new(egui::Context::default());
+    query_context(&backend, 9400, &ds, &default, &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"));
+    query_context(&backend, 9400, &ds, &default, &format!("INSERT INTO {table} VALUES (1, 'a'), (2, 'b'), (3, 'c')"));
+    let test = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for disconnect in [false, true] {
+            let (data, metadata) = editable_query(&backend, 9401, &ds, &sql);
+            // Another console holds row 2 until it ends its transaction.
+            let (_, in_tx) = run(&backend, req(9402, &ds, &[&format!("UPDATE {table} SET name = name WHERE id = 2")], true));
+            assert!(in_tx);
+            let changes: Vec<_> = (0..3).map(|row| ((row, 1), CellEdit::Text(format!("stopped_{row}")))).collect();
+            backend.apply_updates(mutation_request(9401, &ds, &data, &metadata, &changes, false));
+            std::thread::sleep(Duration::from_millis(300));
+            let started = Instant::now();
+            if disconnect {
+                // Only the editing console's session is dropped by closing it.
+                backend.close_session(&ds.id, 9401);
+            } else {
+                backend.cancel(9401);
+            }
+            let (result, in_tx) = updates_outcome(&backend, 9401);
+            assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+            let failure = result.unwrap_err();
+            assert!(!failure.outcome_unknown, "{}", failure.message);
+            assert_eq!(in_tx, Some(false));
+            run(&backend, req(9402, &ds, &["ROLLBACK"], false));
+            let stored = query_context(&backend, 9400, &ds, &default, &sql);
+            assert_eq!(stored.rows, data.rows, "no change of the stopped batch remains");
+        }
+        let (data, metadata) = editable_query(&backend, 9401, &ds, &sql);
+        let (result, _) = apply_updates(&backend, mutation_request(9401, &ds, &data, &metadata, &[((0, 1), CellEdit::Text("after".into()))], false));
+        assert_eq!(result.unwrap().changed_rows, 1);
+    }));
+    for console in [9401, 9402] {
+        backend.close_session(&ds.id, console);
+    }
+    run(&backend, req(9400, &ds, &[&format!("DROP TABLE IF EXISTS {table}")], false));
+    if let Err(panic) = test {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A Submit stopped on a connection that no longer answers is abandoned
+/// within the recovery limit; it was not committed and the session is closed.
+#[test]
+fn stop_releases_a_submit_on_an_unresponsive_connection() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(original) = pg() else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut ds = original.clone();
+    ds.id = uuid::Uuid::new_v4().to_string();
+    ds.host = "127.0.0.1".into();
+    ds.port = listener.local_addr().unwrap().port();
+    ds.use_tls = false;
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let cut = blackhole.clone();
+    let peer = std::thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut server = std::net::TcpStream::connect("127.0.0.1:55432").unwrap();
+        client.set_nonblocking(true).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut buffer = [0; 65536];
+        loop {
+            assert!(Instant::now() < deadline, "proxy connection leaked");
+            for incoming in [true, false] {
+                let (from, to) = if incoming { (&mut client, &mut server) } else { (&mut server, &mut client) };
+                match from.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(n) if !cut.load(Ordering::Acquire) => to.write_all(&buffer[..n]).unwrap(),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return,
+                    Err(error) => panic!("proxy: {error}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let default = ExecutionContext::default();
+    let table = format!("dbeast_stop_{}", uuid::Uuid::new_v4().simple());
+    let setup = Backend::new(egui::Context::default());
+    query_context(&setup, 9500, &original, &default, &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"));
+    query_context(&setup, 9500, &original, &default, &format!("INSERT INTO {table} VALUES (1, 'a')"));
+    let backend = Backend::new(egui::Context::default());
+    let sql = format!("SELECT id, name FROM {table} ORDER BY id");
+    let (data, metadata) = editable_query(&backend, 9501, &ds, &sql);
+    blackhole.store(true, Ordering::Release);
+    backend.apply_updates(mutation_request(9501, &ds, &data, &metadata, &[((0, 1), CellEdit::Text("never".into()))], false));
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    backend.cancel(9501);
+    let (result, in_tx) = updates_outcome(&backend, 9501);
+    let elapsed = started.elapsed();
+    let failure = result.unwrap_err();
+    peer.join().unwrap();
+    let stored = query_context(&setup, 9500, &original, &default, &sql);
+    run(&setup, req(9500, &original, &[&format!("DROP TABLE IF EXISTS {table}")], false));
+    assert!(elapsed < Duration::from_secs(7), "{elapsed:?}");
+    assert!(failure.message.contains("did not respond"), "{}", failure.message);
+    assert!(!failure.outcome_unknown);
+    assert_eq!(in_tx, Some(false));
+    assert_eq!(stored.rows, data.rows);
 }

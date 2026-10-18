@@ -568,6 +568,17 @@ pub struct MutationFailure {
     pub outcome_unknown: bool,
 }
 
+impl MutationFailure {
+    /// Nothing of the batch was committed; the reason is all there is to show.
+    pub fn stopped(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            source_row: None,
+            outcome_unknown: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<Column>,

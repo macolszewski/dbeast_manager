@@ -968,6 +968,54 @@ async fn postgres_limited_pages_open_no_cancel_connection() {
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), opened + 1, "one cancel connection");
 }
 
+/// Stop between statements of a batch: the mutations before it ran, none
+/// after it was sent, and the index of the first unsent one is reported.
+#[tokio::test]
+async fn update_batches_stop_between_statements() {
+    let directory = std::env::temp_dir().join(format!("dbeast_batch_stop_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut sqlite = DataSource::new(DriverKind::Sqlite);
+    sqlite.file = directory.join("stop.sqlite").to_string_lossy().into_owned();
+    let mut sources = vec![sqlite];
+    for ds in [pg(), mysql()] {
+        if std::net::TcpStream::connect(("127.0.0.1", ds.port)).is_ok() {
+            sources.push(ds);
+        } else {
+            eprintln!("skipping {:?} batch stop", ds.driver);
+        }
+    }
+    for ds in sources {
+        let mut conn = Connection::open(&ds).await.unwrap();
+        let table = format!("dbeast_batch_stop_{}", uuid::Uuid::new_v4().simple());
+        let marker = if ds.driver == DriverKind::Postgres { "$1" } else { "?" };
+        conn.execute(&format!("create table {table} (id int primary key, n int)"), Page::first(0)).await.unwrap();
+        let values = (1..=100).map(|id| format!("({id}, 0)")).collect::<Vec<_>>().join(", ");
+        conn.execute(&format!("insert into {table} values {values}"), Page::first(0)).await.unwrap();
+        let updates: Vec<BoundUpdate> = (1..=100)
+            .map(|id| BoundUpdate {
+                sql: format!("update {table} set n = 1 where id = {marker}"),
+                params: vec![Value::Int(id)],
+                source_row: id as usize - 1,
+            })
+            .collect();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let stopped = std::sync::Arc::new(move || counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 40);
+        let (index, error) = conn.execute_bound_updates(&updates, stopped).await.unwrap_err();
+        assert_eq!(index, 40, "{:?}", ds.driver);
+        assert!(error.to_string().contains("Stopped"), "{error}");
+        let r = conn.execute(&format!("select sum(n) from {table}"), Page::first(1)).await.unwrap();
+        let sum = match &r.rows[0][0] {
+            Value::Int(n) => *n,
+            Value::Decimal(n) | Value::Text(n) => n.parse().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(sum, 40, "{:?}: only the mutations before Stop ran", ds.driver);
+        conn.execute(&format!("drop table {table}"), Page::first(0)).await.unwrap();
+    }
+    std::fs::remove_dir_all(directory).ok();
+}
+
 /// Forwards to the test PostgreSQL, delaying every chunk by `delay` in each
 /// direction, like a remote server.
 async fn delaying_proxy(delay: std::time::Duration) -> u16 {

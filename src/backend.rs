@@ -149,7 +149,8 @@ pub enum Event {
         console_id: u64,
         result_id: u64,
         request_id: u64,
-        in_tx: bool,
+        /// `None` when the batch stopped before reaching the session.
+        in_tx: Option<bool>,
         result: Result<MutationReport, MutationFailure>,
     },
     RelatedMetadata {
@@ -290,6 +291,15 @@ impl SessionState {
             anyhow::bail!("{reason} Disconnect and reconnect the data source before continuing.");
         }
         Ok(())
+    }
+
+    /// Drops the connection after Stop sent a cancel request or abandoned an
+    /// operation; nothing uncommitted survives, so no reconnect is required.
+    fn close_after_stop(&mut self) {
+        self.conn = None;
+        self.in_tx = false;
+        self.edit_metadata.clear();
+        self.related_metadata.clear();
     }
 
     fn close_uncertain(&mut self, reason: String) {
@@ -619,21 +629,83 @@ impl Backend {
         }
     }
 
+    /// Stop and Disconnect reach the batch while it waits for the session,
+    /// between statements and during a statement (see [`run_stoppable`]).
     pub fn apply_updates(&self, request: MutationRequest) {
         let send = self.send();
-        let session = self.session(&request.ds.id, &request.console_id.to_string());
-        let cancels = self.cancels.clone();
-        self.rt.spawn(async move {
-            let mut state = session.lock().await;
-            let result = apply_update_batch(&mut state, &request, &cancels).await;
-            cancels.lock().unwrap().remove(&request.console_id);
+        let done = move |in_tx: Option<bool>, result: Result<MutationReport, MutationFailure>| {
             send(Event::UpdatesDone {
                 console_id: request.console_id,
                 result_id: request.result_id,
                 request_id: request.request_id,
-                in_tx: state.in_tx,
+                in_tx,
                 result,
-            });
+            })
+        };
+        let Some((registration, token)) = explain::cancel::Registry::register(
+            &self.query_requests,
+            &request.ds.id,
+            request.console_id,
+            request.request_id,
+        ) else {
+            done(None, Err(MutationFailure::stopped("Another operation is running in this console.")));
+            return;
+        };
+        let session = self.session(&request.ds.id, &request.console_id.to_string());
+        let cancels = self.cancels.clone();
+        self.rt.spawn(async move {
+            let _registration = registration;
+            let Some(mut state) = explain::cancel::lock(&token, &session).await else {
+                done(None, Err(MutationFailure::stopped("Stopped before the changes were sent.")));
+                return;
+            };
+            let commit_attempted = std::sync::atomic::AtomicBool::new(false);
+            let outcome = run_stoppable(
+                &token,
+                apply_update_batch(&mut state, &request, &cancels, &token, &commit_attempted),
+                request.console_id,
+                &cancels,
+            )
+            .await;
+            cancels.lock().unwrap().remove(&request.console_id);
+            let result = match outcome {
+                Stoppable::Done(result) => result,
+                // A late cancel request must not reach a later statement, and
+                // closing the session rolls back what was not committed.
+                Stoppable::Cancelled(result) => {
+                    let open = state.in_tx;
+                    state.close_after_stop();
+                    let closed = if open {
+                        "the session was closed after Stop, which rolled back its open transaction"
+                    } else {
+                        "the session was closed after Stop"
+                    };
+                    match result {
+                        Ok(_) if open => Err(MutationFailure::stopped(&format!(
+                            "Stopped; {closed}, including these changes."
+                        ))),
+                        Ok(report) => Ok(report),
+                        Err(mut failure) => {
+                            failure.message.push_str(&format!("; {closed}."));
+                            Err(failure)
+                        }
+                    }
+                }
+                Stoppable::Abandoned => {
+                    state.close_after_stop();
+                    let unknown = commit_attempted.load(std::sync::atomic::Ordering::Acquire);
+                    Err(MutationFailure {
+                        message: if unknown {
+                            "Stopped while waiting for COMMIT; the database did not respond. The session was closed. Verify the database before submitting again.".into()
+                        } else {
+                            "Stopped; the database did not respond. The session was closed and the changes were not committed.".into()
+                        },
+                        source_row: None,
+                        outcome_unknown: unknown,
+                    })
+                }
+            };
+            done(Some(state.in_tx), result);
         });
     }
 
@@ -1207,10 +1279,62 @@ impl Backend {
     }
 }
 
+/// How an operation ended under [`run_stoppable`].
+enum Stoppable<T> {
+    /// Finished without a cancel request to the server.
+    Done(T),
+    /// Finished after a cancel request was sent. A late request could still
+    /// reach the session, so the caller must close it.
+    Cancelled(T),
+    /// Did not finish within the recovery limit and was dropped; the caller
+    /// must close the session.
+    Abandoned,
+}
+
+/// Time a stopped operation gets to end at its own check between statements
+/// before the running statement is cancelled on the server.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Runs a session operation that Stop or Disconnect may interrupt through
+/// `token`. A statement still running after [`STOP_GRACE`] gets a cancel
+/// request, and the operation then has the recovery limit to finish.
+async fn run_stoppable<T>(
+    token: &explain::cancel::Token,
+    operation: impl std::future::Future<Output = T>,
+    console_id: u64,
+    cancels: &Arc<Mutex<HashMap<u64, CancelHandle>>>,
+) -> Stoppable<T> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => return Stoppable::Done(result),
+        _ = token.cancelled() => {}
+    }
+    if let Ok(result) = tokio::time::timeout(STOP_GRACE, &mut operation).await {
+        return Stoppable::Done(result);
+    }
+    let handle = cancels.lock().unwrap().remove(&console_id);
+    let sent = handle.is_some();
+    if let Some(handle) = handle {
+        // The session is closed afterwards, so a request that arrives late
+        // finds no statement of this console to cancel.
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(explain::cancel::RECOVERY_LIMIT, handle.cancel()).await;
+        });
+    }
+    match tokio::time::timeout(explain::cancel::RECOVERY_LIMIT, &mut operation).await {
+        Ok(result) if sent => Stoppable::Cancelled(result),
+        Ok(result) => Stoppable::Done(result),
+        Err(_) => Stoppable::Abandoned,
+    }
+}
+
 async fn apply_update_batch(
     state: &mut SessionState,
     request: &MutationRequest,
     cancels: &Arc<Mutex<HashMap<u64, CancelHandle>>>,
+    token: &Arc<explain::cancel::Token>,
+    commit_attempted_flag: &std::sync::atomic::AtomicBool,
 ) -> Result<MutationReport, MutationFailure> {
     let mut opened_transaction = false;
     let mut savepoint_active = false;
@@ -1258,14 +1382,17 @@ async fn apply_update_batch(
         // metadata view came from cache. Other clients may have changed the table.
         let fresh = conn.table_edit_metadata(&origin).await?;
         validate_edit_metadata(&request.metadata, &fresh)?;
-        if let Err((index, error)) = conn.execute_bound_updates(&request.mutations, Arc::new(|| false)).await {
+        let stop = token.clone();
+        if let Err((index, error)) = conn.execute_bound_updates(&request.mutations, Arc::new(move || stop.is_cancelled())).await {
             source_row = request.mutations.get(index).map(|update| update.source_row);
             return Err(error);
         }
         conn.execute_control(&format!("RELEASE SAVEPOINT {savepoint}")).await?;
         savepoint_active = false;
         if opened_transaction && !request.manual_tx {
+            anyhow::ensure!(!token.is_cancelled(), "Stopped before the changes were committed.");
             commit_attempted = true;
+            commit_attempted_flag.store(true, std::sync::atomic::Ordering::Release);
             conn.execute_control("COMMIT").await?;
             state.in_tx = false;
         }

@@ -180,6 +180,7 @@ DBeast saves changes safely:
 - Each statement must affect exactly one row. Any error, conflict or uncertain outcome rolls back the whole batch; inside an open transaction this uses a savepoint, so your earlier changes in the transaction are kept.
 - In **Tx: Manual** mode, a successful save stays in the open transaction until you commit.
 - If the connection is lost during a save, DBeast does not retry. The result becomes read-only and keeps your values for reference until you verify the database with a fresh query.
+- **Stop** (`⌘F2`), Disconnect or closing the console also stop a save, including one that waits for the session or for a row locked by another session. Changes are never committed after Stop: DBeast stops before the next statement and rolls back to the savepoint. A statement that is still running after a short moment gets a cancel request; the session is then closed, which also rolls back an open manual transaction, and the Output log says so. If the database does not answer within 5 s, the session is closed as well. Only a Stop while `COMMIT` is waiting for its answer leaves the outcome unknown.
 
 ### When a table is read-only
 
@@ -220,6 +221,7 @@ Things to know:
 - All columns of a composite key are used, in catalog order, including foreign keys that reference a UNIQUE constraint. Aliases in the `SELECT` do not affect the mapping.
 - The source result can be read-only and does not need its own primary key, but it must contain the complete, exact values of the chosen relation. `NULL` values, a missing part of the key, or unsubmitted changes are reported as a reason.
 - Foreign keys are read only when you invoke the action, in the background, and cached per session.
+- **Stop**, Disconnect and closing the console also end a related read that waits for a session or a locked table. If the read had to be cancelled on the server, its session is closed.
 - Each page is limited on the server: the console's SQL is run with `ORDER BY` on the primary key of the shown table (for parent rows without a primary key, the referenced key) and `LIMIT`/`OFFSET` for the page, so later pages neither repeat nor skip rows and the database does not send the rest of the relation.
 - Export of a Related Rows result streams rows to the file in batches. The column origins of the query are checked before the first row is written, and the target file is replaced only after the whole export succeeds.
 - Not supported yet: an open transaction in the source console, temporary tables, SQLite attached and in-memory databases, imported file sources, virtual foreign keys, inline preview, and navigating from several records at once. SQLite foreign keys appear as `FK n`, because SQLite does not return constraint names.

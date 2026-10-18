@@ -56,36 +56,64 @@ impl Backend {
         });
     }
 
+    /// Stop and Disconnect reach the read while it waits for either session
+    /// and while it runs (see [`super::run_stoppable`]).
     pub fn run_bound(&self, request: BoundRunRequest) {
+        use super::Stoppable;
+        use super::explain::cancel;
         let send = self.send();
+        let generated = crate::sqlgen::related_query(request.ds.driver, &request.query);
+        let sql = generated.as_ref().map_or_else(|_| String::new(), |query| query.sql.clone());
+        let console_id = request.console_id;
+        let page = request.page;
+        let finish = move |sql: String, result: anyhow::Result<QueryResult>, in_tx: bool| {
+            send(Event::StatementDone { console_id, sql, page, result: result.map_err(fmt_err) });
+            send(Event::RunFinished { console_id, in_tx });
+        };
+        let Some((registration, token)) = cancel::Registry::register(&self.query_requests, &request.ds.id, console_id, 0) else {
+            finish(sql, Err(anyhow::anyhow!("Another operation is running in this console.")), false);
+            return;
+        };
         let source = request
             .source_guard
             .as_ref()
             .map(|guard| self.session(&request.ds.id, &guard.console_id.to_string()));
-        let session = self.session(&request.ds.id, &request.console_id.to_string());
+        let session = self.session(&request.ds.id, &console_id.to_string());
         let cancels = self.cancels.clone();
         self.rt.spawn(async move {
-            let generated = crate::sqlgen::related_query(request.ds.driver, &request.query);
-            let sql = generated.as_ref().map_or_else(|_| String::new(), |query| query.sql.clone());
+            let _registration = registration;
+            let stopped = || anyhow::anyhow!("Stopped.");
             // The original and destination mutexes are never held together.
             let source_check = async {
                 validate_source(&request.ds, &request.query)?;
                 if let (Some(source), Some(guard)) = (source, request.source_guard.as_ref()) {
-                    let mut state = source.lock().await;
-                    state.validate_result_session(&request.ds, &request.query.source_identity, guard.session_epoch)?;
-                    let conn = state.conn.as_mut().unwrap();
-                    ensure_source_context(conn, &request.query.context).await?;
-                    validate_relation(conn, &request.query).await?;
+                    let mut state = cancel::lock(&token, &source).await.ok_or_else(stopped)?;
+                    let check = async {
+                        state.validate_result_session(&request.ds, &request.query.source_identity, guard.session_epoch)?;
+                        let conn = state.conn.as_mut().unwrap();
+                        ensure_source_context(conn, &request.query.context).await?;
+                        validate_relation(conn, &request.query).await
+                    };
+                    match super::run_stoppable(&token, check, guard.console_id, &cancels).await {
+                        Stoppable::Done(result) => result?,
+                        Stoppable::Cancelled(_) | Stoppable::Abandoned => {
+                            state.close_after_stop();
+                            return Err(anyhow::anyhow!("Stopped. The source console's session was closed."));
+                        }
+                    }
                 }
                 anyhow::Ok(())
             }.await;
-            let mut state = session.lock().await;
-            let result = async {
+            let Some(mut state) = cancel::lock(&token, &session).await else {
+                finish(sql, Err(stopped()), false);
+                return;
+            };
+            let read = async {
                 source_check?;
                 let query = generated.map_err(anyhow::Error::msg)?;
                 let fresh = state.conn.is_none();
                 let conn = state.conn(&request.ds).await?;
-                if let Some(handle) = conn.cancel_handle() { cancels.lock().unwrap().insert(request.console_id, handle); }
+                if let Some(handle) = conn.cancel_handle() { cancels.lock().unwrap().insert(console_id, handle); }
                 if fresh { conn.apply_resolved_context(&request.query.context).await?; }
                 anyhow::ensure!(conn.resolved_context().await? == request.query.context,
                     "The related query's database context has changed. Reopen Related Rows from its source.");
@@ -101,14 +129,21 @@ impl Backend {
                 let data = conn.execute_bound_query(&paged, window, Some(&request.query.context)).await?;
                 validate_output(&data, &request.query)?;
                 anyhow::Ok(data)
-            }.await;
+            };
+            let result = match super::run_stoppable(&token, read, console_id, &cancels).await {
+                Stoppable::Done(result) => result,
+                Stoppable::Cancelled(_) | Stoppable::Abandoned => {
+                    state.close_after_stop();
+                    Err(anyhow::anyhow!("Stopped. The session was closed."))
+                }
+            };
             if result.is_err() {
                 state.related_metadata.clear();
                 state.edit_metadata.clear();
             }
-            cancels.lock().unwrap().remove(&request.console_id);
-            send(Event::StatementDone { console_id: request.console_id, sql, page: request.page, result: result.map_err(fmt_err) });
-            send(Event::RunFinished { console_id: request.console_id, in_tx: state.in_tx });
+            cancels.lock().unwrap().remove(&console_id);
+            let in_tx = state.in_tx;
+            finish(sql, result, in_tx);
         });
     }
 

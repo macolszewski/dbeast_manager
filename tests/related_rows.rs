@@ -1539,3 +1539,58 @@ fn postgres_related_export_error_after_batches_keeps_previous_file() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no partial file is left");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Stop, and closing the console, end a related read that waits for a
+/// table lock; the console reads again afterwards.
+#[test]
+fn postgres_stop_ends_a_related_read_waiting_for_a_lock() {
+    let Some(ds) = server(DriverKind::Postgres) else { return };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let backend = Backend::new(egui::Context::default());
+    let tables = create_paging_tables(&runtime, &ds, 10);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let captured = children_capture(&backend, &ds, &tables.parent);
+        for close in [false, true] {
+            backend.run(RunRequest {
+                console_id: 703,
+                ds: ds.clone(),
+                statements: vec![format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", tables.child)],
+                page: Page::ALL,
+                manual_tx: true,
+                context: ExecutionContext::default(),
+                expected_context: None,
+            });
+            let (statements, in_tx) = finish(&backend, 703);
+            assert!(statements.iter().all(|(_, result)| result.is_ok()) && in_tx);
+            backend.run_bound(BoundRunRequest {
+                console_id: TARGET,
+                ds: ds.clone(),
+                query: Arc::new(captured.clone()),
+                page: Page::first(500),
+                manual_tx: false,
+                source_guard: None,
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            let started = Instant::now();
+            if close {
+                backend.close_session(&ds.id, TARGET);
+            } else {
+                backend.cancel(TARGET);
+            }
+            let (mut statements, in_tx) = finish(&backend, TARGET);
+            assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+            assert!(!in_tx);
+            let error = statements.remove(0).1.unwrap_err();
+            assert!(error.starts_with("Stopped"), "{error}");
+            query(&backend, 703, &ds, "ROLLBACK");
+        }
+        let page = bound(&backend, &ds, &captured, Page::first(500), None).unwrap();
+        assert_eq!(page.rows.len(), 10);
+    }));
+    backend.close_session(&ds.id, 703);
+    drop(backend);
+    drop_paging_tables(&runtime, &ds, &tables);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

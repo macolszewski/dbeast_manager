@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
-pub(super) const RECOVERY_LIMIT: Duration = Duration::from_secs(5);
+pub(crate) const RECOVERY_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct Token {
@@ -37,7 +37,7 @@ impl Token {
     }
 }
 
-pub(super) async fn lock<'a, T>(
+pub(crate) async fn lock<'a, T>(
     token: &Token,
     mutex: &'a tokio::sync::Mutex<T>,
 ) -> Option<tokio::sync::MutexGuard<'a, T>> {

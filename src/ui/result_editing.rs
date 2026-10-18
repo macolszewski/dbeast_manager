@@ -216,7 +216,7 @@ impl App {
         console_id: u64,
         result_id: u64,
         request_id: u64,
-        in_tx: bool,
+        in_tx: Option<bool>,
         result: Result<MutationReport, MutationFailure>,
     ) {
         let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == console_id) else {
@@ -232,7 +232,9 @@ impl App {
             return;
         }
         tab.running = None;
-        tab.in_tx = in_tx;
+        if let Some(in_tx) = in_tx {
+            tab.in_tx = in_tx;
+        }
         let Some(result_index) = tab
             .results
             .iter()
@@ -255,7 +257,7 @@ impl App {
                         )
                         && !file.tables.is_empty()
                 });
-                let message = if in_tx {
+                let message = if tab.in_tx {
                     format!(
                         "{} rows changed in the open transaction. Commit to apply them.",
                         report.changed_rows
@@ -441,7 +443,7 @@ mod tests {
             id,
             result_id,
             2,
-            false,
+            Some(false),
             Ok(MutationReport { changed_rows: 1 }),
         );
         assert!(app.tabs[0].is_running());
@@ -449,7 +451,7 @@ mod tests {
             id,
             result_id,
             3,
-            false,
+            Some(false),
             Err(MutationFailure {
                 message: "Connection lost during commit".into(),
                 source_row: None,
