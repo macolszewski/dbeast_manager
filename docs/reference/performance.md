@@ -269,6 +269,20 @@ cargo test --release --test related_rows related_metadata_and_bound_read_latency
 
 SQLite has to scan the catalog on the first lookup of incoming foreign keys. With 500 extra empty tables this took 1.648 ms cold and 0.027 ms cached; with 5,000 tables, 14.902 ms and 0.018 ms. The work runs in the background. MySQL reads narrowed metadata without repeatedly joining `information_schema` views. The relation cache holds up to 256 entries per session and is invalidated after changes or a reconnect.
 
+Related Rows pages are limited on the server (`ORDER BY` key, `LIMIT` page size + 1, `OFFSET`). Previously the whole relation was read and the client skipped rows. Best of 5 runs, release build, 100,000 children of one parent, 500-row page, 18 October 2026, time until the page is decoded:
+
+| Database | First page, whole relation / server window | Page at 50,000 | Page at 99,500 |
+|---|---:|---:|---:|
+| SQLite | 0.123 / 0.154 ms | 3.837 / 5.987 ms | 10.539 / 13.795 ms |
+| PostgreSQL | 21.446 / 14.857 ms | 42.319 / 31.988 ms | 40.433 / 35.796 ms |
+| MySQL | 71.855 / 1.284 ms | 78.535 / 29.857 ms | 76.541 / 59.262 ms |
+
+SQLite already stopped reading after the page, so the sort by key adds a little there. PostgreSQL and MySQL no longer send the rest of the relation over the network; deep pages still cost an `OFFSET` scan on the server.
+
+```sh
+cargo test --release --test related_rows related_paging_cost -- --ignored --nocapture
+```
+
 Preparing Explain for a Related Rows console (validating the saved relation and source identity, generating SQL with two parameters and wrapping it in `EXPLAIN`) took on average **3.407 µs per request** over 100,000 repetitions, CPU only (`benchmark_captured_explain_preparation`, 15 October 2026). The check for local PostgreSQL encoding errors before execution scans the text without copying it: **0.008 µs** for 32 B of text and **54.944 µs** for 1 MB (`benchmark_explain_parameter_preflight`, 10,000 repetitions). This cost is paid once per request and depends on the total length of text keys.
 
 ## Query plans

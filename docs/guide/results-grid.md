@@ -220,6 +220,7 @@ Things to know:
 - All columns of a composite key are used, in catalog order, including foreign keys that reference a UNIQUE constraint. Aliases in the `SELECT` do not affect the mapping.
 - The source result can be read-only and does not need its own primary key, but it must contain the complete, exact values of the chosen relation. `NULL` values, a missing part of the key, or unsubmitted changes are reported as a reason.
 - Foreign keys are read only when you invoke the action, in the background, and cached per session.
+- Each page is limited on the server: the console's SQL is run with `ORDER BY` on the primary key of the shown table (for parent rows without a primary key, the referenced key) and `LIMIT`/`OFFSET` for the page, so later pages neither repeat nor skip rows and the database does not send the rest of the relation.
 - Not supported yet: an open transaction in the source console, temporary tables, SQLite attached and in-memory databases, imported file sources, virtual foreign keys, inline preview, and navigating from several records at once. SQLite foreign keys appear as `FK n`, because SQLite does not return constraint names.
 
 ## Compare Data

@@ -1225,3 +1225,183 @@ fn related_metadata_and_bound_read_latency() {
         benchmark_sqlite_reverse_catalog(tables);
     }
 }
+
+/// Inserts child rows 1..=count for parent 1 in a scrambled physical order.
+fn seed_children_sql(driver: DriverKind, child: &str, count: usize) -> Vec<String> {
+    let scrambled = format!("(n * 7919) % {count} + 1");
+    match driver {
+        DriverKind::Postgres => vec![format!(
+            "INSERT INTO {child} SELECT {scrambled}, 1, repeat('x', 40) FROM generate_series(0, {}) n",
+            count - 1
+        )],
+        DriverKind::MySql => vec![
+            format!("SET SESSION cte_max_recursion_depth = {}", count + 10),
+            format!(
+                "INSERT INTO {child} WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < {}) SELECT {scrambled}, 1, REPEAT('x', 40) FROM s",
+                count - 1
+            ),
+        ],
+        DriverKind::Sqlite => vec![format!(
+            "INSERT INTO {child} WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < {}) SELECT {scrambled}, 1, printf('%.40c', 'x') FROM s",
+            count - 1
+        )],
+    }
+}
+
+struct PagingTables {
+    parent: String,
+    child: String,
+}
+
+fn create_paging_tables(runtime: &tokio::runtime::Runtime, ds: &DataSource, children: usize) -> PagingTables {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let schema = match ds.driver {
+        DriverKind::Postgres => "public",
+        DriverKind::MySql => "dbeast",
+        DriverKind::Sqlite => "main",
+    };
+    let parent_name = format!("rel_page_{}_parent", &suffix[..10]);
+    let parent = sqlgen::qualified(ds.driver, Some(schema), &parent_name);
+    let parent_reference = if ds.driver == DriverKind::Sqlite {
+        sqlgen::ident(ds.driver, &parent_name)
+    } else {
+        parent.clone()
+    };
+    let child = sqlgen::qualified(ds.driver, Some(schema), &format!("rel_page_{}_child", &suffix[..10]));
+    let engine = if ds.driver == DriverKind::MySql { " ENGINE=InnoDB" } else { "" };
+    runtime.block_on(async {
+        let mut conn = Connection::open(ds).await.unwrap();
+        let mut statements = vec![
+            format!("CREATE TABLE {parent}(id INTEGER PRIMARY KEY, label VARCHAR(80)){engine}"),
+            format!("CREATE TABLE {child}(id INTEGER PRIMARY KEY, parent_id INTEGER, note VARCHAR(80), FOREIGN KEY(parent_id) REFERENCES {parent_reference}(id)){engine}"),
+            format!("INSERT INTO {parent} VALUES (1, 'many'), (2, 'none')"),
+        ];
+        statements.extend(seed_children_sql(ds.driver, &child, children));
+        for sql in statements {
+            conn.execute(&sql, Page::ALL).await.unwrap();
+        }
+    });
+    PagingTables { parent, child }
+}
+
+fn drop_paging_tables(runtime: &tokio::runtime::Runtime, ds: &DataSource, tables: &PagingTables) {
+    runtime.block_on(async {
+        let mut conn = Connection::open(ds).await.unwrap();
+        for table in [&tables.child, &tables.parent] {
+            conn.execute(&format!("DROP TABLE IF EXISTS {table}"), Page::ALL).await.unwrap();
+        }
+    });
+}
+
+fn ints(data: &QueryResult, column: &str) -> Vec<i64> {
+    let index = data.columns.iter().position(|c| c.name == column).unwrap();
+    data.rows
+        .iter()
+        .map(|row| match row[index] {
+            Value::Int(value) => value,
+            ref other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+fn exercise_related_paging(ds: DataSource) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let backend = Backend::new(egui::Context::default());
+    let tables = create_paging_tables(&runtime, &ds, 1250);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let parents = query(&backend, SOURCE, &ds, &format!("SELECT id FROM {} ORDER BY id", tables.parent));
+        let keys = metadata(&backend, metadata_request(&ds, &parents, RelatedDirection::Referencing)).unwrap();
+        let many = capture(&ds, &parents, 0, &keys.keys[0], RelatedDirection::Referencing);
+        let none = capture(&ds, &parents, 1, &keys.keys[0], RelatedDirection::Referencing);
+        let mut seen = Vec::new();
+        for (skip, expected, truncated) in [(0, 500, true), (500, 500, true), (1000, 250, false), (1250, 0, false)] {
+            let page = bound(&backend, &ds, &many, Page { skip, limit: 500 }, None).unwrap();
+            let ids = ints(&page, "id");
+            assert_eq!((ids.len(), page.truncated), (expected, truncated), "page at {skip}");
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "pages follow the child key");
+            seen.extend(ids);
+        }
+        assert_eq!(seen, (1..=1250).collect::<Vec<_>>(), "no row is repeated or skipped");
+        let empty = bound(&backend, &ds, &none, Page::first(500), None).unwrap();
+        assert_eq!((empty.rows.len(), empty.truncated), (0, false));
+        assert_eq!(empty.columns.len(), 3, "an empty page keeps its columns");
+        // The referenced side has a single row and the same server-side window.
+        let children = query(&backend, SOURCE, &ds, &format!("SELECT parent_id FROM {} WHERE id = 7", tables.child));
+        let outgoing = metadata(&backend, metadata_request(&ds, &children, RelatedDirection::Referenced)).unwrap();
+        let outgoing = capture(&ds, &children, 0, &outgoing.keys[0], RelatedDirection::Referenced);
+        let parent = bound(&backend, &ds, &outgoing, Page::first(500), Some(&children)).unwrap();
+        assert_eq!((ints(&parent, "id"), parent.truncated), (vec![1], false));
+        let beyond = bound(&backend, &ds, &outgoing, Page { skip: 1, limit: 500 }, None).unwrap();
+        assert!(beyond.rows.is_empty());
+    }));
+    drop(backend);
+    drop_paging_tables(&runtime, &ds, &tables);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn sqlite_related_pages_are_limited_on_the_server_in_key_order() {
+    let local = LocalDatabase::new();
+    exercise_related_paging(local.source.clone());
+}
+
+#[test]
+fn postgres_related_pages_are_limited_on_the_server_in_key_order() {
+    if let Some(ds) = server(DriverKind::Postgres) {
+        exercise_related_paging(ds);
+    }
+}
+
+#[test]
+fn mysql_related_pages_are_limited_on_the_server_in_key_order() {
+    if let Some(ds) = server(DriverKind::MySql) {
+        exercise_related_paging(ds);
+    }
+}
+
+/// Time until a related page is decoded, for the old shape (the whole
+/// relation read, the client skipping rows) and for the server window.
+#[test]
+#[ignore = "manual release measurement: cargo test --release --test related_rows related_paging_cost -- --ignored --nocapture"]
+fn related_paging_cost() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let local = LocalDatabase::new();
+    let mut sources = vec![local.source.clone()];
+    sources.extend([DriverKind::Postgres, DriverKind::MySql].into_iter().filter_map(server));
+    for ds in sources {
+        let tables = create_paging_tables(&runtime, &ds, 100_000);
+        let backend = Backend::new(egui::Context::default());
+        let parents = query(&backend, SOURCE, &ds, &format!("SELECT id FROM {} ORDER BY id", tables.parent));
+        let keys = metadata(&backend, metadata_request(&ds, &parents, RelatedDirection::Referencing)).unwrap();
+        let captured = capture(&ds, &parents, 0, &keys.keys[0], RelatedDirection::Referencing);
+        drop(backend);
+        runtime.block_on(async {
+            let mut conn = Connection::open(&ds).await.unwrap();
+            conn.apply_resolved_context(&captured.context).await.unwrap();
+            let base = sqlgen::related_query(ds.driver, &captured).unwrap();
+            for skip in [0, 50_000, 99_500] {
+                let window = Page { skip, limit: 500 };
+                let mut best = [Duration::MAX; 2];
+                for _ in 0..5 {
+                    let started = Instant::now();
+                    let old = conn.execute_bound_query(&base, window, None).await.unwrap();
+                    best[0] = best[0].min(started.elapsed());
+                    let (paged, page) = sqlgen::related_page(ds.driver, captured.direction, &base, &["id".into()], window);
+                    let started = Instant::now();
+                    let new = conn.execute_bound_query(&paged, page, None).await.unwrap();
+                    best[1] = best[1].min(started.elapsed());
+                    assert_eq!(old.rows.len(), new.rows.len());
+                }
+                println!(
+                    "related_paging driver={:?} children=100000 skip={skip} limit=500 whole_relation_ms={:.3} server_window_ms={:.3}",
+                    ds.driver,
+                    best[0].as_secs_f64() * 1000.0,
+                    best[1].as_secs_f64() * 1000.0
+                );
+            }
+        });
+        drop_paging_tables(&runtime, &ds, &tables);
+    }
+}

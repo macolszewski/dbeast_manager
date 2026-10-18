@@ -95,7 +95,10 @@ impl Backend {
                     state.conn.as_mut().unwrap().execute_control(begin_statement(request.ds.driver)).await?;
                     state.in_tx = true;
                 }
-                let data = state.conn.as_mut().unwrap().execute_bound_query(&query, request.page, Some(&request.query.context)).await?;
+                let conn = state.conn.as_mut().unwrap();
+                let keys = order_keys(conn, &request.query).await?;
+                let (paged, window) = crate::sqlgen::related_page(request.ds.driver, request.query.direction, &query, &keys, request.page);
+                let data = conn.execute_bound_query(&paged, window, Some(&request.query.context)).await?;
                 validate_output(&data, &request.query)?;
                 anyhow::Ok(data)
             }.await;
@@ -198,6 +201,28 @@ async fn ensure_source_context(
         "Commit or roll back the source transaction before opening Related Rows."
     );
     Ok(())
+}
+
+/// Columns that give related pages a stable order: the output table's primary
+/// key, else the referenced key, which is unique. Read fresh for every page.
+async fn order_keys(
+    conn: &mut Connection,
+    query: &CapturedRelatedQuery,
+) -> anyhow::Result<Vec<String>> {
+    let table = match query.direction {
+        RelatedDirection::Referenced => &query.relation.target,
+        RelatedDirection::Referencing => &query.relation.source,
+    };
+    let keys = conn.primary_key(Some(&table.schema), &table.name).await?;
+    if keys.is_empty() && query.direction == RelatedDirection::Referenced {
+        return Ok(query
+            .relation
+            .columns
+            .iter()
+            .map(|pair| pair.target_name.clone())
+            .collect());
+    }
+    Ok(keys)
 }
 
 async fn validate_relation(

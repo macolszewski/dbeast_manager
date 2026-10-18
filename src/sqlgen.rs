@@ -58,6 +58,42 @@ pub fn related_query(
     Ok(crate::model::BoundQuery { sql, params })
 }
 
+/// Limits a related query to one page on the server. `keys` order the output
+/// table so consecutive pages neither repeat nor skip rows; the extra row in
+/// LIMIT tells whether another page exists. Returns the window to read from
+/// the limited result. Only SQL built by [`related_query`] is rewritten.
+pub fn related_page(
+    driver: DriverKind,
+    direction: crate::model::RelatedDirection,
+    query: &crate::model::BoundQuery,
+    keys: &[String],
+    page: crate::model::Page,
+) -> (crate::model::BoundQuery, crate::model::Page) {
+    if page.limit == usize::MAX {
+        return (query.clone(), page);
+    }
+    let alias = match direction {
+        crate::model::RelatedDirection::Referenced => "p",
+        crate::model::RelatedDirection::Referencing => "c",
+    };
+    let mut sql = query.sql.clone();
+    if !keys.is_empty() {
+        let keys: Vec<String> = keys
+            .iter()
+            .map(|key| format!("{alias}.{}", ident(driver, key)))
+            .collect();
+        sql.push_str(&format!(" ORDER BY {}", keys.join(", ")));
+    }
+    sql.push_str(&format!(" LIMIT {} OFFSET {}", page.limit.saturating_add(1), page.skip));
+    (
+        crate::model::BoundQuery {
+            sql,
+            params: query.params.clone(),
+        },
+        crate::model::Page::first(page.limit),
+    )
+}
+
 /// Compile one parameterized UPDATE per changed row. Output aliases never
 /// become SQL identifiers, and WHERE always uses the original primary key.
 pub fn bound_updates(
@@ -367,6 +403,44 @@ mod tests {
                 type_name: String::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn related_pages_are_ordered_and_limited_on_the_server() {
+        use crate::model::{BoundQuery, Page, RelatedDirection};
+        let query = BoundQuery {
+            sql: "SELECT c.* FROM t AS c WHERE EXISTS (SELECT 1)".into(),
+            params: vec![Value::Int(7)],
+        };
+        let (paged, window) = related_page(
+            DriverKind::MySql,
+            RelatedDirection::Referencing,
+            &query,
+            &["id".into(), "a`b".into()],
+            Page { skip: 1000, limit: 500 },
+        );
+        assert_eq!(
+            paged.sql,
+            "SELECT c.* FROM t AS c WHERE EXISTS (SELECT 1) ORDER BY c.`id`, c.`a``b` LIMIT 501 OFFSET 1000"
+        );
+        assert_eq!(paged.params, query.params);
+        assert_eq!(window, Page::first(500), "the server skips, the client does not");
+        let (paged, _) = related_page(
+            DriverKind::Postgres,
+            RelatedDirection::Referenced,
+            &query,
+            &[],
+            Page::first(10),
+        );
+        assert!(paged.sql.ends_with("(SELECT 1) LIMIT 11 OFFSET 0"));
+        let (all, window) = related_page(
+            DriverKind::Sqlite,
+            RelatedDirection::Referenced,
+            &query,
+            &["id".into()],
+            Page::ALL,
+        );
+        assert_eq!((all.sql, window), (query.sql.clone(), Page::ALL));
     }
 
     #[test]
