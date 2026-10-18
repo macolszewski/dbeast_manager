@@ -5,12 +5,29 @@
 use super::{App, theme, transfers::TransferKind};
 use crate::backend::{ExportItem, ExportJob, PREVIEW_ROWS};
 use crate::export::{ExportFormat, ExportOptions, LineEnding, Quote, TableName, Writer};
-use crate::model::{BoundQuery, CapturedRelatedQuery, DataSource, DbObject, DriverKind, ObjectKind, QueryResult, ResolvedContext};
+use crate::model::{BoundQuery, CapturedRelatedQuery, DataSource, DbObject, DriverKind, ObjectKind, QueryResult, ResolvedContext, Value};
 use egui::{Context, Id, RichText, Ui};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const LABEL_WIDTH: f32 = 112.0;
+/// Characters of a text or decimal value the preview writes; the export
+/// writes values whole.
+const PREVIEW_VALUE_CHARS: usize = 256;
+/// Bytes of a binary value the preview writes.
+const PREVIEW_VALUE_BYTES: usize = 128;
+/// Output the preview keeps; the rows that would not fit are left out.
+const PREVIEW_BYTES: usize = 64 << 10;
+
+/// The preview as written with some options, ready to draw line by line.
+struct PreviewText {
+    options: ExportOptions,
+    text: String,
+    /// Byte offset of each line.
+    lines: Vec<usize>,
+    /// What the preview shortened or left out, shown above it.
+    note: Option<String>,
+}
 
 pub(super) enum ExportSource {
     /// A console or table result: its query runs again without a row limit.
@@ -59,7 +76,7 @@ pub(super) struct ExportDialog {
     /// Table whose rows the preview shows (schema exports).
     preview_table: Option<String>,
     /// Rendered preview and the options it was rendered with.
-    preview_text: Option<(ExportOptions, String)>,
+    preview_text: Option<PreviewText>,
 }
 
 impl ExportDialog {
@@ -106,9 +123,9 @@ impl ExportDialog {
         None
     }
 
-    fn preview_text(&mut self) -> Option<&str> {
+    fn preview_text(&mut self) -> Option<&PreviewText> {
         let data = self.preview.as_ref()?;
-        let stale = self.preview_text.as_ref().is_none_or(|(options, _)| *options != self.options);
+        let stale = self.preview_text.as_ref().is_none_or(|preview| preview.options != self.options);
         if stale {
             let driver = match &self.source {
                 ExportSource::Result { ds, .. } | ExportSource::Table { ds, .. } | ExportSource::Schema { ds, .. } => ds.driver,
@@ -124,16 +141,9 @@ impl ExportDialog {
                     .or_else(|| self.single_name().map(str::to_string))
                     .unwrap_or_default(),
             };
-            let mut writer = Writer::new(Vec::new(), self.options.clone(), driver, table);
-            // Writing to memory cannot fail.
-            writer.begin(&data.columns).expect("in-memory write");
-            for row in data.rows.iter().take(PREVIEW_ROWS) {
-                writer.row(row).expect("in-memory write");
-            }
-            let text = String::from_utf8_lossy(&writer.finish().expect("in-memory write")).into_owned();
-            self.preview_text = Some((self.options.clone(), text));
+            self.preview_text = Some(render_preview(data, &self.options, driver, table));
         }
-        self.preview_text.as_ref().map(|(_, text)| text.as_str())
+        self.preview_text.as_ref()
     }
 
     /// Keeps the file extension in step with the chosen format.
@@ -316,7 +326,13 @@ impl App {
             return false;
         };
         match result {
-            Ok(data) => {
+            Ok(mut data) => {
+                // Only the preview reads these rows, so their long values go now.
+                for value in data.rows.iter_mut().flatten() {
+                    if let Some(short) = preview_value(value) {
+                        *value = short;
+                    }
+                }
                 dialog.preview = Some(Arc::new(data));
                 dialog.preview_error = None;
             }
@@ -621,11 +637,79 @@ fn table_list(ui: &mut Ui, dialog: &mut ExportDialog) {
     }
 }
 
+/// A shortened copy of a value too long for the preview, or `None` to write it
+/// as it is. Only the preview uses these; the export writes the full value.
+fn preview_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Text(text) | Value::Decimal(text) => {
+            let (end, _) = text.char_indices().nth(PREVIEW_VALUE_CHARS)?;
+            let short = format!("{}…", &text[..end]);
+            Some(if matches!(value, Value::Text(_)) { Value::Text(short) } else { Value::Decimal(short) })
+        }
+        Value::Bytes(bytes) if bytes.len() > PREVIEW_VALUE_BYTES => Some(Value::Bytes(bytes[..PREVIEW_VALUE_BYTES].to_vec())),
+        _ => None,
+    }
+}
+
+/// Writes the first rows with long values shortened, up to [`PREVIEW_BYTES`].
+fn render_preview(data: &QueryResult, options: &ExportOptions, driver: DriverKind, table: TableName) -> PreviewText {
+    let mut shortened = false;
+    let mut left_out = 0;
+    let mut size = 0;
+    let mut rows = Vec::new();
+    for row in data.rows.iter().take(PREVIEW_ROWS) {
+        if size >= PREVIEW_BYTES {
+            left_out += 1;
+            continue;
+        }
+        let row: Vec<Value> = row
+            .iter()
+            .map(|value| match preview_value(value) {
+                Some(short) => {
+                    shortened = true;
+                    short
+                }
+                None => value.clone(),
+            })
+            .collect();
+        size += row.iter().map(|value| crate::model::row_bytes(std::slice::from_ref(value))).sum::<usize>();
+        rows.push(row);
+    }
+    let mut writer = Writer::new(Vec::new(), options.clone(), driver, table);
+    // Writing to memory cannot fail.
+    writer.begin(&data.columns).expect("in-memory write");
+    writer.rows(&rows).expect("in-memory write");
+    let text = String::from_utf8_lossy(&writer.finish().expect("in-memory write")).into_owned();
+    let lines = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1).filter(|&at| at < text.len()))
+        .collect();
+    let mut notes = Vec::new();
+    if shortened {
+        notes.push(format!(
+            "Values longer than {PREVIEW_VALUE_CHARS} characters or {PREVIEW_VALUE_BYTES} bytes are shortened here; the export writes them whole."
+        ));
+    }
+    if left_out > 0 {
+        notes.push(format!("{left_out} more rows are left out of the preview to keep it small."));
+    }
+    PreviewText {
+        options: options.clone(),
+        text,
+        lines,
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+    }
+}
+
 fn preview(ui: &mut Ui, dialog: &mut ExportDialog) {
     ui.label(RichText::new("Preview").font(theme::semibold(13.0)));
     ui.add_space(4.0);
     let error = dialog.preview_error.clone();
-    let text = dialog.preview_text().map(str::to_string);
+    let schema = matches!(dialog.source, ExportSource::Schema { .. });
+    let text = dialog.preview_text();
+    if let Some(note) = text.and_then(|text| text.note.as_deref()) {
+        ui.label(RichText::new(note).small().color(theme::TEXT_MUTED));
+        ui.add_space(2.0);
+    }
     egui::Frame::new()
         .fill(theme::BG_EDITOR)
         .corner_radius(4)
@@ -633,18 +717,26 @@ fn preview(ui: &mut Ui, dialog: &mut ExportDialog) {
         .show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             match (text, error) {
-                (Some(text), _) => {
+                (Some(preview), _) => {
+                    // Only the lines in view are laid out.
+                    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
                     egui::ScrollArea::both()
                         .id_salt("export_preview")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(text).monospace()).extend());
+                        .show_rows(ui, row_height, preview.lines.len(), |ui, range| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for line in range {
+                                let start = preview.lines[line];
+                                let end = preview.lines.get(line + 1).map_or(preview.text.len(), |&next| next - 1);
+                                let text = preview.text[start..end].trim_end_matches('\r');
+                                ui.add(egui::Label::new(RichText::new(text).monospace()).extend());
+                            }
                         });
                 }
                 (None, Some(error)) => {
                     ui.label(RichText::new(error).color(theme::RED));
                 }
-                (None, None) if matches!(dialog.source, ExportSource::Schema { .. }) => {
+                (None, None) if schema => {
                     theme::empty_text(ui, "Each chosen table is written to its own file");
                 }
                 (None, None) => {
@@ -666,5 +758,102 @@ mod tests {
         assert_eq!(file_stem("orders"), "orders");
         assert_eq!(file_stem("a/b:c*?"), "a_b_c__");
         assert_eq!(file_stem("   "), "export");
+    }
+
+    fn wide_result() -> QueryResult {
+        let json = format!("{{\"items\": [{}]}}", vec!["{\"żółć\": 1}"; 500_000].join(","));
+        QueryResult {
+            columns: ["id", "doc", "blob"]
+                .map(|name| crate::model::Column {
+                    name: name.into(),
+                    type_name: "text".into(),
+                })
+                .into(),
+            rows: (0..10)
+                .map(|i| vec![Value::Int(i), Value::Text(json.clone()), Value::Bytes(vec![7; 4 << 20])])
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preview_shortens_large_values_and_says_so_in_every_format() {
+        let data = wide_result();
+        for format in [ExportFormat::Csv, ExportFormat::Json, ExportFormat::SqlInsert, ExportFormat::Markdown] {
+            let options = ExportOptions {
+                format,
+                ..ExportOptions::default()
+            };
+            let table = TableName {
+                schema: None,
+                table: "t".into(),
+            };
+            let preview = render_preview(&data, &options, DriverKind::Postgres, table);
+            assert!(preview.text.len() < PREVIEW_BYTES, "{format:?}: {} bytes", preview.text.len());
+            assert!(preview.note.as_deref().is_some_and(|note| note.contains("export writes them whole")));
+            assert!(preview.text.contains('…'));
+            // Line offsets cover the text exactly.
+            assert_eq!(preview.lines[0], 0);
+            assert!(preview.lines.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        // The data the export reads is not changed by the preview.
+        assert_eq!(data.rows[0][1].to_string().len(), wide_result().rows[0][1].to_string().len());
+    }
+
+    #[test]
+    fn preview_leaves_out_rows_beyond_its_budget() {
+        let text = "x".repeat(PREVIEW_VALUE_CHARS);
+        let data = QueryResult {
+            columns: (0..200)
+                .map(|c| crate::model::Column {
+                    name: format!("c{c}"),
+                    type_name: "text".into(),
+                })
+                .collect(),
+            rows: (0..10).map(|_| vec![Value::Text(text.clone()); 200]).collect(),
+            ..Default::default()
+        };
+        let table = TableName {
+            schema: None,
+            table: "t".into(),
+        };
+        let preview = render_preview(&data, &ExportOptions::default(), DriverKind::Sqlite, table);
+        assert!(preview.text.len() < 2 * PREVIEW_BYTES);
+        assert!(preview.note.as_deref().is_some_and(|note| note.contains("more rows are left out")));
+    }
+
+    #[test]
+    #[ignore = "release benchmark: cargo test --release --lib export_preview_cost -- --ignored --nocapture"]
+    fn export_preview_cost_benchmark() {
+        let data = wide_result();
+        let table = || TableName {
+            schema: None,
+            table: "t".into(),
+        };
+        let options = ExportOptions {
+            format: ExportFormat::Json,
+            ..ExportOptions::default()
+        };
+        // The preview before: every row written whole, then copied each frame.
+        let start = std::time::Instant::now();
+        let mut writer = Writer::new(Vec::new(), options.clone(), DriverKind::Postgres, table());
+        writer.begin(&data.columns).unwrap();
+        for row in data.rows.iter().take(PREVIEW_ROWS) {
+            writer.row(row).unwrap();
+        }
+        let full = String::from_utf8_lossy(&writer.finish().unwrap()).into_owned();
+        let build_before = start.elapsed();
+        let start = std::time::Instant::now();
+        let frame_copy = full.to_string();
+        let frame_before = start.elapsed();
+        drop(frame_copy);
+        let start = std::time::Instant::now();
+        let preview = render_preview(&data, &options, DriverKind::Postgres, table());
+        let build_after = start.elapsed();
+        println!(
+            "JSON preview of 10 rows with 7 MB text and 4 MB binary cells: before build {build_before:?}, {} bytes, copied every frame in {frame_before:?}; after build {build_after:?}, {} bytes, no copy per frame",
+            full.len(),
+            preview.text.len()
+        );
     }
 }

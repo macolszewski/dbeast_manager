@@ -13,6 +13,11 @@ use std::path::Path;
 const SNIFF_BYTES: usize = 64 * 1024;
 /// Records whose values decide the inferred column types.
 pub const SAMPLE_ROWS: usize = 1000;
+/// Bytes of the file the preview reads at most, so one huge field or many
+/// wide records cannot make the preview read the whole file into memory.
+const SAMPLE_BYTES: u64 = 8 << 20;
+/// Characters of a field shown in the preview grid; the import reads it whole.
+pub const PREVIEW_FIELD_CHARS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -183,6 +188,33 @@ pub struct CsvPreview {
     /// The separator found in the file when the dialog asked for detection.
     pub detected_delimiter: Option<u8>,
     pub file_size: u64,
+    /// The sample stopped at [`SAMPLE_BYTES`]: types come from fewer records.
+    pub sample_cut: bool,
+    /// Some shown fields are cut to [`PREVIEW_FIELD_CHARS`].
+    pub shortened: bool,
+}
+
+/// Reads at most `left` bytes and notes whether the input went on.
+struct Limited<R> {
+    inner: R,
+    left: u64,
+    cut: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<R: Read> Read for Limited<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            if !self.cut.get() && !buf.is_empty() {
+                let mut probe = [0u8; 1];
+                self.cut.set(self.inner.read(&mut probe)? > 0);
+            }
+            return Ok(0);
+        }
+        let len = buf.len().min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..len])?;
+        self.left -= n as u64;
+        Ok(n)
+    }
 }
 
 /// Reads the start of a file for the Import dialog. With `detect`, the
@@ -200,7 +232,13 @@ pub fn preview(path: &Path, options: &CsvOptions, detect: bool, rows: usize) -> 
         options.delimiter = delimiter;
         detected = Some(delimiter);
     }
-    let mut reader = Records::open(path, &options)?;
+    let cut = std::rc::Rc::new(std::cell::Cell::new(false));
+    let limited = Limited {
+        inner: std::fs::File::open(path).with_context(|| path.display().to_string())?,
+        left: SAMPLE_BYTES,
+        cut: cut.clone(),
+    };
+    let mut reader = Records::from_reader(std::io::BufReader::new(limited), &options)?;
     let columns = reader.columns.clone();
     let mut sample: Vec<Vec<String>> = Vec::new();
     while sample.len() < SAMPLE_ROWS.max(rows) {
@@ -208,6 +246,11 @@ pub fn preview(path: &Path, options: &CsvOptions, detect: bool, rows: usize) -> 
             Some(fields) => sample.push(fields),
             None => break,
         }
+    }
+    let sample_cut = cut.get();
+    if sample_cut && sample.len() < SAMPLE_ROWS.max(rows) {
+        // The read stopped at the limit, inside the last record at the latest.
+        sample.pop();
     }
     let width = sample.iter().map(Vec::len).max().unwrap_or(0).max(columns.len());
     let mut columns = columns;
@@ -226,12 +269,24 @@ pub fn preview(path: &Path, options: &CsvOptions, detect: bool, rows: usize) -> 
         })
         .collect();
     sample.truncate(rows);
+    let mut shortened = false;
+    for field in sample.iter_mut().flatten() {
+        if let Some((end, _)) = field.char_indices().nth(PREVIEW_FIELD_CHARS) {
+            let mut short = String::with_capacity(end + 3);
+            short.push_str(&field[..end]);
+            short.push('…');
+            *field = short;
+            shortened = true;
+        }
+    }
     Ok(CsvPreview {
         columns,
         types,
         rows: sample,
         detected_delimiter: detected,
         file_size,
+        sample_cut,
+        shortened,
     })
 }
 
@@ -264,8 +319,8 @@ pub fn column_names(header: &[String]) -> Vec<String> {
 
 /// Streaming reader of a CSV file: skips leading lines and the header and
 /// reports the byte position for progress.
-pub struct Records {
-    reader: csv::Reader<std::io::BufReader<std::fs::File>>,
+pub struct Records<R = std::io::BufReader<std::fs::File>> {
+    reader: csv::Reader<R>,
     record: csv::StringRecord,
     pub columns: Vec<String>,
     /// Line in the file of the record returned last, for error messages.
@@ -274,7 +329,15 @@ pub struct Records {
 
 impl Records {
     pub fn open(path: &Path, options: &CsvOptions) -> Result<Self> {
-        let mut file = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+        Self::from_reader(
+            std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?),
+            options,
+        )
+    }
+}
+
+impl<R: std::io::BufRead> Records<R> {
+    fn from_reader(mut file: R, options: &CsvOptions) -> Result<Self> {
         let mut skipped = 0u64;
         for _ in 0..options.skip_lines {
             let mut line = Vec::new();
@@ -410,5 +473,52 @@ mod tests {
         assert_eq!(options.value("\\N"), None);
         assert_eq!(options.value(""), Some(String::new()));
         assert_eq!(CsvOptions::default().value(""), None);
+    }
+
+    #[test]
+    fn preview_reads_a_bounded_sample_and_shortens_shown_fields() {
+        // One field far larger than the sample: the preview reads 8 MiB of it
+        // and drops the record it could not finish.
+        let huge = "x".repeat((SAMPLE_BYTES as usize) * 2);
+        let text = format!("id,doc\n1,short\n2,\"{huge}\"\n3,after\n");
+        let path = temp_file("huge_field.csv", &text);
+        let options = CsvOptions::default();
+        let first = preview(&path, &options, false, 50).unwrap();
+        assert!(first.sample_cut);
+        assert_eq!(first.rows, [["1", "short"]]);
+        assert_eq!(first.types[0], InferredType::Integer);
+
+        // Long fields within the sample are shown shortened, Unicode intact.
+        let long = "żółć 😀 ".repeat(100);
+        let text = format!("id,note\n1,\"{long}\"\n2,\"a\nb\"\n");
+        let path = temp_file("long_field.csv", &text);
+        let second = preview(&path, &options, false, 50).unwrap();
+        assert!(!second.sample_cut);
+        assert!(second.shortened);
+        let shown = &second.rows[0][1];
+        assert_eq!(shown.chars().count(), PREVIEW_FIELD_CHARS + 1);
+        assert!(shown.ends_with('…') && long.starts_with(shown.trim_end_matches('…')));
+        assert_eq!(second.rows[1][1], "a\nb");
+
+        // The import itself still reads the whole field.
+        let mut records = Records::open(&path, &options).unwrap();
+        assert_eq!(records.next_fields().unwrap().unwrap()[1], long);
+    }
+
+    #[test]
+    #[ignore = "release benchmark: cargo test --release --lib import_preview_cost -- --ignored --nocapture"]
+    fn import_preview_cost_benchmark() {
+        let huge = "y".repeat(200 << 20);
+        let path = temp_file("huge.csv", &format!("id,doc\n1,a\n2,\"{huge}\"\n"));
+        drop(huge);
+        let start = std::time::Instant::now();
+        let preview = preview(&path, &CsvOptions::default(), true, 50).unwrap();
+        println!(
+            "import preview of a 200 MiB field: {:?}, {} records kept, sample cut: {}",
+            start.elapsed(),
+            preview.rows.len(),
+            preview.sample_cut
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

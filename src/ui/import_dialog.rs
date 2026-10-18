@@ -596,6 +596,23 @@ fn columns_and_preview(ui: &mut Ui, dialog: &mut ImportDialog) {
                 .small()
                 .color(theme::TEXT_MUTED),
         );
+        if preview.shortened {
+            ui.label(
+                RichText::new(format!(
+                    "· values longer than {} characters are shortened here; the import reads them whole",
+                    crate::import::PREVIEW_FIELD_CHARS
+                ))
+                .small()
+                .color(theme::TEXT_MUTED),
+            );
+        }
+        if preview.sample_cut {
+            ui.label(
+                RichText::new("· column types are detected from the first 8 MiB of the file")
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            );
+        }
     });
     ui.add_space(4.0);
     preview_grid(ui, &preview);

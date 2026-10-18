@@ -36,7 +36,7 @@ Depending on the format, the dialog offers:
 - **Rows per statement:** for SQL Inserts,
 - **Qualify table name with schema**.
 
-Choose the target **File:** or, for several tables, the **Folder:**. The **Preview** pane shows the first rows in the selected format. For a schema export, pick the tables with **Select All** and **Select None**. Settings and the last folder are remembered.
+Choose the target **File:** or, for several tables, the **Folder:**. The **Preview** pane shows the first rows in the selected format. Values longer than 256 characters (128 bytes for binary values) are shortened there, and rows beyond 64 KiB of preview are left out; a note above the preview says so. The export itself writes every value whole. For a schema export, pick the tables with **Select All** and **Select None**. Settings and the last folder are remembered.
 
 A grid result is executed again without the page limit, so the file contains the whole result and not only the fetched page. To copy only the fetched page to the clipboard in the same formats, use **Export ▸ Copy as …** in the grid.
 
@@ -66,7 +66,7 @@ For CSV and TSV files you can set:
 - **First row is header**,
 - **Trim whitespace**.
 
-The **Preview** shows the first records of the file.
+The **Preview** shows the first records of the file, with values longer than 256 characters shortened. Column types are detected from the first 1,000 records, read from at most the first 8 MiB of the file; a note says when that limit was reached. The import itself reads every value whole.
 
 ### Target
 
