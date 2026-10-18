@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-18
+
+### Changed
+
+- The work session keeps the rows of saved results in a `session-results`
+  folder next to `session.json`, one file per result, written once in the
+  background. The session is read in the background on start. Sessions saved
+  by earlier versions are still restored.
+- Result pages also end at 64 MB of decoded values; the range label then shows
+  "(64 MB page limit)" and the next page continues after the rows kept.
+  Export and import batches are bounded by bytes as well as rows.
+- Grid columns are resized by dragging the right edge of a header;
+  double-click restores the automatic width.
+- Sorting compares decimals exactly and puts `NaN` after all other numbers.
+- The Output log keeps the last 10,000 messages of a console, up to 8 MiB
+  (64 KiB of one message), says how many earlier messages were removed and no
+  longer wraps long lines.
+- Stop ends Submit and Related Rows reads between statements; a Stop that had
+  to cancel a running statement closes the session. Submit or Related Rows in a
+  console that is busy is refused with a message instead of waiting.
+- The value panel prepares a value once, large values in the background, and
+  lays out only the visible lines and JSON tree rows.
+- Grid cells draw at most 1024 characters, and wide results and Transpose
+  build only the columns in view.
+- Opening a CSV file streams it into the temporary database instead of reading
+  it into memory.
+- Map tile textures are limited to 64 MiB; the Geo Viewer prepares geometries
+  in the background and draws only features in view.
+- Related Rows pages are limited on the server, and their export streams to
+  disk in batches.
+- PostgreSQL table pages no longer open a cancel connection; PostgreSQL Submit
+  sends up to 32 updates before reading their results, and SQLite runs a whole
+  Submit in one task.
+- Local value filters no longer copy the column's values into their list.
+
+### Fixed
+
+- A slow or unreachable SSH server no longer blocks other data sources from
+  opening or reusing their tunnels.
+- AI agent requests release their copy of a shared document when they finish,
+  and repeated cancellation no longer extends how long they are kept.
+- Opening a CSV file that changes while it is read reports an error.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added
