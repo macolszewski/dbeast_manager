@@ -192,6 +192,15 @@ pub(super) struct EditorLayout {
 }
 
 impl EditorLayout {
+    /// TextEdit keeps the empty hint galley for the first input frame, even
+    /// though its layouter has already cached the inserted text. Selection
+    /// painting can clone a galley, so compare the shared layout jobs.
+    pub(super) fn matches_output(&self, galley: &Galley) -> bool {
+        self.galley
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(&cached.job, &galley.job))
+    }
+
     fn invalidate(&mut self) {
         self.revision = None;
         self.galley = None;

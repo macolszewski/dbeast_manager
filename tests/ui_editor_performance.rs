@@ -558,3 +558,43 @@ fn editor_cpu_frames_without_accesskit() {
         drop(fixture);
     }
 }
+
+#[test]
+fn paste_multilingual_transaction() {
+    let _environment_guard = CONFIG_ENVIRONMENT.lock().unwrap();
+    let _fixture = Fixture::new("");
+    let mut h = Harness::builder()
+        .with_size([1440.0, 900.0])
+        .wgpu()
+        .build_eframe(|cc| MeasuredApp {
+            app: dbeast::ui::App::new_for_test(cc),
+            first_ui: None,
+        });
+    focus_editor(&mut h);
+    for sql in [
+        "SELECT 1;\nSELECT 2;\n",
+        include_str!("fixtures/allergen_translations.sql"),
+    ] {
+        h.event(egui::Event::Paste(sql.to_owned()));
+        h.run_steps(3);
+        assert_eq!(editor(&h), sql);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.key_press(Key::Backspace);
+        h.run_steps(3);
+        assert_eq!(editor(&h), "");
+    }
+    // Text input takes the same first-input path as clipboard paste.
+    let sql = include_str!("fixtures/allergen_translations.sql");
+    h.event(egui::Event::Text(sql.to_owned()));
+    h.run_steps(3);
+    assert_eq!(editor(&h), sql);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Home);
+    h.run_steps(3);
+    h.render()
+        .unwrap()
+        .save(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/screenshots/editor-paste.png"
+        ))
+        .unwrap();
+}

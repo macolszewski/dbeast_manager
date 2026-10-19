@@ -1189,6 +1189,7 @@ fn console_editor(
                             .hint_text(theme::keys("-- write SQL here: ⌘↵ runs the statement under the caret, Ctrl+Space completes"))
                             .layouter(&mut layouter)
                             .show(ui);
+                        let layout_current = cache.layout.matches_output(&out.galley);
                         if read_only {
                             ui.ctx().accesskit_node_builder(out.response.id, |node| node.set_read_only());
                         }
@@ -1202,10 +1203,10 @@ fn console_editor(
                             state.cursor.set_char_range(Some(selection));
                             state.store(ui.ctx(), fc.id());
                         }
-                        if !out.response.changed() {
+                        if layout_current && !out.response.changed() {
                             search_actions::paint(ui, &out, &tab.search, search_bg, out.cursor_range.or(selection_before), &cache.layout.row_offsets);
                         }
-                        if let Some(range) = &scroll {
+                        if layout_current && let Some(range) = &scroll {
                             let rect = cache::cursor_rect(&out.galley, &cache.layout.row_offsets, CCursor::new(range.start))
                                 .translate(out.galley_pos.to_vec2());
                             ui.scroll_to_rect(rect, Some(Align::Center));
@@ -1215,9 +1216,13 @@ fn console_editor(
                             let (a, b) = (cache.projection.real_char(r.primary.index.0), cache.projection.real_char(r.secondary.index.0));
                             *cursor = Some(a.min(b)..a.max(b));
                         }
-                        toggle_line = paint_gutter(ui, &out, gutter, current_line_bg, &cache.projection, &cache.markers, &cache.layout.row_offsets);
-                        paint_current_statement(ui, &out, &cache.projection, gutter, &cache.layout.row_offsets);
-                        unfold = paint_fold_boxes(ui, &out, &cache.projection.placeholders, &cache.summaries, sql, folds, &cache.layout.row_offsets);
+                        if layout_current {
+                            toggle_line = paint_gutter(ui, &out, gutter, current_line_bg, &cache.projection, &cache.markers, &cache.layout.row_offsets);
+                            paint_current_statement(ui, &out, &cache.projection, gutter, &cache.layout.row_offsets);
+                            unfold = paint_fold_boxes(ui, &out, &cache.projection.placeholders, &cache.summaries, sql, folds, &cache.layout.row_offsets);
+                        } else {
+                            ui.ctx().request_repaint();
+                        }
                         if !read_only {
                             cache.text.edit(|text| fc.update(ui, text, &out, completion, accept, force));
                         }
