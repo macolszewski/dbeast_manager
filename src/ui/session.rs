@@ -415,7 +415,11 @@ mod tests {
         let expected = serde_json::to_string(&*app.tabs[0].results[0].data).unwrap();
         let weak = Arc::downgrade(&app.tabs[0].results[0].data);
         app.tabs[0].last_active = Instant::now() - Duration::from_secs(60);
-        app.release_results_over(2 * one_tab);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.tabs[0].stored.is_none() && Instant::now() < deadline {
+            app.release_results_over(2 * one_tab);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(app.tabs[0].stored.is_some(), "the longest unused tab is released first");
         assert_eq!(weak.strong_count(), 0, "its rows are freed");
         assert!(app.tabs[1].stored.is_none(), "pending edits stay in memory");
@@ -535,6 +539,8 @@ pub(super) struct SessionWriter {
     failed: Arc<AtomicBool>,
     /// session.json of this application; tests point it at a temporary folder.
     path: Option<PathBuf>,
+    release_check: Option<mpsc::Receiver<HashSet<String>>>,
+    release_check_at: Option<Instant>,
 }
 
 impl SessionWriter {
@@ -545,6 +551,7 @@ impl SessionWriter {
 
 enum Job {
     Write(PathBuf, Box<Session>),
+    CheckResultFiles(PathBuf, Vec<String>, mpsc::Sender<HashSet<String>>, egui::Context),
     /// Acknowledged once every earlier write has finished.
     Flush(mpsc::Sender<()>),
 }
@@ -578,6 +585,15 @@ fn run_writer(receiver: &mpsc::Receiver<Job>, failed: &AtomicBool) {
         loop {
             match job {
                 Job::Write(path, session) => pending = Some((path, session)),
+                Job::CheckResultFiles(path, files, done, ctx) => {
+                    // A check queued after a save must see the completed write.
+                    if let Some((path, session)) = pending.take() {
+                        save_to(&path, &session, failed);
+                    }
+                    let present = files.into_iter().filter(|name| result_file_exists(&path, name)).collect();
+                    let _ = done.send(present);
+                    ctx.request_repaint();
+                }
                 Job::Flush(done) => {
                     if let Some((path, session)) = pending.take() {
                         save_to(&path, &session, failed);
@@ -1027,7 +1043,6 @@ impl App {
     /// tabs, pending edits and rows not yet written to a file stay in memory.
     pub(super) fn release_results_over(&mut self, budget: usize) {
         let in_memory = |tab: &super::Tab| tab.results.iter().map(|rs| rs.data_bytes).sum::<usize>();
-        let session_path = self.session_writer.path();
         let mut total: usize = self.tabs.iter().map(in_memory).sum();
         if total <= budget {
             return;
@@ -1043,10 +1058,41 @@ impl App {
                     && tab.results.iter().all(|rs| {
                         rs.edits.is_empty()
                             && !rs.is_editing()
-                            && result_file_exists(&session_path, &rs.session_file)
+                            && result_file_name(&rs.session_file)
                     })
             })
             .collect();
+        if candidates.is_empty() { return; }
+        let present = match self.session_writer.release_check.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(present)) => {
+                self.session_writer.release_check = None;
+                present
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => return,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.session_writer.release_check = None;
+                return;
+            }
+            None => {
+                // Unsaved or failed files must not create a tight polling loop.
+                let retry = Duration::from_secs(1);
+                if let Some(at) = self.session_writer.release_check_at
+                    && at.elapsed() < retry
+                {
+                    self.backend.ctx().request_repaint_after(retry - at.elapsed().min(retry));
+                    return;
+                }
+                let files = candidates.iter().flat_map(|&index| &self.tabs[index].results)
+                    .map(|rs| rs.session_file.clone()).collect();
+                let (done, receiver) = mpsc::channel();
+                self.session_writer.release_check = Some(receiver);
+                self.session_writer.release_check_at = Some(Instant::now());
+                self.session_writer.send(Job::CheckResultFiles(self.session_writer.path(), files, done, self.backend.ctx().clone()));
+                return;
+            }
+        };
+        self.backend.ctx().request_repaint_after(Duration::from_secs(1));
+        candidates.retain(|&index| self.tabs[index].results.iter().all(|rs| present.contains(&rs.session_file)));
         candidates.sort_by_key(|&index| self.tabs[index].last_active);
         for index in candidates {
             if total <= budget {

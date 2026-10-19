@@ -22,48 +22,54 @@ pub(super) struct ColumnWindow {
 /// Extra columns built beyond each side of the viewport.
 const WINDOW_MARGIN: usize = 2;
 
-/// `visible` is the viewport relative to the left edge of the first column;
-/// `spacing` is the gap the table adds after every column.
-pub(super) fn column_window(
-    widths: impl ExactSizeIterator<Item = f32> + Clone,
-    spacing: f32,
-    visible: egui::Rangef,
-) -> ColumnWindow {
-    let count = widths.len();
-    let (mut first, mut last) = (count, count);
-    let mut x = 0.0;
-    for (index, width) in widths.clone().enumerate() {
-        if first == count && x + width >= visible.min {
-            first = index;
+/// Cumulative widths allow viewport lookup without visiting hidden records.
+#[derive(Default)]
+pub(super) struct HorizontalLayout {
+    key: Option<(usize, f32, f32, f32, u64)>,
+    offsets: Vec<f32>,
+}
+
+impl HorizontalLayout {
+    pub(super) fn prepare(&mut self, key: (usize, f32, f32, f32, u64), width_of: impl Fn(usize) -> f32) {
+        if self.key == Some(key) { return; }
+        self.offsets.clear();
+        self.offsets.push(0.0);
+        for index in 0..key.0 {
+            self.offsets.push(self.offsets[index] + width_of(index) + key.2);
         }
-        if x > visible.max {
-            last = index;
-            break;
+        self.key = Some(key);
+    }
+
+    pub(super) fn offset(&self, index: usize) -> f32 { self.offsets[index] }
+
+    pub(super) fn window(&self, visible: egui::Rangef) -> ColumnWindow {
+        let count = self.offsets.len().saturating_sub(1);
+        let spacing = self.key.map_or(0.0, |key| key.2);
+        let first = self.offsets[1..].partition_point(|end| *end - spacing < visible.min);
+        let last = self.offsets[..count].partition_point(|start| *start <= visible.max);
+        let first = first.min(last).saturating_sub(WINDOW_MARGIN);
+        let last = (last + WINDOW_MARGIN).min(count);
+        ColumnWindow {
+            before: if first > 0 { self.offsets[first] - spacing } else { 0.0 },
+            after: if last < count { self.offsets[count] - self.offsets[last] - spacing } else { 0.0 },
+            range: first..last,
         }
-        x += width + spacing;
     }
-    let first = first.min(last).saturating_sub(WINDOW_MARGIN);
-    let last = (last + WINDOW_MARGIN).min(count);
-    let span = |range: std::ops::Range<usize>| {
-        let len = range.len();
-        widths
-            .clone()
-            .skip(range.start)
-            .take(len)
-            .map(|width| width + spacing)
-            .sum::<f32>()
-            - spacing
-    };
-    ColumnWindow {
-        before: if first > 0 { span(0..first) } else { 0.0 },
-        after: if last < count { span(last..count) } else { 0.0 },
-        range: first..last,
-    }
+}
+
+#[cfg(test)]
+fn column_window(widths: impl ExactSizeIterator<Item = f32>, spacing: f32, visible: egui::Rangef) -> ColumnWindow {
+    let widths: Vec<_> = widths.collect();
+    let mut layout = HorizontalLayout::default();
+    layout.prepare((widths.len(), 1.0, spacing, 0.0, 0), |i| widths[i]);
+    layout.window(visible)
 }
 
 #[derive(Default)]
 pub(super) struct LayoutCache {
     normal: OnceCell<Vec<f32>>,
+    pub(super) horizontal_normal: RefCell<HorizontalLayout>,
+    pub(super) horizontal_transposed: RefCell<HorizontalLayout>,
     transposed: RefCell<HashMap<GridRow, f32>>,
     order_positions: OnceCell<Vec<usize>>,
 }
@@ -71,17 +77,20 @@ pub(super) struct LayoutCache {
 impl LayoutCache {
     pub(super) fn clear_columns(&mut self) {
         self.normal.take();
+        self.horizontal_normal.get_mut().key = None;
         self.clear_transposed();
     }
 
     /// Pending edits affect transposed widths, while fetched column samples are immutable.
     pub(super) fn clear_transposed(&mut self) {
         self.transposed.get_mut().clear();
+        self.horizontal_transposed.get_mut().key = None;
     }
 
     /// Sorting changes record positions, but does not change their cached widths.
     pub(super) fn clear_order(&mut self) {
         self.order_positions.take();
+        self.horizontal_transposed.get_mut().key = None;
     }
 }
 
@@ -217,6 +226,17 @@ fn value_chars(value: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizontal_layout_does_not_visit_hidden_records_on_repaint() {
+        let mut layout = HorizontalLayout::default();
+        let key = (100_000, 1.0, 4.0, 40.0, 0);
+        layout.prepare(key, |_| 100.0);
+        layout.prepare(key, |_| panic!("unchanged widths must stay cached"));
+        assert_eq!(layout.window(egui::Rangef::new(52_000.0, 52_500.0)).range, 498..507);
+        layout.prepare((100_000, 1.0, 4.0, 40.0, 1), |_| 200.0);
+        assert_eq!(layout.offset(2), 408.0);
+    }
 
     #[test]
     fn column_window_keeps_positions_and_total_width() {

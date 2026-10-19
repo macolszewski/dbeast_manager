@@ -1924,11 +1924,13 @@ fn normal_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
             let resized = ColumnWidths::load(ui, egui::Id::new((&rs.sql, "rows")));
             let width_of = |c: usize| resized.width(c, widths[c] * look.scale, minimum);
             let spacing = ui.spacing().item_spacing.x;
-            let window = column_window(ui, row_label_w + spacing, cols, width_of);
+            let mut horizontal = rs.layout.horizontal_normal.borrow_mut();
+            horizontal.prepare((cols, look.scale, spacing, minimum, resized.revision), width_of);
+            let window = column_window(ui, row_label_w + spacing, &horizontal);
             if let Some((_, c)) = ev.reveal
                 && !window.range.contains(&c)
             {
-                reveal_outside_window(ui, ev, row_label_w + spacing, c, width_of);
+                reveal_outside_window(ui, ev, row_label_w + spacing, c, &horizontal, width_of);
             }
             let mut table = TableBuilder::new(ui)
                 .id_salt((&rs.sql, "rows"))
@@ -2001,7 +2003,8 @@ const NAME_COLUMN: usize = usize::MAX;
 /// of the table's per-index state.
 struct ColumnWidths {
     id: egui::Id,
-    widths: HashMap<usize, f32>,
+    widths: std::sync::Arc<HashMap<usize, f32>>,
+    revision: u64,
 }
 
 impl ColumnWidths {
@@ -2010,6 +2013,7 @@ impl ColumnWidths {
         Self {
             id,
             widths: ui.data(|data| data.get_temp(id)).unwrap_or_default(),
+            revision: ui.data(|data| data.get_temp(id.with("revision"))).unwrap_or(0),
         }
     }
 
@@ -2043,11 +2047,13 @@ impl ColumnWidths {
         };
         if let Some(change) = change {
             ui.data_mut(|data| {
-                let widths = data.get_temp_mut_or_default::<HashMap<usize, f32>>(self.id);
+                let widths = data.get_temp_mut_or_default::<std::sync::Arc<HashMap<usize, f32>>>(self.id);
+                let widths = std::sync::Arc::make_mut(widths);
                 match change {
                     Some(width) => widths.insert(key, width),
                     None => widths.remove(&key),
                 };
+                data.insert_temp(self.id.with("revision"), self.revision.wrapping_add(1));
             });
         }
     }
@@ -2058,16 +2064,11 @@ impl ColumnWidths {
 fn column_window(
     ui: &Ui,
     offset: f32,
-    count: usize,
-    width_of: impl Fn(usize) -> f32,
+    horizontal: &layout::HorizontalLayout,
 ) -> layout::ColumnWindow {
     let origin = ui.max_rect().left() + offset;
     let clip = ui.clip_rect();
-    layout::column_window(
-        (0..count).map(&width_of),
-        ui.spacing().item_spacing.x,
-        egui::Rangef::new(clip.left() - origin, clip.right() - origin),
-    )
+    horizontal.window(egui::Rangef::new(clip.left() - origin, clip.right() - origin))
 }
 
 fn with_window_columns<'a>(
@@ -2101,10 +2102,10 @@ fn reveal_outside_window(
     ev: &mut GridEvents,
     offset: f32,
     index: usize,
+    horizontal: &layout::HorizontalLayout,
     width_of: impl Fn(usize) -> f32,
 ) {
-    let spacing = ui.spacing().item_spacing.x;
-    let left = ui.max_rect().left() + offset + (0..index).map(|i| width_of(i) + spacing).sum::<f32>();
+    let left = ui.max_rect().left() + offset + horizontal.offset(index);
     let clip = ui.clip_rect();
     let rect = egui::Rect::from_x_y_ranges(left..=left + width_of(index), clip.y_range());
     ui.scroll_to_rect(rect, None);
@@ -2148,12 +2149,14 @@ fn transposed_grid(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
                 resized.width(index, rs.transposed_width(rs.display_row(index).unwrap()), 40.0)
             };
             let spacing = ui.spacing().item_spacing.x;
-            let window = column_window(ui, name_w + spacing, row_count, width_of);
+            let mut horizontal = rs.layout.horizontal_transposed.borrow_mut();
+            horizontal.prepare((row_count, look.scale, spacing, 40.0, resized.revision), width_of);
+            let window = column_window(ui, name_w + spacing, &horizontal);
             if let Some((row, _)) = ev.reveal
                 && let Some(index) = rs.display_index(row)
                 && !window.range.contains(&index)
             {
-                reveal_outside_window(ui, ev, name_w + spacing, index, width_of);
+                reveal_outside_window(ui, ev, name_w + spacing, index, &horizontal, width_of);
             }
             let mut table = TableBuilder::new(ui)
                 .id_salt((&rs.sql, "transposed"))

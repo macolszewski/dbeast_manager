@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Repainting wide and transposed grids reuses cumulative column positions and
+  shared resize settings instead of revisiting every hidden record.
+- Result eviction checks session files on the session worker, keeping disk
+  metadata reads off the UI thread when the result-memory budget is exceeded.
+
 - Adding a row preserves automatic key generation and starts editing in the
   first writable column that is not an automatic key. Automatic keys are marked
   as generated, and clearing a manually entered new key restores generation.

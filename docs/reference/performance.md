@@ -19,6 +19,9 @@ The verification of the 0.3.0 audit, with the measurements behind each fix, is i
 
 Most measurements below are micro-benchmarks of a single stage, without GPU rendering. They show the cost of that stage; they are not a frame-rate measurement of the whole application. Unless stated otherwise, they were taken on Apple Silicon in a release build.
 
+The [19 October 2026 follow-up audit](../design/performance-audit-2026-10-19.md) covers
+startup, idle resources, horizontal grid layout, session eviction and large SQL editors.
+
 ## Measuring startup, memory and CPU
 
 Time to first frame is printed when `DBEAST_TRACE_STARTUP=1` is set. Use a temporary configuration so your real one is not touched:
