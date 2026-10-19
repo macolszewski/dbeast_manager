@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-19
+
+### Fixed
+
+- Pasting multiline SQL into an empty console no longer closes the application.
+
 ## [0.4.0] - 2026-10-18
 
 ### Changed
@@ -166,3 +172,6 @@ First public version (source only).
 
 - The integrated macOS title bar keeps room for the window buttons at every
   Zoom IDE level.
+
+[Unreleased]: https://github.com/macolszewski/dbeast_manager/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/macolszewski/dbeast_manager/compare/v0.4.0...v0.4.1
