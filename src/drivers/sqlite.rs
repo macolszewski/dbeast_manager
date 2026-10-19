@@ -256,6 +256,7 @@ impl LiteConn {
             let mut columns: Vec<PhysicalColumn> = rows.into_iter().map(|(ordinal, name, ty, notnull, pk, hidden)| PhysicalColumn {
                 name, ordinal: (ordinal + 1) as u32,
                 nullable: !(notnull || (pk > 0 && (without_rowid || (!has_pk_index && ty.eq_ignore_ascii_case("INTEGER"))))),
+                auto_increment: !without_rowid && !has_pk_index && pk > 0 && ty.eq_ignore_ascii_case("INTEGER"),
                 generated: hidden != 0, update_default: false, comparable: true,
             }).collect();
             let mut primary_key: Vec<String> = key.into_iter().map(|(_, name)| name).collect();
@@ -267,6 +268,7 @@ impl LiteConn {
                 primary_key = vec![SQLITE_ROWID.into()];
                 columns.push(PhysicalColumn {
                     name: SQLITE_ROWID.into(), ordinal: 0, nullable: false,
+                    auto_increment: true,
                     generated: true, update_default: false, comparable: true,
                 });
             }
@@ -757,4 +759,55 @@ fn table_details(conn: &Connection, path: &[String]) -> Result<Vec<DbObject>> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(table_folders(path, columns, keys, indexes))
+}
+
+#[cfg(test)]
+mod cell_editor_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cell_editor_detects_only_sqlite_rowid_keys() {
+        let mut source = DataSource::new(crate::model::DriverKind::Sqlite);
+        source.file = ":memory:".into();
+        let conn = LiteConn::open(&source).await.unwrap();
+        for (name, definition, automatic) in [
+            (
+                "automatic",
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT",
+                true,
+            ),
+            ("implicit", "id INTEGER PRIMARY KEY, note TEXT", true),
+            (
+                "descending",
+                "id INTEGER PRIMARY KEY DESC, note TEXT",
+                false,
+            ),
+            (
+                "composite",
+                "id INTEGER, tenant INTEGER, PRIMARY KEY(id, tenant)",
+                false,
+            ),
+        ] {
+            conn.execute_control(&format!("CREATE TABLE {name} ({definition})"))
+                .await
+                .unwrap();
+            let metadata = conn
+                .table_edit_metadata(&OriginTable::Named {
+                    schema: "main".into(),
+                    table: name.into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                metadata
+                    .columns
+                    .iter()
+                    .find(|column| column.name == "id")
+                    .unwrap()
+                    .auto_increment,
+                automatic,
+                "{name}"
+            );
+        }
+    }
 }

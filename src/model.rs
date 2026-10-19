@@ -484,6 +484,8 @@ pub struct PhysicalColumn {
     pub ordinal: u32,
     pub nullable: bool,
     pub generated: bool,
+    /// The database supplies a sequence/identity value when omitted on INSERT.
+    pub auto_increment: bool,
     pub update_default: bool,
     pub comparable: bool,
 }
@@ -510,6 +512,7 @@ pub struct ResultEditMetadata {
     /// are identified by the primary key only.
     pub comparable: Vec<bool>,
     pub update_default: Vec<bool>,
+    pub auto_increment: Vec<bool>,
     pub primary_key: Vec<usize>,
     pub session_epoch: u64,
 }

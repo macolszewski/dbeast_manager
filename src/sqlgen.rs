@@ -466,6 +466,7 @@ mod tests {
             writable: vec![true; 2],
             comparable: vec![true; 2],
             update_default: vec![true; 2],
+            auto_increment: vec![false; 2],
             primary_key: vec![0],
             session_epoch: 9,
         };

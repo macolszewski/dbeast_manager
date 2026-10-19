@@ -539,6 +539,7 @@ impl MyConn {
                     ordinal,
                     nullable: nullable == "YES",
                     generated,
+                    auto_increment: extra.contains("auto_increment"),
                     update_default: !generated,
                     comparable: !matches!(
                         ty.as_str(),

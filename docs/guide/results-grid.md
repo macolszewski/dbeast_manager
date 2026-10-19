@@ -164,9 +164,28 @@ You can edit table data in the table editor and, under certain conditions, the r
 - Double-click a cell, or press Enter, to edit it. Enter confirms, Escape cancels.
 - **+** or **Add Row** (`⌘N`) adds a row. **−** or **Delete Row** (`⌘⌫`) marks the selected row for deletion. **Clone Row** (`⌘D`) adds a copy of the selected row, including its unsaved changes; primary key columns and columns the grid cannot set are left at their default.
 - **Set NULL** and **Set DEFAULT** in the cell context menu set those values.
+- New rows leave auto-increment, serial and identity columns as **\<generated\>**.
+  The database supplies their values on Submit, and editing starts in the first
+  writable column that is not generated automatically. For writable automatic
+  keys, **Generate Automatically** restores that behavior after a manual entry.
+  Clearing such a key in a new row also restores automatic generation.
+- Date, time and timestamp cells keep a directly editable text field. While editing,
+  use **Choose Date** (`…`) to open a calendar with month navigation and **Today**.
+  Select a month from the header and type any year from 1 to 9999 directly
+  into **Year**, then choose the day. Enter in the year field keeps the panel open.
+  DATE shows a calendar; TIME shows hours, minutes, seconds and fractional
+  seconds; TIMESTAMP and DATETIME show both. Zoned values also expose the
+  time-zone offset. Picking a timestamp day keeps the panel open for time editing.
+  The compact panel also contains the complete editable date/time string;
+  **Apply** returns to the cell without submitting changes to the database.
+  Choosing a day preserves the existing time, fractional seconds and time-zone
+  suffix. You can still type the complete value manually; the database validates
+  it when you submit. This works in the grid and Record View.
 - Row shortcuts work on the selected cell when no text field has keyboard focus.
 
 Changed cells are blue, new rows green, and rows to be deleted red and struck through. Before you switch tabs, a cell being edited is added to the pending changes (it is not submitted).
+
+![New row with an automatically generated key and a calendar beside the editable timestamp](../images/date-cell-editor.png)
 
 ### Submitting
 

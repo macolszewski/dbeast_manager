@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Date, time and timestamp cells offer type-specific calendar and time fields
+  alongside direct text editing in the grid and Record View, preserving
+  fractional seconds and time zones. The calendar supports direct year entry
+  and month selection.
+
+### Fixed
+
+- Adding a row preserves automatic key generation and starts editing in the
+  first writable column that is not an automatic key. Automatic keys are marked
+  as generated, and clearing a manually entered new key restores generation.
+
 ## [0.4.1] - 2026-10-19
 
 ### Fixed

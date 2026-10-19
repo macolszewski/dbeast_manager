@@ -59,6 +59,7 @@ impl ResultSet {
             && metadata.writable.len() == columns
             && metadata.comparable.len() == columns
             && metadata.update_default.len() == columns
+            && metadata.auto_increment.len() == columns
             && !metadata.primary_key.is_empty()
             && metadata.primary_key.iter().all(|&column| column < columns)
             && metadata.writable.iter().any(|&writable| writable)
@@ -86,6 +87,7 @@ impl ResultSet {
     }
 
     fn refresh_edit_status(&mut self) {
+        self.layout.clear_columns();
         self.edit_status = match &self.editability {
             ResultEditability::Checking => "Checking whether this result can be edited…".into(),
             ResultEditability::ReadOnly(reason) => format!("Read-only: {reason}"),
@@ -222,6 +224,7 @@ impl ResultSet {
             writable: vec![true; columns],
             comparable: vec![true; columns],
             update_default: vec![false; columns],
+            auto_increment: vec![false; columns],
             primary_key: vec![0],
             session_epoch: 1,
         }));
@@ -296,6 +299,7 @@ pub(super) mod tests {
             writable: vec![true, true, false],
             comparable: vec![true, true, false],
             update_default: vec![false; 3],
+            auto_increment: vec![false; 3],
             primary_key: vec![0],
             session_epoch: 17,
         }

@@ -540,7 +540,9 @@ impl PgConn {
         let name: String = table.get(1);
         let rows = self.client.query(
             "select a.attname, a.attnum, a.attnotnull, a.attgenerated::text, a.attidentity::text, \
-             t.typname, t.typtype::text from pg_catalog.pg_attribute a \
+             t.typname, t.typtype::text, \
+             pg_catalog.pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) is not null \
+             from pg_catalog.pg_attribute a \
              join pg_catalog.pg_type t on t.oid=a.atttypid \
              where a.attrelid=$1 and a.attnum>0 and not a.attisdropped order by a.attnum", &[oid]).await?;
         let columns = rows
@@ -553,6 +555,7 @@ impl PgConn {
                     ordinal: row.get::<_, i16>(1) as u32,
                     nullable: !row.get::<_, bool>(2),
                     generated,
+                    auto_increment: row.get(7),
                     update_default: !generated,
                     comparable: editable_pg_type(
                         &row.get::<_, String>(5),

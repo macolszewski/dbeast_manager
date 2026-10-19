@@ -362,6 +362,7 @@ mod tests {
                     ordinal: i as u32,
                     nullable: false,
                     generated: false,
+                    auto_increment: false,
                     update_default: false,
                     comparable: true,
                 })

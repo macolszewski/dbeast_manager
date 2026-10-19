@@ -73,6 +73,7 @@ pub fn resolve(
     let mut writable = Vec::with_capacity(data.columns.len());
     let mut comparable = Vec::with_capacity(data.columns.len());
     let mut update_default = Vec::with_capacity(data.columns.len());
+    let mut auto_increment = Vec::with_capacity(data.columns.len());
     for (index, origin) in source.columns.iter().enumerate() {
         let column = match origin.as_ref().map(|c| &c.column) {
             Some(OriginColumn::Postgres(ordinal)) => u32::try_from(*ordinal)
@@ -94,6 +95,7 @@ pub fn resolve(
         let can_write = column.is_some_and(|c| !c.generated && source.exact_columns[index]);
         physical_columns.push(column.map(|c| c.name.clone()));
         writable.push(can_write);
+        auto_increment.push(column.is_some_and(|c| c.auto_increment) && source.exact_columns[index]);
         comparable.push(column.is_some_and(|c| c.comparable) && source.exact_columns[index]);
         update_default.push(can_write && column.is_some_and(|c| c.update_default));
     }
@@ -121,6 +123,7 @@ pub fn resolve(
         writable,
         comparable,
         update_default,
+        auto_increment,
         primary_key,
         session_epoch: source.session_epoch,
     })
@@ -444,6 +447,7 @@ mod tests {
                     ordinal: i as u32 + 1,
                     nullable: false,
                     generated: i == 3,
+                    auto_increment: i == 1,
                     update_default: false,
                     comparable: true,
                 })
@@ -497,6 +501,13 @@ mod tests {
             ..Default::default()
         };
         (data, table)
+    }
+
+    #[test]
+    fn cell_editor_maps_automatic_keys_by_origin() {
+        let (data, table) = fixture();
+        let metadata = resolve(None, DriverKind::Sqlite, &data, &table).unwrap();
+        assert_eq!(metadata.auto_increment, [true, false, false, false, false]);
     }
 
     #[test]

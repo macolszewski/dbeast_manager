@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod actions;
+mod date_edit;
 mod aggregate_view;
 mod depth_view;
 mod editability;
@@ -426,6 +427,14 @@ impl ResultSet {
     }
 
     fn set_cell(&mut self, row: GridRow, col: usize, edit: CellEdit) {
+        let edit = if matches!(row, GridRow::New(_))
+            && self.is_auto_increment(col)
+            && matches!(&edit, CellEdit::Text(text) if text.is_empty())
+        {
+            CellEdit::Default
+        } else {
+            edit
+        };
         if !self.can_edit_cell(row, col)
             || (matches!(edit, CellEdit::Text(_)) && !self.can_edit_text(row, col))
             || (edit == CellEdit::Default && !self.can_set_default(row, col))
@@ -471,11 +480,13 @@ impl ResultSet {
             .inserted
             .push(vec![CellEdit::Default; self.data.columns.len()]);
         let row = GridRow::New(self.edits.inserted.len() - 1);
-        self.select_cell((row, 0), false);
+        let column = (0..self.data.columns.len())
+            .find(|&c| self.can_edit_text(row, c) && !self.is_auto_increment(c));
+        self.select_cell((row, column.unwrap_or(0)), false);
         self.pending_reveal = true;
-        self.edits.editing = Some((row, 0, String::new()));
+        self.edits.editing = column.map(|c| (row, c, String::new()));
         self.edits.editing_surface = CellSurface::Grid;
-        self.edits.editing_needs_focus = true;
+        self.edits.editing_needs_focus = column.is_some();
     }
 
     /// Copies a row into a new one. Primary key columns are left to their
@@ -493,6 +504,7 @@ impl ResultSet {
             .map(|c| {
                 // The key and columns the grid cannot set are left to their defaults.
                 if self.primary_key_columns().contains(&c)
+                    || self.is_auto_increment(c)
                     || self
                         .edit_metadata()
                         .is_none_or(|metadata| !metadata.writable[c])
@@ -511,6 +523,11 @@ impl ResultSet {
         let col = self.selected.map_or(0, |(_, c)| c);
         self.select_cell((GridRow::New(self.edits.inserted.len() - 1), col), false);
         self.pending_reveal = true;
+    }
+
+    fn is_auto_increment(&self, column: usize) -> bool {
+        self.edit_metadata()
+            .is_some_and(|metadata| metadata.auto_increment.get(column) == Some(&true))
     }
 
     fn delete_row(&mut self, row: GridRow) {
@@ -1660,12 +1677,7 @@ fn data_cell(
             Some((er, ec, text))
                 if *er == grid_row && *ec == c && ev.editing_surface == surface =>
             {
-                let out = ui.add(
-                    egui::TextEdit::singleline(text)
-                        .font(egui::TextStyle::Monospace)
-                        .frame(egui::Frame::NONE)
-                        .desired_width(f32::INFINITY),
-                );
+                let (out, calendar_active) = date_edit::editor(ui, text, &rs.data.columns[c].type_name);
                 ev.editor_id = Some(out.id);
                 if ev.editing_needs_focus {
                     out.request_focus();
@@ -1684,11 +1696,11 @@ fn data_cell(
                 if escape || enter || submit {
                     ev.finish_edit = Some(enter || submit);
                     ev.return_focus = true;
-                } else if out.lost_focus() {
+                } else if out.lost_focus() && !calendar_active {
                     ev.finish_edit = Some(true);
                 }
             }
-            _ => cell(ui, shown, deleted, selected),
+            _ => cell(ui, shown, deleted, selected, rs.is_auto_increment(c)),
         }
     });
     if resp.clicked() && !editing_here {
@@ -1835,7 +1847,11 @@ fn data_cell(
             if ui
                 .add_enabled(
                     rs.can_set_default(grid_row, c),
-                    egui::Button::new("Set DEFAULT"),
+                    egui::Button::new(if rs.is_auto_increment(c) && matches!(grid_row, GridRow::New(_)) {
+                        "Generate Automatically"
+                    } else {
+                        "Set DEFAULT"
+                    }),
                 )
                 .on_disabled_hover_text("DEFAULT is not available for this cell or database.")
                 .clicked()
@@ -2341,7 +2357,7 @@ fn header_cell_bg(ui: &Ui) {
 /// truncates to the column width.
 const CELL_PREVIEW_CHARS: usize = 1024;
 
-fn cell(ui: &mut Ui, shown: Shown<'_>, deleted: bool, selected: bool) {
+fn cell(ui: &mut Ui, shown: Shown<'_>, deleted: bool, selected: bool, auto_increment: bool) {
     let mut text = match shown {
         Shown::Value(v) => match v {
             Value::Null => RichText::new("<null>").italics().color(theme::TEXT_MUTED),
@@ -2353,7 +2369,7 @@ fn cell(ui: &mut Ui, shown: Shown<'_>, deleted: bool, selected: bool) {
             _ => RichText::new(v.cell_preview(CELL_PREVIEW_CHARS)).color(theme::TEXT),
         },
         Shown::Edit(CellEdit::Null) => RichText::new("<null>").italics().color(theme::TEXT_MUTED),
-        Shown::Edit(CellEdit::Default) => RichText::new("<default>")
+        Shown::Edit(CellEdit::Default) => RichText::new(if auto_increment { "<generated>" } else { "<default>" })
             .italics()
             .color(theme::TEXT_MUTED),
         Shown::Edit(CellEdit::Text(s)) => {
@@ -2644,6 +2660,122 @@ mod tests {
             .into_iter()
             .map(|mutation| mutation.sql)
             .collect()
+    }
+
+    #[test]
+    fn cell_editor_generated_key_stays_omitted_until_overridden() {
+        let mut rs = rs();
+        if let editability::ResultEditability::Editable(metadata) = &mut rs.editability {
+            std::sync::Arc::make_mut(metadata).auto_increment[0] = true;
+        }
+        rs.add_row();
+        assert_eq!(rs.selected, Some((GridRow::New(0), 1)));
+        assert_eq!(rs.edits.inserted[0][0], CellEdit::Default);
+        rs.set_cell(GridRow::New(0), 1, CellEdit::Text("new".into()));
+        assert!(!sql(&rs)[0].contains("\"id\""));
+        rs.set_cell(GridRow::New(0), 0, CellEdit::Text("42".into()));
+        assert!(sql(&rs)[0].contains("\"id\""));
+        rs.set_cell(GridRow::New(0), 0, CellEdit::Text(String::new()));
+        assert_eq!(rs.edits.inserted[0][0], CellEdit::Default);
+        assert!(!sql(&rs)[0].contains("\"id\""));
+    }
+
+    #[test]
+    fn cell_editor_calendar_keeps_manual_text_and_generated_key() {
+        use egui_kittest::kittest::Queryable;
+        let mut result = rs();
+        let data = std::sync::Arc::make_mut(&mut result.data);
+        data.columns[1].name = "created_at".into();
+        data.columns[1].type_name = "timestamp".into();
+        data.rows[0][1] = Value::Text("2026-10-18 08:00:00+02:00".into());
+        if let editability::ResultEditability::Editable(metadata) = &mut result.editability {
+            std::sync::Arc::make_mut(metadata).auto_increment[0] = true;
+        }
+        result.show_value_editor = false;
+        result.add_row();
+        result.edits.editing.as_mut().unwrap().2 = "2026-10-19 12:34:56.123456+02:00".into();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([1000.0, 600.0])
+            .wgpu()
+            .build_ui_state(
+                |ui, state: &mut GridHarness| {
+                    if ui.ctx().cumulative_pass_nr() == 0 {
+                        theme::apply(ui.ctx());
+                        return;
+                    }
+                    grid(ui, &mut state.rs, &mut state.tiles);
+                },
+                GridHarness {
+                    rs: result,
+                    tiles: super::super::map::TileCache::new(String::new(), std::env::temp_dir()),
+                    sql: String::new(),
+                    submitted: Vec::new(),
+                    toolbar: false,
+                },
+            );
+        h.run_steps(3);
+        h.get_by_label("<generated>");
+        h.get_by_label("Choose Date").click();
+        h.run_steps(3);
+        assert!((h.get_by_label("2026-10-01").rect().center().x
+            - h.get_by_label("Th").rect().center().x).abs() < 1.0);
+        assert!((h.get_by_label("2026-10-19").rect().center().x
+            - h.get_by_label("Mo").rect().center().x).abs() < 1.0);
+        std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/screenshots")).unwrap();
+        h.render()
+            .unwrap()
+            .save(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/docs/screenshots/date-cell-editor.png"
+            ))
+            .unwrap();
+        h.ctx.set_zoom_factor(1.5);
+        h.run_steps(3);
+        h.render().unwrap().save(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/docs/screenshots/date-cell-editor-zoom.png")).unwrap();
+        h.ctx.set_zoom_factor(1.0);
+        h.run_steps(3);
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Year").focus();
+        h.run_steps(1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Text("1999".into()));
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        h.get_by_label("1999-10-23");
+        assert!(h.state().rs.edits.editing.is_some());
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Year").focus();
+        h.run_steps(1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Text("2026".into()));
+        h.run_steps(2);
+        h.get_by_label("2026-10-23").click();
+        h.run_steps(3);
+        assert_eq!(
+            h.state().rs.edits.editing.as_ref().unwrap().2,
+            "2026-10-23 12:34:56.123456+02:00"
+        );
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Seconds").focus();
+        h.run_steps(1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Text("09".into()));
+        h.run_steps(1);
+        assert_eq!(h.state().rs.edits.editing.as_ref().unwrap().2,
+            "2026-10-23 12:34:09.123456+02:00");
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Date and time").focus();
+        h.run_steps(1);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Text("2027-01-02 03:04:05+01:00".into()));
+        h.run_steps(1);
+        h.get_by_label("Apply").click();
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(
+            h.state().rs.edits.inserted[0][1],
+            CellEdit::Text("2027-01-02 03:04:05+01:00".into())
+        );
+        assert_eq!(h.state().rs.edits.inserted[0][0], CellEdit::Default);
     }
 
     #[test]

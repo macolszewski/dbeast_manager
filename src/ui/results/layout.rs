@@ -69,6 +69,11 @@ pub(super) struct LayoutCache {
 }
 
 impl LayoutCache {
+    pub(super) fn clear_columns(&mut self) {
+        self.normal.take();
+        self.clear_transposed();
+    }
+
     /// Pending edits affect transposed widths, while fetched column samples are immutable.
     pub(super) fn clear_transposed(&mut self) {
         self.transposed.get_mut().clear();
@@ -159,7 +164,9 @@ impl ResultSet {
                         .map(|row| value_chars(&row[column]))
                         .max()
                         .unwrap_or(0);
-                    text_width(header.max(sample))
+                    let editor = super::date_edit::column_chars(&meta.type_name)
+                        .max(if self.is_auto_increment(column) { 11 } else { 0 });
+                    text_width(header.max(sample).max(editor))
                 })
                 .collect()
         })
@@ -171,11 +178,11 @@ impl ResultSet {
             return width;
         }
         let widest = (0..self.data.columns.len())
-            .map(|column| match self.cell(row, column) {
+            .map(|column| (match self.cell(row, column) {
                 Shown::Value(value) => value_chars(value),
                 Shown::Edit(CellEdit::Text(text)) => bounded_chars(text),
-                Shown::Edit(_) => 9,
-            })
+                Shown::Edit(_) => if self.is_auto_increment(column) { 11 } else { 9 },
+            }).max(super::date_edit::column_chars(&self.data.columns[column].type_name)))
             .max()
             .unwrap_or(0);
         let width = text_width(widest);
