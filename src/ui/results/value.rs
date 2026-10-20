@@ -29,6 +29,27 @@ pub(super) fn viewer(ui: &mut Ui, rs: &mut ResultSet) {
     let Some((row, column)) = rs.valid_selection() else {
         return;
     };
+    if rs.boolean_column(column) || rs.enum_column(column).is_some() {
+        theme::panel_header(ui, |ui| {
+            ui.label(format!("{} · {}", rs.data.columns[column].name, rs.data.columns[column].type_name));
+            if ui.small_button("Copy").clicked() { ui.ctx().copy_text(rs.copy_cell(row, column)); }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::tool_button(ui, "×", "Close Value Editor").clicked() {
+                    rs.show_value_editor = false;
+                    rs.pending_grid_focus = true;
+                }
+            });
+        });
+        let edit = ui.horizontal(|ui| {
+            if let Some(values) = rs.enum_column(column) {
+                cell_editors::enumeration(ui, rs.cell(row, column), rs.can_edit_cell(row, column), rs.can_set_null(row, column), values)
+            } else {
+                cell_editors::boolean(ui, rs.cell(row, column), rs.can_edit_cell(row, column), rs.can_set_null(row, column))
+            }
+        }).inner;
+        if let Some(edit) = edit { rs.set_cell(row, column, edit); }
+        return;
+    }
     if rs.value_cache.is_none() {
         rs.value_cache = Some(std::sync::Arc::downgrade(&ViewCache::of(ui.ctx())));
     }
@@ -85,6 +106,7 @@ pub(super) fn viewer(ui: &mut Ui, rs: &mut ResultSet) {
     });
     if start {
         rs.commit_find_buffer();
+        if rs.edits.editing.is_some() { return; }
         let text = match rs.cell(row, column) {
             Shown::Value(Value::Null) | Shown::Edit(CellEdit::Null | CellEdit::Default) => {
                 String::new()
@@ -111,6 +133,7 @@ pub(super) fn viewer(ui: &mut Ui, rs: &mut ResultSet) {
         cancel |= ui.is_enabled()
             && owned_focus
             && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+        let spec = rs.column_spec(column).cloned();
         if let Some((_, _, text)) = &mut rs.edits.editing {
             let minimum_size = ui.available_size();
             let response = egui::ScrollArea::vertical()
@@ -132,6 +155,13 @@ pub(super) fn viewer(ui: &mut Ui, rs: &mut ResultSet) {
             ui.ctx().accesskit_node_builder(response.id, |node| {
                 node.set_label("Value editor text");
             });
+            if let Some(error) = cell_editors::validation_feedback(ui, &response, rs.edits.editing_needs_focus,
+                || spec.as_ref().and_then(|spec| spec.validate_text(text).err())) {
+                rs.edit_status = error.clone();
+                ui.colored_label(Color32::from_rgb(230, 90, 90), error);
+            } else {
+                rs.edit_status = "Editable result".into();
+            }
             if rs.edits.editing_needs_focus {
                 response.request_focus();
                 rs.edits.editing_needs_focus = false;
@@ -140,6 +170,7 @@ pub(super) fn viewer(ui: &mut Ui, rs: &mut ResultSet) {
             apply |= submit || response.lost_focus();
         }
         if cancel {
+            rs.edit_status = "Editable result".into();
             rs.edits.editing = None;
             rs.edits.editing_needs_focus = false;
             rs.pending_grid_focus = true;
@@ -528,6 +559,28 @@ mod tests {
             Some(&CellEdit::Text("Łódź\nsecond line".into()))
         );
         assert!(h.state().edits.editing.is_none());
+    }
+
+    #[test]
+    fn typed_value_editor_retains_invalid_input_and_clears_cancelled_error() {
+        let mut h = harness();
+        if let editability::ResultEditability::Editable(metadata) = &mut h.state_mut().editability {
+            std::sync::Arc::make_mut(metadata).column_specs[1] = crate::cell_value::ColumnSpec::new(DriverKind::Postgres, "numeric(5,2)", false);
+        }
+        h.get_by_label("Edit Value").click();
+        h.run_steps(3);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.get_by_role_and_label(Role::MultilineTextInput, "Value editor text").type_text("invalid");
+        h.run_steps(2);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().edits.editing.as_ref().unwrap().2, "invalid");
+        assert!(h.state().edits.changed.is_empty());
+        assert!(h.state().edit_status.contains("decimal"));
+        h.key_press(Key::Escape);
+        h.run_steps(3);
+        assert!(h.state().edits.editing.is_none());
+        assert_eq!(h.state().edit_status, "Editable result");
     }
 
     #[test]

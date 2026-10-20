@@ -523,20 +523,22 @@ impl MyConn {
                     .is_some_and(|engine| engine.eq_ignore_ascii_case("InnoDB")),
             "Only transactional InnoDB tables can be edited from MySQL console results."
         );
-        type EditColumn = (String, u32, String, String, String);
+        type EditColumn = (String, u32, String, String, String, String);
         let rows: Vec<EditColumn> = self.conn.exec(
-            "select column_name, ordinal_position, is_nullable, extra, data_type \
+            "select column_name, ordinal_position, is_nullable, extra, data_type, column_type \
              from information_schema.columns where BINARY table_schema=BINARY ? and BINARY table_name=BINARY ? order by ordinal_position",
             (schema, table)).await?;
         let columns = rows
             .into_iter()
-            .map(|(name, ordinal, nullable, extra, ty)| {
+            .map(|(name, ordinal, nullable, extra, ty, type_name)| {
                 let extra = extra.to_ascii_lowercase();
                 let generated =
                     extra.contains("virtual generated") || extra.contains("stored generated");
                 PhysicalColumn {
+                    enum_values: Vec::new(),
                     name,
                     ordinal,
+                    type_name,
                     nullable: nullable == "YES",
                     generated,
                     auto_increment: extra.contains("auto_increment"),

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod actions;
 mod date_edit;
+mod cell_editors;
 mod aggregate_view;
 mod depth_view;
 mod editability;
@@ -426,7 +427,7 @@ impl ResultSet {
         }
     }
 
-    fn set_cell(&mut self, row: GridRow, col: usize, edit: CellEdit) {
+    fn set_cell(&mut self, row: GridRow, col: usize, edit: CellEdit) -> bool {
         let edit = if matches!(row, GridRow::New(_))
             && self.is_auto_increment(col)
             && matches!(&edit, CellEdit::Text(text) if text.is_empty())
@@ -440,8 +441,13 @@ impl ResultSet {
             || (edit == CellEdit::Default && !self.can_set_default(row, col))
         {
             self.note_refused_edit();
-            return;
+            return false;
         }
+        if let Err(error) = self.validate_cell(row, col, &edit) {
+            self.edit_status = error;
+            return false;
+        }
+        self.edit_status = "Editable result".into();
         self.edit_preview = None;
         self.aggregate.invalidate();
         self.layout.clear_transposed();
@@ -464,6 +470,7 @@ impl ResultSet {
             }
             GridRow::New(j) => self.edits.inserted[j][col] = edit,
         }
+        true
     }
 
     fn add_row(&mut self) {
@@ -481,7 +488,7 @@ impl ResultSet {
             .push(vec![CellEdit::Default; self.data.columns.len()]);
         let row = GridRow::New(self.edits.inserted.len() - 1);
         let column = (0..self.data.columns.len())
-            .find(|&c| self.can_edit_text(row, c) && !self.is_auto_increment(c));
+            .find(|&c| self.can_edit_text(row, c) && !self.is_auto_increment(c) && !self.boolean_column(c) && self.enum_column(c).is_none());
         self.select_cell((row, column.unwrap_or(0)), false);
         self.pending_reveal = true;
         self.edits.editing = column.map(|c| (row, c, String::new()));
@@ -585,6 +592,9 @@ impl ResultSet {
         &self,
         driver: DriverKind,
     ) -> Result<Vec<crate::model::BoundUpdate>, String> {
+        if let Some((row, column, text)) = &self.edits.editing {
+            self.validate_text(*row, *column, text)?;
+        }
         let metadata = self.edit_metadata().ok_or_else(|| {
             self.edit_read_only_reason()
                 .unwrap_or("This result is read-only.")
@@ -1085,6 +1095,7 @@ struct GridEvents {
     clone_row: Option<GridRow>,
     editing: Option<(GridRow, usize, String)>,
     finish_edit: Option<bool>,
+    validation_error: Option<Option<String>>,
     return_focus: bool,
     toggle_transpose: bool,
     show_record: bool,
@@ -1261,14 +1272,26 @@ pub fn grid(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) 
     {
         ev.finish_edit = Some(true);
     }
+    if let Some(error) = ev.validation_error {
+        rs.edit_status = error.unwrap_or_else(|| "Editable result".into());
+    }
     let mut editing = ev.editing;
     match ev.finish_edit {
         Some(true) => {
             if let Some((row, c, text)) = editing.take() {
-                rs.set_cell(row, c, CellEdit::Text(text));
+                if !rs.set_cell(row, c, CellEdit::Text(text.clone())) {
+                    editing = Some((row, c, text));
+                    ev.editing_needs_focus = true;
+                    ev.return_focus = false;
+                    ev.start_edit = None;
+                    ev.add_row = false;
+                    ev.clone_row = None;
+                    rs.select_cell((row, c), false);
+                    rs.pending_reveal = true;
+                }
             }
         }
-        Some(false) => editing = None,
+        Some(false) => { editing = None; rs.edit_status = "Editable result".into(); },
         None => {}
     }
     if ev.related_rows {
@@ -1313,6 +1336,7 @@ pub fn grid(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) 
         rs.note_refused_edit();
     }
     if let Some((row, c, surface)) = ev.start_edit
+        && !rs.boolean_column(c) && rs.enum_column(c).is_none()
         && rs.can_edit_text(row, c)
     {
         let text = match rs.cell(row, c) {
@@ -1432,7 +1456,12 @@ fn grid_keys(ui: &mut Ui, rs: &ResultSet, ev: &mut GridEvents) {
             ev.add_row = true;
         }
         if let Some((row, col)) = rs.valid_selection() {
-            if rs.can_edit_text(row, col)
+            if rs.boolean_column(col) && rs.can_edit_cell(row, col)
+                && (i.consume_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::Enter))
+                    || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::Space))) {
+                ev.set_edits.push((row, col, cell_editors::toggle_boolean(rs.cell(row, col))));
+                ev.return_focus = true;
+            } else if rs.can_edit_text(row, col)
                 && i.consume_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::Enter))
             {
                 ev.start_edit = Some((row, col, rs.focused_surface));
@@ -1478,13 +1507,16 @@ fn edit_status_chip(ui: &mut Ui, rs: &ResultSet) {
     let read_only = rs.edit_read_only_reason();
     let (text, color) = match read_only {
         Some(_) => ("Read-only", theme::SQL_KEYWORD),
+        None if rs.edit_status != "Editable result" => ("Invalid value", theme::RED),
         None => ("Editable", theme::TEXT_MUTED),
     };
     let response = ui
         .add(egui::Label::new(RichText::new(text).small().color(color)).sense(Sense::hover()))
-        .on_hover_text(read_only.unwrap_or(
-            "Rows are identified by the primary key; every change must affect exactly one row.",
-        ));
+        .on_hover_text(read_only.unwrap_or(if rs.edit_status != "Editable result" {
+            &rs.edit_status
+        } else {
+            "Rows are identified by the primary key; every change must affect exactly one row."
+        }));
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &rs.edit_status));
 }
 
@@ -1673,11 +1705,28 @@ fn data_cell(
                 egui::StrokeKind::Inside,
             );
         }
+        if rs.boolean_column(c) {
+            if let Some(edit) = cell_editors::boolean(ui, shown, editable, rs.can_set_null(grid_row, c)) {
+                ev.set_edits.push((grid_row, c, edit));
+                if editing_here { ev.finish_edit = Some(false); }
+                ev.return_focus = true;
+            }
+            return;
+        }
+        if let Some(values) = rs.enum_column(c) {
+            if let Some(edit) = cell_editors::enumeration(ui, shown, editable, rs.can_set_null(grid_row, c), values) {
+                ev.set_edits.push((grid_row, c, edit));
+                if editing_here { ev.finish_edit = Some(false); }
+                ev.return_focus = true;
+            }
+            return;
+        }
         match &mut ev.editing {
             Some((er, ec, text))
                 if *er == grid_row && *ec == c && ev.editing_surface == surface =>
             {
-                let (out, calendar_active) = date_edit::editor(ui, text, &rs.data.columns[c].type_name);
+                let (out, calendar_active) = date_edit::editor(ui, text, &rs.data.columns[c].type_name, rs.column_spec(c));
+                ev.validation_error = Some(cell_editors::validation_feedback(ui, &out, ev.editing_needs_focus, || rs.validate_text(grid_row, c, text).err()));
                 ev.editor_id = Some(out.id);
                 if ev.editing_needs_focus {
                     out.request_focus();
@@ -1722,7 +1771,7 @@ fn data_cell(
             ev.drag_to = Some((grid_row, c));
         }
     }
-    if text_editable && resp.double_clicked() && !deleted {
+    if text_editable && !rs.boolean_column(c) && rs.enum_column(c).is_none() && resp.double_clicked() && !deleted {
         ev.start_edit = Some((grid_row, c, surface));
     } else if resp.double_clicked() && rs.edit_metadata().is_none() {
         ev.edit_refused = true;
@@ -1827,17 +1876,19 @@ fn data_cell(
             ui.separator();
             let reason = rs.cell_read_only_reason(grid_row, c).unwrap_or("");
             if ui
-                .add_enabled(text_editable, egui::Button::new("Edit"))
+                .add_enabled(text_editable, egui::Button::new(if rs.boolean_column(c) { "Toggle Value" } else { "Edit" }))
                 .on_disabled_hover_text(rs.text_read_only_reason(grid_row, c).unwrap_or(""))
                 .clicked()
             {
-                ev.start_edit = Some((grid_row, c, surface));
+                if rs.boolean_column(c) {
+                    ev.set_edits.push((grid_row, c, cell_editors::toggle_boolean(rs.cell(grid_row, c))));
+                } else { ev.start_edit = Some((grid_row, c, surface)); }
                 ev.return_focus = true;
                 ui.close();
             }
             if ui
-                .add_enabled(editable, egui::Button::new("Set NULL"))
-                .on_disabled_hover_text(reason)
+                .add_enabled(rs.can_set_null(grid_row, c), egui::Button::new("Set NULL"))
+                .on_disabled_hover_text(if editable { "This column does not allow NULL." } else { reason })
                 .clicked()
             {
                 ev.set_edits.push((grid_row, c, CellEdit::Null));
@@ -2681,6 +2732,121 @@ mod tests {
         rs.set_cell(GridRow::New(0), 0, CellEdit::Text(String::new()));
         assert_eq!(rs.edits.inserted[0][0], CellEdit::Default);
         assert!(!sql(&rs)[0].contains("\"id\""));
+    }
+
+    fn typed_result() -> ResultSet {
+        let data = QueryResult {
+            columns: vec![
+                Column { name: "id".into(), type_name: "int4".into() },
+                Column { name: "enabled".into(), type_name: "bool".into() },
+                Column { name: "amount (numeric)".into(), type_name: "numeric(5,2)".into() },
+            ],
+            rows: vec![vec![Value::Int(1), Value::Bool(true), Value::Decimal("12.34".into())]],
+            ..Default::default()
+        };
+        let mut result = ResultSet::new("typed".into(), "select".into(), data, Page::first(500)).with_test_table();
+        if let editability::ResultEditability::Editable(metadata) = &mut result.editability {
+            let metadata = std::sync::Arc::make_mut(metadata);
+            metadata.column_specs[0].nullable = false;
+            metadata.column_specs[2].nullable = false;
+        }
+        result.show_value_editor = false;
+        result
+    }
+
+    #[test]
+    fn typed_cell_validation_keeps_drafts_and_guards_all_mutations() {
+        let mut result = typed_result();
+        assert!(!result.set_cell(GridRow::Data(0), 1, CellEdit::Text("dupakonia".into())));
+        assert!(!result.set_cell(GridRow::Data(0), 2, CellEdit::Text("12abc".into())));
+        assert!(!result.set_cell(GridRow::Data(0), 2, CellEdit::Null));
+        assert!(result.edits.changed.is_empty());
+        result.edits.editing = Some((GridRow::Data(0), 2, "12abc".into()));
+        assert!(!result.commit_find_buffer());
+        assert_eq!(result.edits.editing.as_ref().unwrap().2, "12abc");
+        assert!(result.pending_mutations(DriverKind::Postgres).is_err());
+        result.edits.editing.as_mut().unwrap().2 = "99.50".into();
+        assert!(result.commit_find_buffer());
+        assert!(result.pending_mutations(DriverKind::Postgres).is_ok());
+        // A caller bypassing the UI still cannot construct invalid UPDATE or INSERT.
+        result.edits.changed.insert((0, 1), CellEdit::Text("invalid".into()));
+        assert!(result.pending_mutations(DriverKind::Postgres).is_err());
+        result.edits.changed.clear();
+        result.edits.inserted.push(vec![CellEdit::Default, CellEdit::Default, CellEdit::Null]);
+        assert!(result.pending_mutations(DriverKind::Postgres).is_err());
+        result.edits.inserted.clear();
+        assert!(result.set_cell(GridRow::Data(0), 1, CellEdit::Text("false".into())));
+        assert_eq!(result.pending_mutations(DriverKind::Postgres).unwrap()[0].params[0], Value::Bool(false));
+    }
+
+    #[test]
+    fn typed_cell_checkbox_nullable_and_record_view() {
+        use egui_kittest::kittest::Queryable;
+        use egui::accesskit::Role;
+        let mut h = egui_kittest::Harness::builder().with_size([850.0, 250.0]).wgpu().build_ui_state(
+            |ui, state: &mut GridHarness| {
+                if ui.ctx().cumulative_pass_nr() == 0 { theme::apply(ui.ctx()); return; }
+                ui.horizontal(|ui| edit_status_chip(ui, &state.rs));
+                grid(ui, &mut state.rs, &mut state.tiles);
+            }, GridHarness { rs: typed_result(), tiles: super::super::map::TileCache::new(String::new(), std::env::temp_dir()), sql: String::new(), submitted: Vec::new(), toolbar: false });
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::CheckBox, "True").click();
+        h.run_steps(2);
+        assert_eq!(h.state().rs.edits.changed[&(0, 1)], CellEdit::Text("false".into()));
+        h.get_by_role_and_label(Role::Button, "NULL").click();
+        h.run_steps(2);
+        assert_eq!(h.state().rs.edits.changed[&(0, 1)], CellEdit::Null);
+        h.get_by_role_and_label(Role::CheckBox, "NULL").click();
+        h.run_steps(2);
+        assert!(h.state().rs.edits.changed.is_empty());
+        h.state_mut().rs.edits.editing = Some((GridRow::Data(0), 2, "12.34".into()));
+        h.state_mut().rs.edits.editing_needs_focus = true;
+        h.run_steps(2);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Text("not a number".into()));
+        h.run_steps(1);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().rs.edits.editing.as_ref().unwrap().2, "not a number");
+        assert!(h.state().rs.edits.changed.is_empty());
+        assert!(h.state().rs.edit_status.contains("decimal"));
+        std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/screenshots")).unwrap();
+        h.render().unwrap().save(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/screenshots/typed-cell-editors.png")).unwrap();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Text("45.67".into()));
+        h.run_steps(1);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert!(h.state().rs.edits.editing.is_none());
+        assert_eq!(h.state().rs.edits.changed[&(0, 2)], CellEdit::Text("45.67".into()));
+        if let editability::ResultEditability::Editable(metadata) = &mut h.state_mut().rs.editability {
+            std::sync::Arc::make_mut(metadata).column_specs[1].nullable = false;
+        }
+        h.run_steps(2);
+        assert!(h.query_by_role_and_label(Role::Button, "NULL").is_none());
+        h.state_mut().rs.selected = Some((GridRow::Data(0), 1));
+        h.state_mut().rs.pending_grid_focus = true;
+        h.run_steps(2);
+        h.key_press(Key::Space);
+        h.run_steps(2);
+        assert_eq!(h.state().rs.edits.changed[&(0, 1)], CellEdit::Text("false".into()));
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert!(!h.state().rs.edits.changed.contains_key(&(0, 1)));
+        h.state_mut().rs.record_view = true;
+        h.run_steps(3);
+        assert_eq!(h.get_all_by_role_and_label(Role::CheckBox, "True").count(), 2);
+        h.state_mut().rs.record_view = false;
+        if let editability::ResultEditability::Editable(metadata) = &mut h.state_mut().rs.editability {
+            std::sync::Arc::make_mut(metadata).column_specs[2].kind = crate::cell_value::EditorKind::Enum(vec!["45.67".into(), "Completed".into()]);
+        }
+        h.run_steps(2);
+        h.get_by_role(Role::ComboBox).click();
+        h.run_steps(2);
+        h.get_by_label("Completed").click();
+        h.run_steps(2);
+        assert_eq!(h.state().rs.edits.changed[&(0, 2)], CellEdit::Text("Completed".into()));
+        assert!(h.query_by_label("Set NULL").is_none());
     }
 
     #[test]

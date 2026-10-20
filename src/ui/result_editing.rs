@@ -358,7 +358,9 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| PhysicalColumn {
+                    enum_values: Vec::new(),
                     name: (*name).into(),
+                    type_name: String::new(),
                     ordinal: i as u32,
                     nullable: false,
                     generated: false,

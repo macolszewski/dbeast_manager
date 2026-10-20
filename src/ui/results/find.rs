@@ -241,7 +241,11 @@ impl ResultSet {
             GridRow::New(index) => index < self.edits.inserted.len(),
         };
         if valid_row && column < self.data.columns.len() {
-            self.set_cell(row, column, CellEdit::Text(text));
+            if !self.set_cell(row, column, CellEdit::Text(text.clone())) {
+                self.edits.editing = Some((row, column, text));
+                self.edits.editing_needs_focus = true;
+                return false;
+            }
         }
         true
     }

@@ -4,6 +4,7 @@ Design documents, plans and verification records for selected DBeast features. T
 
 | Document | What it covers |
 |---|---|
+| [Typed cell editors](typed-cell-editors.md) | Shared column contracts, editor composition, validation and driver-specific limits. |
 | [Local MCP contract](mcp-contract.md) | The permission model, tools, approval flow, idempotency, error handling and limits of the local MCP server. |
 | [MCP server in DBeast](mcp-plan.md) | The goals, trust boundary, technology choices, acceptance criteria and verification results of the MCP server increment. |
 | [Skills package for DBeast MCP](mcp-skills.md) | The structure and maintenance of the agent skills in `.agents/skills`, and how they were validated with simulated scenarios. |

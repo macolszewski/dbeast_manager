@@ -174,6 +174,7 @@ impl ResultSet {
                         .max()
                         .unwrap_or(0);
                     let editor = super::date_edit::column_chars(&meta.type_name)
+                        .max(if self.boolean_column(column) { 16 } else { 0 })
                         .max(if self.is_auto_increment(column) { 11 } else { 0 });
                     text_width(header.max(sample).max(editor))
                 })
@@ -191,7 +192,8 @@ impl ResultSet {
                 Shown::Value(value) => value_chars(value),
                 Shown::Edit(CellEdit::Text(text)) => bounded_chars(text),
                 Shown::Edit(_) => if self.is_auto_increment(column) { 11 } else { 9 },
-            }).max(super::date_edit::column_chars(&self.data.columns[column].type_name)))
+            }).max(super::date_edit::column_chars(&self.data.columns[column].type_name))
+              .max(if self.boolean_column(column) { 16 } else { 0 }))
             .max()
             .unwrap_or(0);
         let width = text_width(widest);

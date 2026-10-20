@@ -481,6 +481,8 @@ pub struct PhysicalTable {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalColumn {
     pub name: String,
+    pub enum_values: Vec<String>,
+    pub type_name: String,
     pub ordinal: u32,
     pub nullable: bool,
     pub generated: bool,
@@ -504,6 +506,7 @@ pub struct TableEditMetadata {
 /// Validated mapping from output positions to a single table's physical names.
 #[derive(Clone, Debug)]
 pub struct ResultEditMetadata {
+    pub column_specs: Vec<crate::cell_value::ColumnSpec>,
     pub table: PhysicalTable,
     pub physical_columns: Vec<Option<String>>,
     pub writable: Vec<bool>,

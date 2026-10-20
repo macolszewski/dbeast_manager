@@ -254,10 +254,12 @@ impl LiteConn {
             let rowid_usable = !without_rowid
                 && !rows.iter().any(|row| ["rowid", "_rowid_", "oid"].iter().any(|name| row.1.eq_ignore_ascii_case(name)));
             let mut columns: Vec<PhysicalColumn> = rows.into_iter().map(|(ordinal, name, ty, notnull, pk, hidden)| PhysicalColumn {
+                enum_values: Vec::new(),
                 name, ordinal: (ordinal + 1) as u32,
                 nullable: !(notnull || (pk > 0 && (without_rowid || (!has_pk_index && ty.eq_ignore_ascii_case("INTEGER"))))),
                 auto_increment: !without_rowid && !has_pk_index && pk > 0 && ty.eq_ignore_ascii_case("INTEGER"),
                 generated: hidden != 0, update_default: false, comparable: true,
+                type_name: ty,
             }).collect();
             let mut primary_key: Vec<String> = key.into_iter().map(|(_, name)| name).collect();
             // Legacy SQLite allows NULL in a non-INTEGER primary key, so such a
@@ -267,7 +269,9 @@ impl LiteConn {
             if !key_usable && rowid_usable {
                 primary_key = vec![SQLITE_ROWID.into()];
                 columns.push(PhysicalColumn {
+                    enum_values: Vec::new(),
                     name: SQLITE_ROWID.into(), ordinal: 0, nullable: false,
+                    type_name: "INTEGER".into(),
                     auto_increment: true,
                     generated: true, update_default: false, comparable: true,
                 });
@@ -764,6 +768,25 @@ fn table_details(conn: &Connection, path: &[String]) -> Result<Vec<DbObject>> {
 #[cfg(test)]
 mod cell_editor_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn typed_cell_sqlite_metadata_and_boolean_binding() {
+        let mut source = DataSource::new(crate::model::DriverKind::Sqlite);
+        source.file = ":memory:".into();
+        let mut conn = LiteConn::open(&source).await.unwrap();
+        conn.execute_control("CREATE TABLE typed (id INTEGER PRIMARY KEY, enabled BOOLEAN NOT NULL, optional BOOLEAN); INSERT INTO typed VALUES (1,1,NULL)").await.unwrap();
+        let data = conn.execute("SELECT id, enabled, optional FROM typed", Page::first(500)).await.unwrap();
+        let physical = conn.table_edit_metadata(&OriginTable::Named { schema: "main".into(), table: "typed".into() }).await.unwrap();
+        let metadata = crate::result_edit::resolve(None, crate::model::DriverKind::Sqlite, &data, &physical).unwrap();
+        assert!(!metadata.column_specs[1].nullable);
+        assert!(metadata.column_specs[2].nullable);
+        assert_eq!(metadata.column_specs[1].kind, crate::cell_value::EditorKind::Boolean);
+        let changes = std::collections::HashMap::from([((0,1), crate::sqlgen::CellEdit::Text("false".into()))]);
+        let updates = crate::sqlgen::bound_updates(crate::model::DriverKind::Sqlite, &metadata, &data, &changes).unwrap();
+        assert_eq!(conn.execute_bound_update(&updates[0]).await.unwrap(), 1);
+        let read = conn.execute("SELECT enabled, typeof(enabled) FROM typed", Page::first(500)).await.unwrap();
+        assert_eq!(read.rows[0], vec![Value::Int(0), Value::Text("integer".into())]);
+    }
 
     #[tokio::test]
     async fn cell_editor_detects_only_sqlite_rowid_keys() {

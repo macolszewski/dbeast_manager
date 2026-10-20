@@ -84,6 +84,7 @@ impl ResultSet {
 
     pub(in crate::ui) fn apply_local_action(&mut self, action: ActionId, ctx: &Context) -> bool {
         self.commit_find_buffer();
+        if self.edits.editing.is_some() && action != ActionId::Revert { return false; }
         match action {
             ActionId::FindOnCurrentPage => self.open_find(),
             ActionId::RecordView => {

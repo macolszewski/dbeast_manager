@@ -104,6 +104,7 @@ pub fn bound_updates(
 ) -> Result<Vec<BoundUpdate>, String> {
     let columns = data.columns.len();
     if metadata.primary_key.is_empty()
+        || metadata.column_specs.len() != columns
         || metadata.physical_columns.len() != columns
         || metadata.writable.len() != columns
         || metadata.comparable.len() != columns
@@ -131,6 +132,7 @@ pub fn bound_updates(
         if matches!(edit, CellEdit::Default) && !metadata.update_default[col] {
             return Err("Set DEFAULT is unavailable for this column.".into());
         }
+        metadata.column_specs[col].validate(edit).map_err(|e| format!("{}: {e}", data.columns[col].name))?;
         by_row.entry(row).or_default().push((col, edit));
     }
     let mut out = Vec::with_capacity(by_row.len());
@@ -163,7 +165,7 @@ pub fn bound_updates(
             let value = match edit {
                 CellEdit::Default => "DEFAULT".into(),
                 CellEdit::Null => bind(driver, &mut params, Value::Null),
-                CellEdit::Text(text) => bind(driver, &mut params, Value::Text(text.clone())),
+                CellEdit::Text(_) => bind(driver, &mut params, metadata.column_specs[col].bind_value(edit)?),
             };
             assignments.push(format!(
                 "{} = {value}",
@@ -296,13 +298,14 @@ pub fn bound_mutations(
                     data.columns[col].name
                 ));
             };
+            metadata.column_specs[col].validate(edit).map_err(|e| format!("{}: {e}", data.columns[col].name))?;
             names.push(ident(driver, name));
             placeholders.push(bind(
                 driver,
                 &mut params,
                 match edit {
                     CellEdit::Null => Value::Null,
-                    CellEdit::Text(text) => Value::Text(text.clone()),
+                    CellEdit::Text(_) => metadata.column_specs[col].bind_value(edit)?,
                     CellEdit::Default => unreachable!(),
                 },
             ));
@@ -457,6 +460,7 @@ mod tests {
             ..Default::default()
         };
         let mut metadata = ResultEditMetadata {
+            column_specs: (0..2).map(|_| crate::cell_value::ColumnSpec::new(DriverKind::Postgres, "", true)).collect(),
             table: PhysicalTable {
                 schema: "odd\"schema".into(),
                 name: "rows".into(),

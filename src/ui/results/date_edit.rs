@@ -19,7 +19,7 @@ fn has_time(type_name: &str) -> bool {
         || name.starts_with("time ")
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct TimeParts {
     prefix: String,
     hour: String,
@@ -79,7 +79,110 @@ impl TimeParts {
     }
 }
 
-fn time_fields(ui: &mut Ui, text: &mut String, type_name: &str, dated: bool) {
+#[derive(Clone, Copy)]
+enum ComponentRule {
+    Number {
+        max: u32,
+        digits: usize,
+        signed: bool,
+    },
+    Fraction,
+    Zone,
+}
+
+impl ComponentRule {
+    fn accepts(self, text: &str) -> bool {
+        match self {
+            Self::Number {
+                max,
+                digits,
+                signed,
+            } => {
+                let digits_text = if signed {
+                    text.strip_prefix(['-', '+']).unwrap_or(text)
+                } else {
+                    text
+                };
+                digits_text.len() <= digits
+                    && digits_text.bytes().all(|c| c.is_ascii_digit())
+                    && (digits_text.is_empty()
+                        || digits_text.parse::<u32>().is_ok_and(|n| n <= max))
+            }
+            Self::Fraction => text.len() <= 9 && text.bytes().all(|c| c.is_ascii_digit()),
+            Self::Zone => {
+                if text.is_empty() || text == "Z" {
+                    return true;
+                }
+                let Some(rest) = text.strip_prefix(['+', '-']) else {
+                    return false;
+                };
+                let parts: Vec<_> = rest.split(':').collect();
+                parts.len() <= 3
+                    && parts.iter().enumerate().all(|(i, part)| {
+                        Self::Number {
+                            max: if i == 0 { 23 } else { 59 },
+                            digits: 2,
+                            signed: false,
+                        }
+                        .accepts(part)
+                            && (i == parts.len() - 1 || part.len() == 2)
+                    })
+            }
+        }
+    }
+
+    fn complete_zone(self, text: &str) -> bool {
+        self.accepts(text)
+            && (text.is_empty()
+                || text == "Z"
+                || matches!(text.len(), 6 | 9) && text[1..].split(':').all(|p| p.len() == 2))
+    }
+}
+
+/// Reject invalid input at the text buffer boundary, including paste and undo.
+struct ComponentBuffer<'a> {
+    value: &'a mut String,
+    rule: ComponentRule,
+    before_delete: Option<String>,
+}
+impl egui::TextBuffer for ComponentBuffer<'_> {
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<ComponentBuffer<'static>>()
+    }
+    fn is_mutable(&self) -> bool {
+        true
+    }
+    fn as_str(&self) -> &str {
+        self.value
+    }
+    fn insert_text(&mut self, text: &str, index: egui::text::CharIndex) -> usize {
+        let mut candidate = self.value.clone();
+        let inserted = egui::TextBuffer::insert_text(&mut candidate, text, index);
+        if self.rule.accepts(&candidate) {
+            *self.value = candidate;
+            inserted
+        } else {
+            if let Some(previous) = self.before_delete.take() {
+                *self.value = previous;
+            }
+            0
+        }
+    }
+    fn delete_char_range(&mut self, range: std::ops::Range<egui::text::CharIndex>) {
+        self.before_delete = Some(self.value.clone());
+        egui::TextBuffer::delete_char_range(self.value, range);
+    }
+}
+
+fn time_fields(
+    ui: &mut Ui,
+    text: &mut String,
+    type_name: &str,
+    dated: bool,
+    spec: Option<&crate::cell_value::ColumnSpec>,
+    draft_id: egui::Id,
+    reset: bool,
+) -> bool {
     let initial = if text.is_empty() {
         if dated {
             format!("{} 00:00:00", chrono::Local::now().date_naive())
@@ -89,19 +192,37 @@ fn time_fields(ui: &mut Ui, text: &mut String, type_name: &str, dated: bool) {
     } else {
         text.clone()
     };
-    let Some(mut parts) = TimeParts::parse(&initial, dated) else {
+    let cached = ui
+        .ctx()
+        .data(|data| data.get_temp::<(String, TimeParts)>(draft_id));
+    let parsed = cached
+        .filter(|(source, _)| !reset && source == text)
+        .map(|(_, parts)| parts)
+        .or_else(|| TimeParts::parse(&initial, dated));
+    let Some(mut parts) = parsed else {
         ui.label(
             egui::RichText::new("Enter a time as HH:MM:SS to edit its components.").size(11.0),
         );
-        return;
+        return false;
+    };
+    let duration = !dated && spec.is_some_and(|s| s.driver() == crate::model::DriverKind::MySql);
+    let hour_rule = ComponentRule::Number {
+        max: if duration { 838 } else { 23 },
+        digits: if duration { 3 } else { 2 },
+        signed: duration,
+    };
+    let minute_rule = ComponentRule::Number {
+        max: 59,
+        digits: 2,
+        signed: false,
     };
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        for (label, value) in [
-            ("Hours", &mut parts.hour),
-            ("Minutes", &mut parts.minute),
-            ("Seconds", &mut parts.second),
+        for (label, value, rule) in [
+            ("Hours", &mut parts.hour, hour_rule),
+            ("Minutes", &mut parts.minute, minute_rule),
+            ("Seconds", &mut parts.second, minute_rule),
         ] {
             ui.vertical(|ui| {
                 ui.label(
@@ -109,8 +230,13 @@ fn time_fields(ui: &mut Ui, text: &mut String, type_name: &str, dated: bool) {
                         .size(11.0)
                         .color(theme::TEXT_MUTED),
                 );
+                let mut buffer = ComponentBuffer {
+                    value,
+                    rule,
+                    before_delete: None,
+                };
                 let response = ui.add(
-                    egui::TextEdit::singleline(value)
+                    egui::TextEdit::singleline(&mut buffer)
                         .font(theme::mono(12.0))
                         .desired_width(80.0),
                 );
@@ -128,8 +254,13 @@ fn time_fields(ui: &mut Ui, text: &mut String, type_name: &str, dated: bool) {
                     .size(11.0)
                     .color(theme::TEXT_MUTED),
             );
+            let mut buffer = ComponentBuffer {
+                value: &mut parts.fraction,
+                rule: ComponentRule::Fraction,
+                before_delete: None,
+            };
             let response = ui.add(
-                egui::TextEdit::singleline(&mut parts.fraction)
+                egui::TextEdit::singleline(&mut buffer)
                     .font(theme::mono(12.0))
                     .desired_width(124.0)
                     .hint_text("0"),
@@ -146,8 +277,13 @@ fn time_fields(ui: &mut Ui, text: &mut String, type_name: &str, dated: bool) {
                         .size(11.0)
                         .color(theme::TEXT_MUTED),
                 );
+                let mut buffer = ComponentBuffer {
+                    value: &mut parts.zone,
+                    rule: ComponentRule::Zone,
+                    before_delete: None,
+                };
                 let response = ui.add(
-                    egui::TextEdit::singleline(&mut parts.zone)
+                    egui::TextEdit::singleline(&mut buffer)
                         .font(theme::mono(12.0))
                         .desired_width(124.0)
                         .hint_text("+00:00"),
@@ -158,9 +294,27 @@ fn time_fields(ui: &mut Ui, text: &mut String, type_name: &str, dated: bool) {
             });
         }
     });
-    if changed {
-        *text = parts.value();
+    let complete = !parts.hour.is_empty()
+        && parts.hour != "-"
+        && parts.hour != "+"
+        && !parts.minute.is_empty()
+        && !parts.second.is_empty()
+        && hour_rule.accepts(&parts.hour)
+        && minute_rule.accepts(&parts.minute)
+        && minute_rule.accepts(&parts.second)
+        && ComponentRule::Fraction.accepts(&parts.fraction)
+        && ComponentRule::Zone.complete_zone(&parts.zone);
+    let candidate = parts.value();
+    let valid = complete && spec.is_none_or(|s| s.validate_text(&candidate).is_ok());
+    if changed && valid {
+        *text = candidate;
     }
+    if !valid {
+        ui.colored_label(theme::RED, "Complete a valid time before applying.");
+    }
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(draft_id, (text.clone(), parts)));
+    valid
 }
 
 pub(super) fn column_chars(type_name: &str) -> usize {
@@ -213,7 +367,12 @@ fn year_page(year: i32) -> i32 {
 }
 
 /// Returns the text response and whether the calendar owns this interaction.
-pub(super) fn editor(ui: &mut Ui, text: &mut String, type_name: &str) -> (Response, bool) {
+pub(super) fn editor(
+    ui: &mut Ui,
+    text: &mut String,
+    type_name: &str,
+    spec: Option<&crate::cell_value::ColumnSpec>,
+) -> (Response, bool) {
     let dated = has_date(type_name);
     let timed = has_time(type_name);
     let temporal = dated || timed;
@@ -297,6 +456,7 @@ pub(super) fn editor(ui: &mut Ui, text: &mut String, type_name: &str) -> (Respon
         active && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let mut chosen = None;
     let mut applied = false;
+    let mut time_valid = true;
     popup.show(|ui| {
         ui.set_width(280.0);
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
@@ -542,7 +702,15 @@ pub(super) fn editor(ui: &mut Ui, text: &mut String, type_name: &str) -> (Respon
                 }
                 if timed {
                     ui.separator();
-                    time_fields(ui, text, type_name, dated);
+                    time_valid = time_fields(
+                        ui,
+                        text,
+                        type_name,
+                        dated,
+                        spec,
+                        out.id.with("time_draft"),
+                        clicked,
+                    );
                 }
             });
         ui.separator();
@@ -562,11 +730,17 @@ pub(super) fn editor(ui: &mut Ui, text: &mut String, type_name: &str) -> (Respon
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 applied = ui
-                    .add_sized(
-                        [64.0, 24.0],
-                        egui::Button::new(egui::RichText::new("Apply").size(12.0)),
+                    .add_enabled_ui(
+                        time_valid && spec.is_none_or(|s| s.validate_text(text).is_ok()),
+                        |ui| {
+                            ui.add_sized(
+                                [64.0, 24.0],
+                                egui::Button::new(egui::RichText::new("Apply").size(12.0)),
+                            )
+                            .clicked()
+                        },
                     )
-                    .clicked();
+                    .inner;
             });
         });
         if (chosen.is_some() && !timed) || applied || escaped {
@@ -590,6 +764,69 @@ pub(super) fn editor(ui: &mut Ui, text: &mut String, type_name: &str) -> (Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_editor_time_fields_reject_invalid_input_and_preserve_timestamp() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let original = "2026-10-12T12:18:57.235043+00:00";
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([500.0, 220.0])
+            .build_ui_state(
+                |ui, state: &mut (String, bool)| {
+                    let spec = crate::cell_value::ColumnSpec::new(
+                        crate::model::DriverKind::Postgres,
+                        "timestamptz",
+                        false,
+                    );
+                    state.1 = time_fields(
+                        ui,
+                        &mut state.0,
+                        "timestamptz",
+                        true,
+                        Some(&spec),
+                        egui::Id::new("time_test"),
+                        false,
+                    );
+                    ui.add_enabled(state.1, egui::Button::new("Apply"));
+                },
+                (original.to_string(), true),
+            );
+        for (label, invalid, valid) in [
+            ("Hours", "24", "12"),
+            ("Minutes", "60", "18"),
+            ("Seconds", "60", "57"),
+            ("Fractional seconds", "abc", "235043"),
+            ("Time zone", "+00:99", "+00:00"),
+        ] {
+            let before = h.state().0.clone();
+            h.get_by_role_and_label(egui::accesskit::Role::TextInput, label)
+                .click();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            h.event(egui::Event::Text(invalid.into()));
+            h.run_steps(2);
+            assert_eq!(
+                h.state().0,
+                before,
+                "invalid {label} must not change the timestamp"
+            );
+            if matches!(label, "Hours" | "Minutes" | "Seconds") {
+                h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+                h.key_press(egui::Key::Backspace);
+                h.run_steps(2);
+                assert_eq!(h.state().0, before);
+                assert!(!h.state().1);
+                assert!(h.get_by_label("Apply").accesskit_node().is_disabled());
+            }
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            h.event(egui::Event::Text(valid.into()));
+            h.run_steps(2);
+            assert!(h.state().1, "{label} can be corrected");
+            h.event(egui::Event::Text("ddffs".into()));
+            h.run_steps(2);
+            assert_eq!(h.state().0, before, "letters cannot enter {label}");
+        }
+        assert_eq!(h.state().0, original);
+    }
 
     #[test]
     fn cell_editor_time_components_preserve_precision_and_zone() {

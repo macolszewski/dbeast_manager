@@ -9,12 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shared typed cell editors validate nullability, numeric ranges and precision,
+  character lengths, date/time, JSON, UUID and enum values before staging changes
+  and again before generating UPDATE or INSERT. Boolean cells have green checkmarks without redundant True/False labels
+  and nullable-only NULL actions; enum cells offer declared labels. Invalid drafts
+  remain editable in the grid and Value Editor.
+
 - Date, time and timestamp cells offer type-specific calendar and time fields
   alongside direct text editing in the grid and Record View, preserving
   fractional seconds and time zones. The calendar expands from the cell and
   offers month and year grids within one panel, with matching Today/Apply buttons.
 
 ### Fixed
+
+- Calendar time fields reject invalid typing and paste across hours, minutes,
+  seconds, fractions and offsets. Incomplete time drafts do not corrupt the cell
+  value, and Apply stays disabled until the time is valid.
 
 - Repainting wide and transposed grids reuses cumulative column positions and
   shared resize settings instead of revisiting every hidden record.

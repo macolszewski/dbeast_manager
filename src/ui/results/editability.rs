@@ -55,7 +55,8 @@ impl ResultSet {
 
     fn metadata_fits(&self, metadata: &ResultEditMetadata) -> bool {
         let columns = self.data.columns.len();
-        metadata.physical_columns.len() == columns
+        metadata.column_specs.len() == columns
+            && metadata.physical_columns.len() == columns
             && metadata.writable.len() == columns
             && metadata.comparable.len() == columns
             && metadata.update_default.len() == columns
@@ -143,6 +144,7 @@ impl ResultSet {
 
     pub(super) fn can_edit_text(&self, row: GridRow, column: usize) -> bool {
         self.can_edit_cell(row, column)
+            && self.column_spec(column).is_none_or(|spec| spec.kind != crate::cell_value::EditorKind::Binary)
             && !matches!(row, GridRow::Data(index) if matches!(self.data.rows[index][column], crate::model::Value::Bytes(_)))
     }
 
@@ -215,6 +217,7 @@ impl ResultSet {
             exact_columns: vec![true; columns],
         });
         self.editability = ResultEditability::Editable(Arc::new(ResultEditMetadata {
+            column_specs: self.data.columns.iter().map(|c| crate::cell_value::ColumnSpec::new(crate::model::DriverKind::Postgres, &c.type_name, true)).collect(),
             table: PhysicalTable {
                 schema: "main".into(),
                 name: "test".into(),
@@ -290,6 +293,7 @@ pub(super) mod tests {
 
     pub(in crate::ui::results) fn metadata() -> ResultEditMetadata {
         ResultEditMetadata {
+            column_specs: (0..3).map(|_| crate::cell_value::ColumnSpec::new(DriverKind::Postgres, "", true)).collect(),
             table: PhysicalTable {
                 schema: "main".into(),
                 name: "records".into(),

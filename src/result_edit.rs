@@ -73,6 +73,7 @@ pub fn resolve(
     let mut writable = Vec::with_capacity(data.columns.len());
     let mut comparable = Vec::with_capacity(data.columns.len());
     let mut update_default = Vec::with_capacity(data.columns.len());
+    let mut column_specs = Vec::with_capacity(data.columns.len());
     let mut auto_increment = Vec::with_capacity(data.columns.len());
     for (index, origin) in source.columns.iter().enumerate() {
         let column = match origin.as_ref().map(|c| &c.column) {
@@ -92,6 +93,12 @@ pub fn resolve(
         {
             return Err("A physical column appears more than once in this result.".into());
         }
+        let type_name = column.map(|c| c.type_name.as_str()).filter(|s| !s.is_empty()).unwrap_or(&data.columns[index].type_name);
+        let mut spec = crate::cell_value::ColumnSpec::new(driver, type_name, column.is_some_and(|c| c.nullable));
+        if let Some(column) = column && !column.enum_values.is_empty() {
+            spec.kind = crate::cell_value::EditorKind::Enum(column.enum_values.clone());
+        }
+        column_specs.push(spec);
         let can_write = column.is_some_and(|c| !c.generated && source.exact_columns[index]);
         physical_columns.push(column.map(|c| c.name.clone()));
         writable.push(can_write);
@@ -118,6 +125,7 @@ pub fn resolve(
     }
     validate_keys(data, &primary_key)?;
     Ok(ResultEditMetadata {
+        column_specs,
         table: table.table.clone(),
         physical_columns,
         writable,
@@ -443,7 +451,9 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| PhysicalColumn {
+                    enum_values: Vec::new(),
                     name: (*name).into(),
+                    type_name: String::new(),
                     ordinal: i as u32 + 1,
                     nullable: false,
                     generated: i == 3,

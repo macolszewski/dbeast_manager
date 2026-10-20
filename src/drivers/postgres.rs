@@ -539,9 +539,13 @@ impl PgConn {
         let schema: String = table.get(0);
         let name: String = table.get(1);
         let rows = self.client.query(
-            "select a.attname, a.attnum, a.attnotnull, a.attgenerated::text, a.attidentity::text, \
+            "select a.attname, a.attnum, (a.attnotnull or t.typnotnull), a.attgenerated::text, a.attidentity::text, \
              t.typname, t.typtype::text, \
-             pg_catalog.pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) is not null \
+             pg_catalog.pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) is not null, \
+             pg_catalog.format_type(case when t.typtype='d' then t.typbasetype else a.atttypid end, \
+                 case when t.typtype='d' then t.typtypmod else a.atttypmod end), \
+             array(select e.enumlabel::text from pg_catalog.pg_enum e \
+                 where e.enumtypid=case when t.typtype='d' then t.typbasetype else t.oid end order by e.enumsortorder) \
              from pg_catalog.pg_attribute a \
              join pg_catalog.pg_type t on t.oid=a.atttypid \
              where a.attrelid=$1 and a.attnum>0 and not a.attisdropped order by a.attnum", &[oid]).await?;
@@ -553,6 +557,8 @@ impl PgConn {
                 PhysicalColumn {
                     name: row.get(0),
                     ordinal: row.get::<_, i16>(1) as u32,
+                    type_name: row.get(8),
+                    enum_values: row.get(9),
                     nullable: !row.get::<_, bool>(2),
                     generated,
                     auto_increment: row.get(7),

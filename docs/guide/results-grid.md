@@ -159,6 +159,42 @@ You can edit table data in the table editor and, under certain conditions, the r
 
 ![Table editor with an edited cell, the DML preview showing a parameterized UPDATE, and the value panel](../images/07-grid-edit.png)
 
+### Editors follow the column type
+
+DBeast loads each physical column's type and nullability once with its editing
+metadata. The grid, Transpose, Record View and Value Editor share these rules:
+
+| Type | Editor and validation |
+|---|---|
+| Boolean | Checkbox only: a green checkmark means true and an empty box means false, without redundant text labels. **NULL** is a separate action, available only for nullable columns. An indeterminate checkbox represents NULL or DEFAULT, with an explicit label. Enter or Space toggles a selected boolean cell. |
+| Integer | Whole numbers within the declared type's range, including MySQL unsigned ranges. |
+| Numeric / decimal | Decimal notation and exponents without conversion to floating point. Nonnegative scales enforce precision and reject values requiring rounding. |
+| Floating point | Numeric syntax and range for the floating-point type. |
+| Character | Declared character length, counted as Unicode characters. |
+| Date / time / timestamp | Valid ISO date/time text plus the existing calendar and time editor. |
+| JSON / UUID | Valid JSON syntax or UUID format. |
+| ENUM | A dropdown of declared labels, with **Set NULL** only for nullable columns. |
+| Binary | Text editing is unavailable; a binary editor is not yet implemented. |
+
+An invalid entry stays in the edit buffer, with a red outline and an **Invalid
+value** status. Hover over either to read the reason. Correct it or press Escape
+to discard the draft. Enter does not stage an invalid entry, and Submit cannot
+send it. UPDATE and INSERT generation repeat validation so other editing paths
+use the same contract. **Set NULL** is disabled for nonnullable columns.
+Automatic key fields continue to use DEFAULT when left unset.
+
+SQLite permits values beyond a declared type's affinity, but DBeast's typed
+editors intentionally enforce common declared types; SQLite character length
+annotations are not enforced. MySQL exposes BOOLEAN as TINYINT(1), which remains
+an integer editor because that declaration also permits values other than 0/1.
+PostgreSQL domains use their base type and nullability. Custom CHECK constraints,
+foreign keys, uniqueness, unsupported custom types, arrays and spatial types
+remain subject to server validation. Negative numeric scales are syntax-checked;
+the server handles their rounding and precision. DEFAULT expressions are also
+resolved by the server.
+
+![Boolean checkbox and a numeric draft rejected before staging](../images/typed-cell-editors.png)
+
 ### Making changes
 
 - Double-click a cell, or press Enter, to edit it. Enter confirms, Escape cancels.
@@ -179,14 +215,19 @@ You can edit table data in the table editor and, under certain conditions, the r
   leads to months, then days, all inside the same panel. Escape closes the panel
   and returns focus to the editable field.
   DATE shows a calendar; TIME shows hours, minutes, seconds and fractional
-  seconds; TIMESTAMP and DATETIME show both. Zoned values also expose the
+  seconds; TIMESTAMP and DATETIME show both. Component fields reject letters,
+  invalid pasted text and out-of-range numbers. Hours use 0-23 (MySQL TIME
+  durations allow signed hours up to 838); minutes and seconds use 0-59.
+  Fractional seconds accept digits, and offsets accept a sign and numeric
+  components. Incomplete components stay in the popup draft, leave the cell
+  unchanged and disable Apply until corrected. Zoned values also expose the
   time-zone offset. Picking a timestamp day keeps the panel open for time editing.
   The complete date/time string remains directly editable in the table cell.
   **Today** and **Apply** use matching buttons. **Apply** returns to the cell
   without submitting changes to the database.
   Choosing a day preserves the existing time, fractional seconds and time-zone
-  suffix. You can still type the complete value manually; the database validates
-  it when you submit. This works in the grid and Record View.
+  suffix. You can still type the complete value manually; DBeast validates
+  its format before staging it. This works in the grid and Record View.
 - Row shortcuts work on the selected cell when no text field has keyboard focus.
 
 Changed cells are blue, new rows green, and rows to be deleted red and struck through. Before you switch tabs, a cell being edited is added to the pending changes (it is not submitted).

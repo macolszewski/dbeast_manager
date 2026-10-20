@@ -27,3 +27,5 @@ pub mod search;
 pub mod splitter;
 pub mod sqlgen;
 pub mod ui;
+
+pub mod cell_value;

@@ -70,7 +70,8 @@ These shortcuts work only while the grid has focus, so they never capture typing
 | `⇧` + arrows, `⇧`-click | Extend the selection to a rectangle |
 | `⌘A` | Select all cells of the visible page |
 | `⌘C` | Copy the selected value or range |
-| `Enter` / `Escape` | Start / cancel editing a cell |
+| `Enter` / `Escape` | Start / cancel editing a cell; invalid drafts remain open |
+| `Space` / `Enter` | Toggle the selected boolean cell while the grid has focus |
 | `⇧↵` | Open in Value Editor |
 | `⌘⇧↵` | Show Record View |
 | `⌘↵` | Submit pending changes |
