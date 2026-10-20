@@ -171,13 +171,19 @@ You can edit table data in the table editor and, under certain conditions, the r
   Clearing such a key in a new row also restores automatic generation.
 - Date, time and timestamp cells keep a directly editable text field. While editing,
   use **Choose Date** (`…`) to open a calendar with month navigation and **Today**.
-  Select a month from the header and type any year from 1 to 9999 directly
-  into **Year**, then choose the day. Enter in the year field keeps the panel open.
+  The panel expands below the field as an overlay without moving table rows.
+  Near the bottom of the window it opens above the field; limited space makes
+  its content scroll while the action buttons stay visible.
+  Click the month heading to choose from twelve months, or the year heading to
+  choose from a grid of years. Arrows page through 24-year ranges. Choosing a year
+  leads to months, then days, all inside the same panel. Escape closes the panel
+  and returns focus to the editable field.
   DATE shows a calendar; TIME shows hours, minutes, seconds and fractional
   seconds; TIMESTAMP and DATETIME show both. Zoned values also expose the
   time-zone offset. Picking a timestamp day keeps the panel open for time editing.
-  The compact panel also contains the complete editable date/time string;
-  **Apply** returns to the cell without submitting changes to the database.
+  The complete date/time string remains directly editable in the table cell.
+  **Today** and **Apply** use matching buttons. **Apply** returns to the cell
+  without submitting changes to the database.
   Choosing a day preserves the existing time, fractional seconds and time-zone
   suffix. You can still type the complete value manually; the database validates
   it when you submit. This works in the grid and Record View.
@@ -185,7 +191,9 @@ You can edit table data in the table editor and, under certain conditions, the r
 
 Changed cells are blue, new rows green, and rows to be deleted red and struck through. Before you switch tabs, a cell being edited is added to the pending changes (it is not submitted).
 
-![New row with an automatically generated key and a calendar beside the editable timestamp](../images/date-cell-editor.png)
+![Calendar expanding from a timestamp cell without moving table rows](../images/date-cell-editor.png)
+
+![Year selection within the same calendar panel](../images/date-cell-years.png)
 
 ### Submitting
 

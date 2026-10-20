@@ -2717,9 +2717,16 @@ mod tests {
                 },
             );
         h.run_steps(3);
-        h.get_by_label("<generated>");
+        let row_rect = h.get_by_label("<generated>").rect();
+        let field_rect = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Date and time").rect();
         h.get_by_label("Choose Date").click();
         h.run_steps(3);
+        assert_eq!(h.get_by_label("<generated>").rect(), row_rect);
+        let weekday = h.get_by_label("Mo").rect();
+        assert!((weekday.center().x - field_rect.left() - 26.0).abs() < 4.0,
+            "popup must align with the field, not its trailing button");
+        assert!(weekday.top() > field_rect.bottom());
+        assert_eq!(h.get_by_label("Today").rect().size(), h.get_by_label("Apply").rect().size());
         assert!((h.get_by_label("2026-10-01").rect().center().x
             - h.get_by_label("Th").rect().center().x).abs() < 1.0);
         assert!((h.get_by_label("2026-10-19").rect().center().x
@@ -2734,23 +2741,36 @@ mod tests {
             .unwrap();
         h.ctx.set_zoom_factor(1.5);
         h.run_steps(3);
+        assert!(h.get_by_label("Choose Month").rect().top() >=
+            h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Date and time").rect().bottom());
         h.render().unwrap().save(concat!(env!("CARGO_MANIFEST_DIR"),
             "/docs/screenshots/date-cell-editor-zoom.png")).unwrap();
         h.ctx.set_zoom_factor(1.0);
         h.run_steps(3);
-        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Year").focus();
-        h.run_steps(1);
-        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
-        h.event(egui::Event::Text("1999".into()));
+        h.get_by_label("Choose Month").click();
         h.run_steps(2);
-        h.key_press(Key::Enter);
+        h.get_by_label("February").click();
+        h.run_steps(2);
+        h.get_by_label("2026-02-01");
+        h.get_by_label("Choose Year").click();
+        h.run_steps(2);
+        h.render().unwrap().save(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/docs/screenshots/date-cell-years.png")).unwrap();
+        h.get_by_label("Previous Period").click();
+        h.run_steps(2);
+        h.get_by_label("1999").click();
+        h.run_steps(2);
+        h.render().unwrap().save(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/docs/screenshots/date-cell-months.png")).unwrap();
+        h.get_by_label("October").click();
         h.run_steps(2);
         h.get_by_label("1999-10-23");
         assert!(h.state().rs.edits.editing.is_some());
-        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Year").focus();
-        h.run_steps(1);
-        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
-        h.event(egui::Event::Text("2026".into()));
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().rs.edits.editing.is_some());
+        assert!(h.query_by_label("Choose Month").is_none());
+        h.get_by_label("Choose Date").click();
         h.run_steps(2);
         h.get_by_label("2026-10-23").click();
         h.run_steps(3);
@@ -2765,13 +2785,17 @@ mod tests {
         h.run_steps(1);
         assert_eq!(h.state().rs.edits.editing.as_ref().unwrap().2,
             "2026-10-23 12:34:09.123456+02:00");
+        h.get_by_label("Today").click();
+        h.run_steps(2);
+        assert_eq!(h.state().rs.edits.editing.as_ref().unwrap().2,
+            format!("{} 12:34:09.123456+02:00", chrono::Local::now().date_naive()));
+        h.get_by_label("Apply").click();
+        h.run_steps(2);
         h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Date and time").focus();
         h.run_steps(1);
         h.key_press_modifiers(Modifiers::COMMAND, Key::A);
         h.event(egui::Event::Text("2027-01-02 03:04:05+01:00".into()));
         h.run_steps(1);
-        h.get_by_label("Apply").click();
-        h.run_steps(2);
         h.key_press(Key::Enter);
         h.run_steps(3);
         assert_eq!(

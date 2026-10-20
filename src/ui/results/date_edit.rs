@@ -188,6 +188,30 @@ fn replace_date(text: &mut String, date: NaiveDate, type_name: &str) {
     *text = format!("{}{suffix}", date.format("%Y-%m-%d"));
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum CalendarView {
+    #[default]
+    Days,
+    Months,
+    Years,
+}
+
+fn dropdown_indicator(ui: &Ui, response: &Response) {
+    let center = egui::pos2(response.rect.right() - 10.0, response.rect.center().y);
+    ui.painter().add(egui::Shape::line(
+        vec![
+            center + egui::vec2(-3.0, -1.5),
+            center + egui::vec2(0.0, 1.5),
+            center + egui::vec2(3.0, -1.5),
+        ],
+        egui::Stroke::new(1.0, theme::TEXT_MUTED),
+    ));
+}
+
+fn year_page(year: i32) -> i32 {
+    (year.clamp(1, 9999) - 1) / 24 * 24 + 1
+}
+
 /// Returns the text response and whether the calendar owns this interaction.
 pub(super) fn editor(ui: &mut Ui, text: &mut String, type_name: &str) -> (Response, bool) {
     let dated = has_date(type_name);
@@ -237,196 +261,327 @@ pub(super) fn editor(ui: &mut Ui, text: &mut String, type_name: &str) -> (Respon
         }
         data.get_temp::<NaiveDate>(month_id).unwrap()
     });
-    let year_id = out.id.with("calendar_year");
-    let mut year_text = ui.ctx().data_mut(|data| {
-        if clicked || data.get_temp::<String>(year_id).is_none() {
-            data.insert_temp(year_id, month.year().to_string());
+    ui.ctx()
+        .accesskit_node_builder(out.id, |node| node.set_label("Date and time"));
+    let view_id = out.id.with("calendar_view");
+    let page_id = out.id.with("calendar_year_page");
+    let (mut view, mut page) = ui.ctx().data_mut(|data| {
+        if clicked {
+            data.insert_temp(view_id, CalendarView::Days);
+            data.insert_temp(page_id, year_page(month.year()));
         }
-        data.get_temp::<String>(year_id).unwrap()
+        (
+            data.get_temp::<CalendarView>(view_id).unwrap_or_default(),
+            data.get_temp::<i32>(page_id)
+                .unwrap_or_else(|| year_page(month.year())),
+        )
     });
+    let viewport = ui.ctx().content_rect();
+    let below = (viewport.bottom() - rect.bottom() - 16.0).max(0.0);
+    let above = (rect.top() - viewport.top() - 16.0).max(0.0);
+    let opens_below = below >= 180.0 || below >= above;
+    let available_height = if opens_below { below } else { above };
     let popup = egui::Popup::from_toggle_button_response(&button)
+        .anchor(rect)
+        .align(if opens_below {
+            egui::emath::RectAlign::BOTTOM_START
+        } else {
+            egui::emath::RectAlign::TOP_START
+        })
+        .align_alternatives(&[])
+        .gap(0.0)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(280.0);
     let active = popup.is_open() || clicked;
+    let escaped =
+        active && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let mut chosen = None;
     let mut applied = false;
     popup.show(|ui| {
         ui.set_width(280.0);
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
-        let input = ui.add(
-            egui::TextEdit::singleline(text)
-                .font(theme::mono(12.0))
-                .desired_width(272.0),
-        );
-        ui.ctx()
-            .accesskit_node_builder(input.id, |node| node.set_label("Date and time"));
-        if dated {
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui
-                    .add_sized([28.0, 26.0], egui::Button::new("‹").frame(false))
-                    .on_hover_text("Previous Month")
-                    .clicked()
-                    && let Some(previous) = month.checked_sub_months(Months::new(1))
-                {
-                    month = previous;
-                    year_text = month.year().to_string();
-                }
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    egui::ComboBox::from_id_salt("calendar_month_choice")
-                        .width(140.0)
-                        .selected_text(month.format("%B").to_string())
-                        .show_ui(ui, |ui| {
-                            for number in 1..=12 {
-                                let candidate = month.with_month(number).unwrap();
-                                if ui
-                                    .selectable_label(
-                                        month.month() == number,
-                                        candidate.format("%B").to_string(),
-                                    )
-                                    .clicked()
-                                {
-                                    month = candidate;
-                                }
-                            }
+        egui::ScrollArea::vertical()
+            .id_salt("calendar_body")
+            .max_height((available_height - 40.0).max(40.0))
+            .show(ui, |ui| {
+                if dated {
+                    ui.horizontal(|ui| {
+                        let previous =
+                            ui.add_sized([28.0, 26.0], egui::Button::new("‹").frame(false));
+                        previous.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                "Previous Period",
+                            )
                         });
-                    let year = ui.add(
-                        egui::TextEdit::singleline(&mut year_text)
-                            .font(theme::mono(12.0))
-                            .desired_width(60.0)
-                            .char_limit(4),
-                    );
-                    ui.ctx()
-                        .accesskit_node_builder(year.id, |node| node.set_label("Year"));
-                    if year.changed()
-                        && let Ok(value @ 1..=9999) = year_text.parse::<i32>()
-                        && let Some(date) = month.with_year(value)
-                    {
-                        month = date;
-                    }
-                    if (year.has_focus() || year.lost_focus())
-                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                    {
-                        year.surrender_focus();
-                    }
-                    if year.lost_focus() {
-                        year_text = month.year().to_string();
-                    }
-                });
-                if ui
-                    .add_sized([28.0, 26.0], egui::Button::new("›").frame(false))
-                    .on_hover_text("Next Month")
-                    .clicked()
-                    && let Some(next) = month.checked_add_months(Months::new(1))
-                {
-                    month = next;
-                    year_text = month.year().to_string();
-                }
-            });
-            ui.horizontal(|ui| {
-                for label in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
-                    ui.add_sized(
-                        [40.0, 22.0],
-                        egui::Label::new(
-                            egui::RichText::new(label)
-                                .size(11.0)
-                                .color(theme::TEXT_MUTED),
-                        ),
-                    );
-                }
-            });
-            let offset = month.weekday().num_days_from_monday();
-            let selected = date_prefix(text);
-            let today = chrono::Local::now().date_naive();
-            for week in 0..6 {
-                if week > 0 && month.with_day(week * 7 - offset + 1).is_none() {
-                    break;
-                }
-                ui.horizontal(|ui| {
-                    for weekday in 0..7 {
-                        let day = (week * 7 + weekday).checked_sub(offset).map(|day| day + 1);
-                        let date = day.and_then(|day| month.with_day(day));
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(40.0, 26.0),
-                            if date.is_some() {
-                                egui::Sense::click()
-                            } else {
-                                egui::Sense::hover()
-                            },
-                        );
-                        if let Some(date) = date {
-                            response.widget_info(|| {
+                        if previous.clicked() {
+                            match view {
+                                CalendarView::Days => {
+                                    if let Some(date) = month.checked_sub_months(Months::new(1)) {
+                                        month = date;
+                                    }
+                                }
+                                CalendarView::Months => {
+                                    if let Some(date) = month.with_year((month.year() - 1).max(1)) {
+                                        month = date;
+                                    }
+                                }
+                                CalendarView::Years => page = (page - 24).max(1),
+                            }
+                        }
+                        if view == CalendarView::Years {
+                            ui.add_sized(
+                                [224.0, 26.0],
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{} - {}",
+                                        page,
+                                        (page + 23).min(9999)
+                                    ))
+                                    .size(13.0),
+                                ),
+                            );
+                        } else {
+                            let month_button = ui.add_sized(
+                                [140.0, 26.0],
+                                egui::Button::new(month.format("%B").to_string()).frame(false),
+                            );
+                            month_button.widget_info(|| {
                                 egui::WidgetInfo::labeled(
                                     egui::WidgetType::Button,
                                     true,
-                                    date.format("%Y-%m-%d").to_string(),
+                                    "Choose Month",
                                 )
                             });
-                            let fill = if selected == Some(date) {
-                                theme::BG_SELECTED
-                            } else if response.hovered() || response.has_focus() {
-                                theme::BG_HOVER
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            let tile = rect.shrink2(egui::vec2(4.0, 1.0));
-                            ui.painter().rect_filled(tile, 3.0, fill);
-                            if date == today {
-                                ui.painter().rect_stroke(
-                                    tile,
-                                    3.0,
-                                    egui::Stroke::new(1.0, theme::ACCENT),
-                                    egui::StrokeKind::Inside,
-                                );
+                            dropdown_indicator(ui, &month_button);
+                            if month_button.clicked() {
+                                view = if view == CalendarView::Months {
+                                    CalendarView::Days
+                                } else {
+                                    CalendarView::Months
+                                };
                             }
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                date.day().to_string(),
-                                egui::FontId::proportional(13.0),
-                                theme::TEXT,
+                            let year_button = ui.add_sized(
+                                [84.0, 26.0],
+                                egui::Button::new(month.year().to_string()).frame(false),
                             );
-                            if response.clicked() {
-                                chosen = Some(date);
+                            year_button.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    "Choose Year",
+                                )
+                            });
+                            dropdown_indicator(ui, &year_button);
+                            if year_button.clicked() {
+                                page = year_page(month.year());
+                                view = CalendarView::Years;
                             }
                         }
-                    }
-                });
-            }
-        }
-        if let Some(date) = chosen {
-            replace_date(text, date, type_name);
-        }
-        if timed {
-            ui.separator();
-            time_fields(ui, text, type_name, dated);
-        }
+                        let next = ui.add_sized([28.0, 26.0], egui::Button::new("›").frame(false));
+                        next.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Next Period")
+                        });
+                        if next.clicked() {
+                            match view {
+                                CalendarView::Days => {
+                                    if let Some(date) = month.checked_add_months(Months::new(1)) {
+                                        month = date;
+                                    }
+                                }
+                                CalendarView::Months => {
+                                    if let Some(date) =
+                                        month.with_year((month.year() + 1).min(9999))
+                                    {
+                                        month = date;
+                                    }
+                                }
+                                CalendarView::Years => page = (page + 24).min(year_page(9999)),
+                            }
+                        }
+                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(280.0, 202.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_height(202.0);
+                            match view {
+                                CalendarView::Years => {
+                                    for row in 0..6 {
+                                        ui.horizontal(|ui| {
+                                            for col in 0..4 {
+                                                let year = page + row * 4 + col;
+                                                if year <= 9999
+                                                    && ui
+                                                        .add_sized(
+                                                            [70.0, 26.0],
+                                                            egui::Button::new(year.to_string())
+                                                                .frame(year == month.year())
+                                                                .selected(year == month.year()),
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    month = month.with_year(year).unwrap();
+                                                    view = CalendarView::Months;
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                CalendarView::Months => {
+                                    for row in 0..4 {
+                                        ui.horizontal(|ui| {
+                                            for col in 0..3 {
+                                                let candidate =
+                                                    month.with_month(row * 3 + col + 1).unwrap();
+                                                if ui
+                                                    .add_sized(
+                                                        [280.0 / 3.0, 40.0],
+                                                        egui::Button::new(
+                                                            candidate.format("%B").to_string(),
+                                                        )
+                                                        .frame(candidate.month() == month.month())
+                                                        .selected(
+                                                            candidate.month() == month.month(),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    month = candidate;
+                                                    view = CalendarView::Days;
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                CalendarView::Days => {
+                                    ui.horizontal(|ui| {
+                                        for label in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+                                            ui.add_sized(
+                                                [40.0, 22.0],
+                                                egui::Label::new(
+                                                    egui::RichText::new(label)
+                                                        .size(11.0)
+                                                        .color(theme::TEXT_MUTED),
+                                                ),
+                                            );
+                                        }
+                                    });
+                                    let offset = month.weekday().num_days_from_monday();
+                                    let selected = date_prefix(text);
+                                    let today = chrono::Local::now().date_naive();
+                                    for week in 0..6 {
+                                        if week > 0
+                                            && month.with_day(week * 7 - offset + 1).is_none()
+                                        {
+                                            break;
+                                        }
+                                        ui.horizontal(|ui| {
+                                            for weekday in 0..7 {
+                                                let day = (week * 7 + weekday)
+                                                    .checked_sub(offset)
+                                                    .map(|day| day + 1);
+                                                let date = day.and_then(|day| month.with_day(day));
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    egui::vec2(40.0, 26.0),
+                                                    if date.is_some() {
+                                                        egui::Sense::click()
+                                                    } else {
+                                                        egui::Sense::hover()
+                                                    },
+                                                );
+                                                if let Some(date) = date {
+                                                    response.widget_info(|| {
+                                                        egui::WidgetInfo::labeled(
+                                                            egui::WidgetType::Button,
+                                                            true,
+                                                            date.format("%Y-%m-%d").to_string(),
+                                                        )
+                                                    });
+                                                    let fill = if selected == Some(date) {
+                                                        theme::BG_SELECTED
+                                                    } else if response.hovered()
+                                                        || response.has_focus()
+                                                    {
+                                                        theme::BG_HOVER
+                                                    } else {
+                                                        egui::Color32::TRANSPARENT
+                                                    };
+                                                    let tile = rect.shrink2(egui::vec2(4.0, 1.0));
+                                                    ui.painter().rect_filled(tile, 3.0, fill);
+                                                    if date == today {
+                                                        ui.painter().rect_stroke(
+                                                            tile,
+                                                            3.0,
+                                                            egui::Stroke::new(1.0, theme::ACCENT),
+                                                            egui::StrokeKind::Inside,
+                                                        );
+                                                    }
+                                                    ui.painter().text(
+                                                        rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        date.day().to_string(),
+                                                        egui::FontId::proportional(13.0),
+                                                        theme::TEXT,
+                                                    );
+                                                    if response.clicked() {
+                                                        chosen = Some(date);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        },
+                    );
+                }
+                if let Some(date) = chosen {
+                    replace_date(text, date, type_name);
+                }
+                if timed {
+                    ui.separator();
+                    time_fields(ui, text, type_name, dated);
+                }
+            });
         ui.separator();
         ui.horizontal(|ui| {
             if dated
                 && ui
-                    .add(egui::Button::new(egui::RichText::new("Today").size(12.0)).frame(false))
+                    .add_sized(
+                        [64.0, 24.0],
+                        egui::Button::new(egui::RichText::new("Today").size(12.0)),
+                    )
                     .clicked()
             {
-                chosen = Some(chrono::Local::now().date_naive());
+                let today = chrono::Local::now().date_naive();
+                month = today.with_day(1).unwrap();
+                view = CalendarView::Days;
+                chosen = Some(today);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                applied = ui.small_button("Apply").clicked();
+                applied = ui
+                    .add_sized(
+                        [64.0, 24.0],
+                        egui::Button::new(egui::RichText::new("Apply").size(12.0)),
+                    )
+                    .clicked();
             });
         });
-        if (chosen.is_some() && !timed) || applied {
+        if (chosen.is_some() && !timed) || applied || escaped {
             ui.close();
         }
     });
     ui.ctx().data_mut(|data| {
         data.insert_temp(month_id, month);
-        data.insert_temp(year_id, year_text);
+        data.insert_temp(view_id, view);
+        data.insert_temp(page_id, page);
     });
     if let Some(date) = chosen {
         replace_date(text, date, type_name);
     }
-    if (chosen.is_some() && !timed) || applied {
+    if (chosen.is_some() && !timed) || applied || escaped {
         out.request_focus();
     }
     (out, active)

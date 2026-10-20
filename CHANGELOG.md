@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Date, time and timestamp cells offer type-specific calendar and time fields
   alongside direct text editing in the grid and Record View, preserving
-  fractional seconds and time zones. The calendar supports direct year entry
-  and month selection.
+  fractional seconds and time zones. The calendar expands from the cell and
+  offers month and year grids within one panel, with matching Today/Apply buttons.
 
 ### Fixed
 
