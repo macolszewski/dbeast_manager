@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-03
+
+### Added
+
+- Database Explorer shows the live connection state of each data source: a green
+  or red marker on the source icon and a "connection lost" label. Sources that are
+  not connected have a Connect action next to Disconnect.
+
+### Fixed
+
+- Sessions closed by the server (idle timeout, restart, network drop) reconnect
+  on the next query instead of failing with "connection closed" until Disconnect.
+  The Output log reports the new session; a session lost with an open transaction
+  reports the lost changes instead of reconnecting silently.
+
 ## [0.5.0] - 2026-10-20
 
 ### Added
@@ -203,6 +218,7 @@ First public version (source only).
 - The integrated macOS title bar keeps room for the window buttons at every
   Zoom IDE level.
 
-[Unreleased]: https://github.com/macolszewski/dbeast_manager/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/macolszewski/dbeast_manager/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/macolszewski/dbeast_manager/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/macolszewski/dbeast_manager/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/macolszewski/dbeast_manager/compare/v0.4.0...v0.4.1
