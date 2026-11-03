@@ -173,14 +173,12 @@ impl ColumnSpec {
                     }
                     if let (Some(precision), Some(scale)) = (precision, scale)
                         && *scale >= 0
+                        && (integer_digits > i64::from(*precision) - i64::from(*scale)
+                            || fractional_digits > i64::from(*scale))
                     {
-                        if integer_digits > i64::from(*precision) - i64::from(*scale)
-                            || fractional_digits > i64::from(*scale)
-                        {
-                            return Err(format!(
-                                "Value does not fit numeric({precision},{scale}) without rounding."
-                            ));
-                        }
+                        return Err(format!(
+                            "Value does not fit numeric({precision},{scale}) without rounding."
+                        ));
                     }
                 }
             }

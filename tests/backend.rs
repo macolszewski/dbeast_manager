@@ -2579,7 +2579,13 @@ fn a_script_waits_while_the_ui_has_not_taken_its_results() {
         &["select 'first'", "select 'second'", "select 'third'"],
         false,
     ));
-    let next = || backend.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Connection state changes are not results and do not count here.
+    let next = || loop {
+        match backend.rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Event::SourceLink { .. } => {}
+            event => return event,
+        }
+    };
     let first = next();
     assert!(matches!(&first, Event::StatementDone { sql, .. } if sql == "select 'first'"));
     // Not taken by the UI yet: the next statement waits.

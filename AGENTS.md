@@ -55,14 +55,15 @@ Rust 2024, GUI in egui/eframe 0.36 (immediate mode rendering), UI tests with egu
 | `src/ui/theme.rs` | dark theme palette, fonts, shared widgets |
 | `src/ui/about.rs` | About DBeast screen: animation, ASCII portrait, music on a separate thread (`rodio`), mute setting saved in the configuration |
 | `src/ui/map.rs`, `json_view.rs`, `files_panel.rs`, `highlight.rs` | Geo Viewer, JSON panel, Files window, syntax highlighting |
-| `docs/`, `mkdocs.yml` | MkDocs documentation site: user guide, reference, design notes, images |
+| `docs/`, `mkdocs.yml` | MkDocs documentation site: user guide, reference, images |
+| `design/` | design notes for contributors, kept out of the documentation site |
 
 UI pattern: views collect user intent into enums or event structs (`TreeAction`, `GridEvents`), and state changes after drawing. This avoids borrow conflicts in egui. Add new actions the same way.
 
 ## Conventions
 
 - Code, identifiers, comments, commits, README and all documentation in `docs/` are in English. UI text is in English and uses standard action names (for example "Add Row", "Show Record View").
-- User-facing documentation is the MkDocs site under `docs/`, configured by `mkdocs.yml`: the user guide is in `docs/guide/`, the reference in `docs/reference/` and design notes in `docs/design/`.
+- User-facing documentation is the MkDocs site under `docs/`, configured by `mkdocs.yml`: the user guide is in `docs/guide/` and the reference in `docs/reference/`. Design notes are in `design/`, outside the site; link to them from site pages with their GitHub URL.
 - Keyboard shortcuts follow macOS conventions. In code, define them as `KeyboardShortcut` with `Modifiers::COMMAND` so they map to Ctrl on other systems. Write shortcut text in the UI with macOS symbols and pass it through `theme::keys`, which shows Ctrl+Shift+L and so on on Linux and Windows. The application must work on macOS, Linux and Windows: platform-specific code goes behind `cfg` only. Verify Linux with a build in a Linux container and Windows with `cargo clippy --target x86_64-pc-windows-gnu --all-targets` (mingw-w64 installed); the on-demand Windows workflow runs the unit tests there.
 - Every new user-visible feature needs a test (unit test or UI test in `tests/ui_*.rs`), an entry in the relevant user guide page in `docs/guide/`, and an entry in the keyboard shortcuts reference in `docs/reference/` if it has a shortcut.
 - UI tests write screenshots to `docs/screenshots/`. Before finishing, look at the screenshot of the changed view and check that it is consistent with the rest of the interface. Screenshots used by the documentation are copied from `docs/screenshots/` into `docs/images/` by `scripts/docs-screenshots.sh`. `docs/screenshots/` is not committed; only `docs/images/` is. Run the script after changing a view that the documentation shows, with the test databases up so every screenshot has data.

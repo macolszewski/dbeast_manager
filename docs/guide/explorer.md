@@ -81,6 +81,7 @@ Right-click a node to see the actions available for it. Depending on the node ty
 | **Compare Structure With** | table, view | Opens DDL Diff against another object (see below) |
 | **Copy Name** | objects | Copies the object name |
 | **Refresh** | any node | Reloads that part of the tree |
+| **Connect** | data source | Connects and loads the tree; available while the source is not connected or its connection was lost, see [Lost connections](data-sources.md#lost-connections) |
 | **Disconnect** | data source | Closes the source's connections |
 | **Databases and Schemas…** | data source | Opens the scope chooser |
 | **Data Source Properties…** | data source | Opens the data source settings |

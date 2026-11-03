@@ -95,6 +95,12 @@ impl MyConn {
         })
     }
 
+    pub(super) async fn ping(&mut self) -> Result<()> {
+        use mysql_async::prelude::Queryable;
+        self.conn.ping().await?;
+        Ok(())
+    }
+
     pub async fn server_info(&mut self) -> Result<ServerInfo> {
         let version: Option<String> = self.conn.query_first("select version()").await?;
         let cipher: Option<(String, String)> = self.conn.query_first("SHOW SESSION STATUS LIKE 'Ssl_cipher'").await?;

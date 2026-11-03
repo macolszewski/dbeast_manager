@@ -250,7 +250,7 @@ password or a connection string.
 Read-only queries run through `query_sql`, which accepts only SQL that a full parser and the
 database itself prove to be read-only. Anything else goes through `request_sql`, which waits
 for you to approve the exact statement. Details: [AI agents guide](https://macolszewski.github.io/dbeast_manager/guide/ai-agents/)
-and the [MCP contract](docs/design/mcp-contract.md).
+and the [MCP contract](design/mcp-contract.md).
 
 ## Performance
 
@@ -276,8 +276,9 @@ from [`docs/`](docs):
   with screenshots.
 - [Reference](https://macolszewski.github.io/dbeast_manager/reference/keyboard-shortcuts/): keyboard
   shortcuts, performance, testing and known limitations.
-- [Design notes](https://macolszewski.github.io/dbeast_manager/design/): the MCP contract, credential
-  storage, TLS and other technical decisions.
+
+Design notes for contributors (the MCP contract, credential storage, TLS and other technical
+decisions) are in [`design/`](design) and are not part of the site.
 
 Preview it locally with `pip install -r docs/requirements.txt && mkdocs serve`.
 

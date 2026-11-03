@@ -2137,10 +2137,17 @@ mod tests {
             assert!(source_change_blocked_reason(tab).is_some(), "state {kind}");
         }
         tab.in_tx = false;
+        // A text column, so that Add Row opens the inline editor below.
         let mut result = crate::ui::ResultSet::new(
             "Result".into(),
-            "select 1".into(),
-            crate::model::QueryResult::default(),
+            "select name from test".into(),
+            crate::model::QueryResult {
+                columns: vec![crate::model::Column {
+                    name: "name".into(),
+                    type_name: "text".into(),
+                }],
+                ..Default::default()
+            },
             crate::model::Page::first(500),
         );
         result.edits.deleted.insert(0);

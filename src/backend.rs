@@ -8,6 +8,7 @@ mod explain;
 mod related;
 mod dump;
 mod import;
+mod link;
 pub use dump::{ToolJob, ToolTask};
 mod transfer;
 pub use import::{ImportJob, OnError};
@@ -63,6 +64,12 @@ pub enum Event {
     Notice {
         console_id: u64,
         text: String,
+    },
+    /// A data source got a working connection, or one of its connections was
+    /// lost. Sent only when the state changes.
+    SourceLink {
+        ds_id: String,
+        open: bool,
     },
     RunFinished {
         console_id: u64,
@@ -252,6 +259,9 @@ pub struct TablePage {
     pub ordered: bool,
 }
 
+/// How often idle sessions are checked for a connection the server closed.
+const LINK_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How long a table's primary key orders its pages before it is read again,
 /// also covering key changes made by other sessions.
 const PAGE_KEY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -301,7 +311,21 @@ struct SessionState {
     page_keys: HashMap<(Option<String>, String), (Vec<String>, std::time::Instant)>,
     /// A failed or ambiguous execution must never silently reconnect and retry.
     reconnect_required: Option<String>,
+    /// When the connection was last handed out; an idle one is checked first.
+    last_used: Option<std::time::Instant>,
+    /// A statement failed, possibly because the connection broke.
+    check_next: bool,
+    /// The connection was lost; the next one opened replaces it.
+    reconnecting: bool,
+    link: Option<link::SessionLink>,
 }
+
+/// Idle time after which a connection is pinged before it is used again.
+const CHECK_AFTER_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+const LOST_IN_TRANSACTION: &str = "The connection to the database was lost. The open transaction ended without a commit, so its uncommitted changes are lost. Execute again to reconnect.";
+
+const RECONNECTED: &str = "The connection to the database was lost; reconnected in a new session. Session settings and temporary objects were reset.";
 
 impl SessionState {
     fn ensure_usable(&self) -> anyhow::Result<()> {
@@ -314,6 +338,16 @@ impl SessionState {
     /// Drops the connection after Stop sent a cancel request or abandoned an
     /// operation; nothing uncommitted survives, so no reconnect is required.
     fn close_after_stop(&mut self) {
+        self.drop_conn();
+        self.report(None);
+    }
+
+    fn close_uncertain(&mut self, reason: String) {
+        self.close_after_stop();
+        self.reconnect_required = Some(reason);
+    }
+
+    fn drop_conn(&mut self) {
         self.conn = None;
         self.in_tx = false;
         self.edit_metadata.clear();
@@ -321,13 +355,48 @@ impl SessionState {
         self.related_metadata.clear();
     }
 
-    fn close_uncertain(&mut self, reason: String) {
-        self.conn = None;
-        self.in_tx = false;
-        self.edit_metadata.clear();
-        self.page_keys.clear();
-        self.related_metadata.clear();
-        self.reconnect_required = Some(reason);
+    fn report(&self, open: Option<bool>) {
+        if let Some(link) = &self.link {
+            link.set(open);
+        }
+    }
+
+    /// Drops a connection that the server closed or that no longer answers,
+    /// before anything is sent on it, so the next use opens a new one. Only a
+    /// lost transaction is an error: its changes are gone and the user must
+    /// know before running anything else.
+    async fn check_connection(&mut self) -> anyhow::Result<()> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        let idle = self
+            .last_used
+            .is_none_or(|used| used.elapsed() >= CHECK_AFTER_IDLE);
+        let alive = if conn.is_closed() {
+            false
+        } else if idle || self.check_next {
+            conn.is_alive().await
+        } else {
+            true
+        };
+        self.check_next = false;
+        self.last_used = Some(std::time::Instant::now());
+        if alive {
+            return Ok(());
+        }
+        let in_tx = self.in_tx;
+        self.drop_conn();
+        self.report(Some(false));
+        anyhow::ensure!(!in_tx, LOST_IN_TRANSACTION);
+        self.reconnecting = true;
+        Ok(())
+    }
+
+    /// The watcher's check, which needs no network round trip.
+    fn mark_if_closed(&self) {
+        if self.conn.as_ref().is_some_and(Connection::is_closed) {
+            self.report(Some(false));
+        }
     }
 
     async fn conn(&mut self, ds: &DataSource) -> anyhow::Result<&mut Connection> {
@@ -336,14 +405,22 @@ impl SessionState {
             "Saved passwords are unavailable. Retry loading or replace them in Data Sources and Drivers."
         );
         self.ensure_usable()?;
+        self.check_connection().await?;
         if self.conn.is_none() {
             self.conn = Some(Connection::open(ds).await?);
+            self.last_used = Some(std::time::Instant::now());
             self.open_database = MetadataKey::for_source(ds).database;
             self.configured_schema = SchemaSelection::Default;
             self.source_identity = Some(ds.identity());
             self.edit_metadata.clear();
             self.page_keys.clear();
             self.related_metadata.clear();
+            self.report(Some(true));
+            if std::mem::take(&mut self.reconnecting)
+                && let Some(link) = &self.link
+            {
+                link.notice(RECONNECTED);
+            }
         }
         anyhow::ensure!(
             self.source_identity.as_ref() == Some(&ds.identity()),
@@ -480,6 +557,7 @@ pub struct Backend {
     tasks: Arc<Mutex<HashMap<TaskId, tokio_util::sync::CancellationToken>>>,
     /// Connections of open Activity Monitors, by monitor.
     activity: ActivityConnections,
+    links: Arc<link::Links>,
 }
 
 impl Drop for Backend {
@@ -514,7 +592,7 @@ impl Backend {
             let _ = mcp_tx.send(Event::McpChanged);
             mcp_ctx.request_repaint();
         });
-        Self {
+        let backend = Self {
             pending_results: Arc::default(),
             mcp,
             rt,
@@ -532,7 +610,34 @@ impl Backend {
             graph_layouts: Arc::default(),
             tasks: Arc::default(),
             activity: Arc::default(),
-        }
+            links: Arc::default(),
+        };
+        backend.watch_links();
+        backend
+    }
+
+    /// Notices sessions closed by the server while they sit idle, so the
+    /// explorer shows a lost connection before the next query fails. Locked
+    /// sessions are busy and report their own state.
+    fn watch_links(&self) {
+        let sessions = Arc::downgrade(&self.sessions);
+        self.rt.spawn(async move {
+            let mut ticks = tokio::time::interval(LINK_WATCH_INTERVAL);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let Some(sessions) = sessions.upgrade() else {
+                    return;
+                };
+                let all: Vec<Session> = sessions.lock().unwrap().values().cloned().collect();
+                drop(sessions);
+                for session in all {
+                    if let Ok(state) = session.try_lock() {
+                        state.mark_if_closed();
+                    }
+                }
+            }
+        });
     }
 
     pub(crate) fn start_persistence(
@@ -633,7 +738,12 @@ impl Backend {
             .lock()
             .unwrap()
             .entry((ds_id.to_string(), name.to_string()))
-            .or_default()
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Mutex::new(SessionState {
+                    link: Some(self.links.register(ds_id, name, Arc::new(self.send()))),
+                    ..Default::default()
+                }))
+            })
             .clone()
     }
 
@@ -831,7 +941,7 @@ impl Backend {
         let session = self.session(&ds.id, "meta");
         self.spawn_metadata(ds.id.clone(), async move {
             let mut guard = session.lock().await;
-            guard.conn = None;
+            guard.close_after_stop();
             let result = async {
                 let conn = guard.conn(&ds).await?;
                 let info = conn.server_info().await?;
@@ -1086,6 +1196,7 @@ impl Backend {
                         // Restored results may initialize a new session's configured
                         // namespace. An existing session is only checked, never switched.
                         async {
+                            state.check_connection().await?;
                             if state.conn.is_none() {
                                 state.configure(&ds, &context.schema).await?;
                             }
@@ -1212,6 +1323,7 @@ impl Backend {
                         if failed {
                             // A key changed by another session may have broken the page.
                             state.page_keys.clear();
+                            state.check_next = true;
                         }
                         send(Event::StatementDone {
                             console_id,
@@ -1364,6 +1476,7 @@ impl Backend {
             .lock()
             .unwrap()
             .retain(|(id, _), _| id != ds_id);
+        self.links.forget_source(ds_id);
     }
 
     /// Closes one console's session.
@@ -1380,6 +1493,12 @@ impl Backend {
             .lock()
             .unwrap()
             .remove(&(ds_id.to_string(), console_id.to_string()));
+        if let Some(open) = self.links.forget_session(ds_id, &console_id.to_string()) {
+            (self.send())(Event::SourceLink {
+                ds_id: ds_id.to_owned(),
+                open,
+            });
+        }
     }
 }
 
@@ -1546,8 +1665,7 @@ async fn apply_update_batch(
             if outcome_unknown {
                 // Continuing on an uncertain connection risks repeating a committed
                 // update or accidentally committing a partially recovered transaction.
-                state.conn = None;
-                state.in_tx = false;
+                state.close_after_stop();
                 message.push_str(
                     "; the session was closed. Verify the database before submitting again.",
                 );

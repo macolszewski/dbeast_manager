@@ -200,6 +200,7 @@ impl App {
                         ),
                         Some(ConnStatus::Connecting) => ("connecting…".into(), theme::TEXT_MUTED),
                         Some(ConnStatus::Failed(error)) => (first_line(error), theme::RED),
+                        Some(ConnStatus::Lost) => ("connection lost".into(), theme::RED),
                         _ => (String::new(), theme::TEXT_MUTED),
                     };
                     state.status.insert(slot, status);
@@ -301,13 +302,23 @@ impl App {
                             ));
                             ui.close();
                         }
+                        let selected = self.selected_source_id();
+                        let connected = selected.is_some_and(|id| self.source_connected(id));
                         if ui
                             .add_enabled(
-                                self.selected_source_id().is_some(),
-                                egui::Button::new("Disconnect"),
+                                selected.is_some() && !connected,
+                                egui::Button::new("Connect"),
                             )
                             .clicked()
-                            && let Some(id) = self.selected_source_id()
+                            && let Some(id) = selected
+                        {
+                            actions.push(TreeAction::Connect(id.to_owned()));
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(selected.is_some(), egui::Button::new("Disconnect"))
+                            .clicked()
+                            && let Some(id) = selected
                         {
                             actions.push(TreeAction::Disconnect(id.to_owned()));
                             ui.close();
@@ -885,6 +896,13 @@ impl App {
                     actions.push(TreeAction::ChooseScope(source.id.clone()));
                     ui.close();
                 }
+                if ui
+                    .add_enabled(!self.source_connected(&source.id), egui::Button::new("Connect"))
+                    .clicked()
+                {
+                    actions.push(TreeAction::Connect(source.id.clone()));
+                    ui.close();
+                }
                 if ui.button("Disconnect").clicked() {
                     actions.push(TreeAction::Disconnect(source.id.clone()));
                     ui.close();
@@ -905,13 +923,28 @@ impl App {
                 }
             }
         });
-        if node.is_none()
-            && let Some(ConnStatus::Failed(error)) =
-                self.sources.get(&source.id).map(|source| &source.status)
-        {
-            response.clone().on_hover_text(error);
+        if node.is_none() {
+            let status = self.sources.get(&source.id).map(|source| &source.status);
+            paint_link_marker(ui, &response, current.depth, status);
+            match status {
+                Some(ConnStatus::Failed(error)) => {
+                    response.clone().on_hover_text(error);
+                }
+                Some(ConnStatus::Lost) => {
+                    response.clone().on_hover_text(
+                        "The connection was lost. The next query reconnects; Connect reloads the tree.",
+                    );
+                }
+                _ => {}
+            }
         }
         response
+    }
+
+    fn source_connected(&self, ds_id: &str) -> bool {
+        self.sources
+            .get(ds_id)
+            .is_some_and(|source| source.status.is_connected())
     }
 
     /// DBeast extension: standing agent access, chosen where the object is visible.
@@ -1580,6 +1613,7 @@ impl App {
             TreeAction::Toggle(..)
                 | TreeAction::Refresh(..)
                 | TreeAction::RefreshNode(..)
+                | TreeAction::Connect(..)
                 | TreeAction::Disconnect(..)
                 | TreeAction::CloseFile(..)
         ) {
@@ -1622,6 +1656,10 @@ impl App {
             TreeAction::RefreshNode(id, node) => {
                 self.expanded.insert((id.clone(), node.path.clone()));
                 self.load_node(&id, node);
+            }
+            TreeAction::Connect(id) => {
+                self.expanded.insert((id.clone(), Vec::new()));
+                self.connect(&id);
             }
             TreeAction::Disconnect(id) => self.disconnect(&id),
             TreeAction::Properties(id) => {
@@ -1809,6 +1847,22 @@ pub(super) fn tree_row_with_badge(
         &[],
         Sense::click(),
     )
+}
+
+/// A dot on the data source icon: green while connected, red when the
+/// connection was lost.
+fn paint_link_marker(ui: &Ui, response: &egui::Response, depth: usize, status: Option<&ConnStatus>) {
+    let color = match status {
+        Some(ConnStatus::Connected(_)) => theme::GREEN,
+        Some(ConnStatus::Lost) => theme::RED,
+        _ => return,
+    };
+    // The icon starts after the indent and the expand arrow (see tree_row_highlighted).
+    let x = response.rect.left() + 4.0 + depth as f32 * 16.0 + 14.0;
+    let center = egui::pos2(x + 13.0, response.rect.center().y + 4.0);
+    let painter = ui.painter_at(response.rect);
+    painter.circle_filled(center, 3.5, theme::BG_PANEL);
+    painter.circle_filled(center, 2.5, color);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2257,6 +2311,27 @@ mod tests {
         app.advance_explorer_reveal();
         assert!(app.sources[&id].loading.is_empty());
         assert!(matches!(app.sources[&id].status, ConnStatus::Failed(_)));
+    }
+
+    #[test]
+    fn link_events_mark_lost_connections_and_enable_connect() {
+        let (mut app, id) = cached_app();
+        // Losing a connection that was never shown as open changes nothing.
+        app.source_link(&id, false);
+        assert!(matches!(app.sources[&id].status, ConnStatus::Disconnected));
+        // A console may connect before the explorer does.
+        app.source_link(&id, true);
+        assert!(matches!(app.sources[&id].status, ConnStatus::Connected(_)));
+        assert!(app.source_connected(&id));
+        app.source_link(&id, false);
+        assert!(matches!(app.sources[&id].status, ConnStatus::Lost));
+        assert!(!app.source_connected(&id), "Connect is offered again");
+        app.source_link(&id, true);
+        assert!(app.source_connected(&id));
+        // After Disconnect a late report does not bring the source back.
+        app.disconnect(&id);
+        app.source_link("unknown-source", true);
+        assert!(!app.sources.contains_key("unknown-source"));
     }
 
     #[test]

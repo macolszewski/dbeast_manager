@@ -2,7 +2,7 @@
 
 DBeast includes a local [Model Context Protocol](https://modelcontextprotocol.io) server. It lets AI agents such as Claude Code or Codex read the schema and data you explicitly share, ask for approval before anything else, and run queries on separate connections without touching your consoles. You stay in control: an agent starts every session with no permissions, and only your decision in DBeast grants access.
 
-This page describes the feature from the user's side. The complete technical contract (tools, error codes, verification rules) is in the [MCP contract](../design/mcp-contract.md).
+This page describes the feature from the user's side. The complete technical contract (tools, error codes, verification rules) is in the [MCP contract](https://github.com/macolszewski/dbeast_manager/blob/master/design/mcp-contract.md).
 
 ## Starting the server
 

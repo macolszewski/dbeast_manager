@@ -1278,17 +1278,17 @@ pub fn grid(ui: &mut Ui, rs: &mut ResultSet, tiles: &mut super::map::TileCache) 
     let mut editing = ev.editing;
     match ev.finish_edit {
         Some(true) => {
-            if let Some((row, c, text)) = editing.take() {
-                if !rs.set_cell(row, c, CellEdit::Text(text.clone())) {
-                    editing = Some((row, c, text));
-                    ev.editing_needs_focus = true;
-                    ev.return_focus = false;
-                    ev.start_edit = None;
-                    ev.add_row = false;
-                    ev.clone_row = None;
-                    rs.select_cell((row, c), false);
-                    rs.pending_reveal = true;
-                }
+            if let Some((row, c, text)) = editing.take()
+                && !rs.set_cell(row, c, CellEdit::Text(text.clone()))
+            {
+                editing = Some((row, c, text));
+                ev.editing_needs_focus = true;
+                ev.return_focus = false;
+                ev.start_edit = None;
+                ev.add_row = false;
+                ev.clone_row = None;
+                rs.select_cell((row, c), false);
+                rs.pending_reveal = true;
             }
         }
         Some(false) => { editing = None; rs.edit_status = "Editable result".into(); },
