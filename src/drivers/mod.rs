@@ -382,6 +382,36 @@ impl Connection {
         self.epoch
     }
 
+    /// The server or the SSH tunnel has closed the session; known without a
+    /// network round trip.
+    pub fn is_closed(&self) -> bool {
+        self._tunnel.as_ref().is_some_and(|tunnel| !tunnel.is_alive())
+            || match &self.kind {
+                Kind::Postgres(conn) => conn.is_closed(),
+                Kind::MySql(_) | Kind::Sqlite(_) => false,
+            }
+    }
+
+    /// Whether the server still answers. A session that dropped silently
+    /// (network change, sleep, NAT timeout) fails here before a statement is
+    /// sent on it, so the caller can reconnect without guessing its outcome.
+    pub async fn is_alive(&mut self) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        let ping = async {
+            match &mut self.kind {
+                Kind::Postgres(conn) => conn.ping().await,
+                Kind::MySql(conn) => conn.ping().await,
+                Kind::Sqlite(_) => Ok(()),
+            }
+        };
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), ping).await,
+            Ok(Ok(()))
+        )
+    }
+
     pub(crate) fn clear_prepared_updates(&mut self) {
         if let Kind::Postgres(conn) = &mut self.kind {
             conn.clear_prepared_updates();

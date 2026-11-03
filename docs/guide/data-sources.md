@@ -193,6 +193,18 @@ DBeast detects broken connections instead of waiting indefinitely:
 - **PostgreSQL keepalive.** TCP keepalive probes start after 30 s of inactivity and repeat every 10 s, three times. On Linux, unacknowledged data also times out after 60 s.
 - **Waiting for a connection.** Stop, Disconnect and closing the tab also cancel a console that is still waiting for its connection.
 
+### Lost connections
+
+A connection can end without DBeast closing it: the server restarts, an administrator terminates the session, the server closes idle sessions, or the network changes while the computer sleeps.
+
+- **Connection status.** A connected data source has a green dot on its icon in the Database Explorer. When the server closes one of its connections, the dot turns red and the source shows `connection lost`, also in the console status bar. PostgreSQL connections are checked every few seconds without sending anything to the server; MySQL reports a closed connection only when it is used.
+- **Automatic reconnect.** Before a statement runs on a connection that is known to be closed, has been idle for 30 s, or failed on the previous statement, DBeast checks that the server still answers. If it does not, DBeast opens a new session, runs the statement there and writes `reconnected in a new session` to the Output log. Session settings, temporary tables and prepared statements of the old session are gone; the console's schema selection is applied again.
+- **Open transactions are never replaced.** If the lost session had an open transaction, the statement is not run. The Output log says that the uncommitted changes are lost, and the next execution reconnects.
+- **Failed statements are not retried.** When a connection breaks while a statement runs, DBeast cannot know whether the server executed it, so it reports the error and does not run it again. The next execution reconnects.
+- **Connect.** The **Connect** action in the data source context menu and in the **…** menu connects the explorer and reloads the tree. It is available while the source is not connected or its connection was lost.
+
+![Database Explorer and console status bar showing a lost connection](../images/connection-lost.png)
+
 ### Stopping a running statement
 
 When you press **Stop** (`⌘F2`) during execution, DBeast sends a cancel request and waits at most 1 s for it to be sent. It then closes the console session and unlocks the console, even if the server does not respond.

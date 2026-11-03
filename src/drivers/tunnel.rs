@@ -20,7 +20,7 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    fn is_alive(&self) -> bool {
+    pub(crate) fn is_alive(&self) -> bool {
         !self.session.is_closed() && !self.forwarder.is_finished()
     }
 }

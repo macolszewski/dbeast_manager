@@ -69,11 +69,21 @@ enum ConnStatus {
     Connecting,
     Connected(String),
     Failed(String),
+    /// A connection the server or network closed; the next use reconnects.
+    Lost,
+}
+
+impl ConnStatus {
+    fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected(_) | Self::Connecting)
+    }
 }
 
 #[derive(Default)]
 struct SourceState {
     status: ConnStatus,
+    /// Server product and version from the last explorer connection.
+    info: String,
     roots: Option<Vec<DbObject>>,
     loading: HashSet<Vec<String>>,
 }
@@ -253,6 +263,7 @@ enum TreeAction {
     ChooseScope(String),
     Refresh(String),
     RefreshNode(String, DbObject),
+    Connect(String),
     Disconnect(String),
     Properties(String),
     CopyName(String),
@@ -772,6 +783,23 @@ impl App {
         self.backend.connect(ds, request_id);
     }
 
+    /// A console can connect before the explorer does, so an open link may
+    /// create the source's state; a lost one only marks a known connection.
+    fn source_link(&mut self, ds_id: &str, open: bool) {
+        if self.source(ds_id).is_none() {
+            return;
+        }
+        let st = self.sources.entry(ds_id.to_owned()).or_default();
+        match (&st.status, open) {
+            // The explorer's own connection reports the result.
+            (ConnStatus::Connecting, _) => return,
+            (_, true) => st.status = ConnStatus::Connected(st.info.clone()),
+            (ConnStatus::Disconnected, false) => return,
+            (_, false) => st.status = ConnStatus::Lost,
+        }
+        self.explorer_ui.invalidate();
+    }
+
     fn disconnect(&mut self, ds_id: &str) {
         self.explorer_ui.cancel_reveal_for_source(ds_id);
         self.explorer_ui.invalidate();
@@ -856,11 +884,15 @@ impl App {
                         st.loading.remove(&Vec::new());
                     }
                     st.status = match result {
-                        Ok(info) => ConnStatus::Connected(info),
+                        Ok(info) => {
+                            st.info = info.clone();
+                            ConnStatus::Connected(info)
+                        }
                         Err(e) => ConnStatus::Failed(e),
                     };
                     self.explorer_ui.invalidate();
                 }
+                Event::SourceLink { ds_id, open } => self.source_link(&ds_id, open),
                 Event::Children {
                     ds_id,
                     path,
@@ -1982,12 +2014,18 @@ impl App {
                             ui.add_space(10.0);
                         }
                         let status = match self.sources.get(&tab.ds_id).map(|s| &s.status) {
-                            Some(ConnStatus::Connected(info)) => {
+                            Some(ConnStatus::Connected(info)) if !info.is_empty() => {
                                 RichText::new(info.split(" (").next().unwrap_or(info).to_string())
                                     .color(theme::TEXT_MUTED)
                             }
+                            Some(ConnStatus::Connected(_)) => {
+                                RichText::new("connected").color(theme::TEXT_MUTED)
+                            }
                             Some(ConnStatus::Failed(_)) => {
                                 RichText::new("connection failed").color(theme::RED)
+                            }
+                            Some(ConnStatus::Lost) => {
+                                RichText::new("connection lost").color(theme::RED)
                             }
                             _ => RichText::new("not connected").color(theme::TEXT_MUTED),
                         };

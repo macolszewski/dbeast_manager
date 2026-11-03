@@ -121,7 +121,7 @@ The Database Explorer shows your data sources as a tree: data source, database, 
 
 - **+** (New): add a data source or a data source group.
 - **Refresh**.
-- **…** (More actions): Collapse All, Scroll from Editor, Speed Search Filter, Data Source Properties…, Disconnect.
+- **…** (More actions): Collapse All, Scroll from Editor, Speed Search Filter, Data Source Properties…, Connect, Disconnect. A green dot on a data source icon means it is connected, a red one that its connection was lost.
 - **QL**: open a new query console (`⌘⇧L`).
 - **−**: hide the panel.
 

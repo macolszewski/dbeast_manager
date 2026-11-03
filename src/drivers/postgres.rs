@@ -133,6 +133,16 @@ impl PgConn {
         })
     }
 
+    pub(super) fn is_closed(&self) -> bool {
+        self.client.is_closed() || self._connection_task.0.is_finished()
+    }
+
+    /// An empty query: answered even inside a failed transaction.
+    pub(super) async fn ping(&self) -> Result<()> {
+        self.client.simple_query("").await?;
+        Ok(())
+    }
+
     pub fn cancel_handle(&self) -> super::CancelHandle {
         let token = self.client.cancel_token();
         if let Some((host, port, server_name)) = &self.mcp_endpoint {
