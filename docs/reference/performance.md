@@ -15,11 +15,11 @@ How these goals are met:
 - Everything is loaded lazily: the Explorer tree level by level, results in pages (500 rows by default), completion metadata once per connection.
 - Grids, trees, lists and logs draw only the visible rows. Work proportional to the number of rows (sorting, serialization, indexing) is done once and cached, never repeated on every frame.
 
-The verification of the 0.3.0 audit, with the measurements behind each fix, is in [Performance and memory audit of 0.3.0](../design/performance-audit-0.3.md).
+The verification of the 0.3.0 audit, with the measurements behind each fix, is in [Performance and memory audit of 0.3.0](https://github.com/macolszewski/dbeast_manager/blob/master/design/performance-audit-0.3.md).
 
 Most measurements below are micro-benchmarks of a single stage, without GPU rendering. They show the cost of that stage; they are not a frame-rate measurement of the whole application. Unless stated otherwise, they were taken on Apple Silicon in a release build.
 
-The [19 October 2026 follow-up audit](../design/performance-audit-2026-10-19.md) covers
+The [19 October 2026 follow-up audit](https://github.com/macolszewski/dbeast_manager/blob/master/design/performance-audit-2026-10-19.md) covers
 startup, idle resources, horizontal grid layout, session eviction and large SQL editors.
 
 ## Measuring startup, memory and CPU

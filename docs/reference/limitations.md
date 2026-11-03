@@ -100,4 +100,4 @@ See [Query plans](../guide/query-plans.md).
 - Results are limited to 500 rows and 256 KiB of data. Agents cannot open files by path.
 - Parallel conversations need separate agent connections, because a new `begin_session` replaces the previous session of the same client.
 
-See [AI agents](../guide/ai-agents.md) and the [MCP contract](../design/mcp-contract.md) for the complete list.
+See [AI agents](../guide/ai-agents.md) and the [MCP contract](https://github.com/macolszewski/dbeast_manager/blob/master/design/mcp-contract.md) for the complete list.

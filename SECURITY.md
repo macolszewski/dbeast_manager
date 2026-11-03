@@ -51,4 +51,4 @@ Out of scope:
   (please report those upstream).
 
 The MCP security model is described in the
-[MCP contract](docs/design/mcp-contract.md).
+[MCP contract](design/mcp-contract.md).
