@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-12
+
+### Changed
+
+- The macOS bundle identifier and the name of the credential record in the
+  Keychain, Secret Service and the Windows credential files are now
+  `dev.dbeast.dbeast`, the same as the configuration folder. Passwords saved by
+  earlier versions are not read: enter them again after upgrading. macOS treats
+  the app as new, so permissions granted to the old bundle must be granted again.
+
+### Removed
+
+- The configuration is no longer read from the folder of the application's former
+  name (`dev.db_eye.db_eye` on macOS). Move a `config.json` left there to the
+  current configuration folder.
+
 ## [0.5.1] - 2026-11-03
 
 ### Added
@@ -218,7 +234,8 @@ First public version (source only).
 - The integrated macOS title bar keeps room for the window buttons at every
   Zoom IDE level.
 
-[Unreleased]: https://github.com/macolszewski/dbeast_manager/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/macolszewski/dbeast_manager/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/macolszewski/dbeast_manager/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/macolszewski/dbeast_manager/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/macolszewski/dbeast_manager/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/macolszewski/dbeast_manager/compare/v0.4.0...v0.4.1
