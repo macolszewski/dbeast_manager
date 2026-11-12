@@ -246,19 +246,12 @@ impl Config {
         if let Some(p) = std::env::var_os("DBEAST_CONFIG") {
             return Some(PathBuf::from(p));
         }
-        // Saved passwords are bound to the config path, so an existing config from
-        // before the rename stays where it is instead of being moved. The disk is
-        // checked once per run: this path is asked for on every session save.
+        // Resolved once per run: this path is asked for on every session save.
         static DEFAULT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
         DEFAULT
             .get_or_init(|| {
-                let legacy = directories::ProjectDirs::from("dev", "db_eye", "db_eye")
+                directories::ProjectDirs::from("dev", "dbeast", "dbeast")
                     .map(|dirs| dirs.config_dir().join("config.json"))
-                    .filter(|path| path.exists());
-                legacy.or_else(|| {
-                    directories::ProjectDirs::from("dev", "dbeast", "dbeast")
-                        .map(|dirs| dirs.config_dir().join("config.json"))
-                })
             })
             .clone()
     }

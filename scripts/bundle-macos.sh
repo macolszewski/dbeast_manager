@@ -16,7 +16,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleExecutable</key><string>DBeast</string>
 <key>CFBundleName</key><string>DBeast</string>
 <key>CFBundleDisplayName</key><string>DBeast</string>
-<key>CFBundleIdentifier</key><string>ai.inprojects.dbeast</string>
+<key>CFBundleIdentifier</key><string>dev.dbeast.dbeast</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>DBeast</string>
 <key>CFBundleShortVersionString</key><string>$version</string>

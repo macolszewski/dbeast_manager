@@ -200,7 +200,7 @@ impl Persistence {
     }
     fn service(config: &Config) -> String {
         format!(
-            "ai.inprojects.dbeast.credentials.{}",
+            "dev.dbeast.dbeast.credentials.{}",
             config.credential_namespace
         )
     }

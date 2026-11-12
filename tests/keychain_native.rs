@@ -25,7 +25,7 @@ fn isolated_keychain_round_trip() {
         .prompt_user(false)
         .create(&path)
         .unwrap();
-    let service = "ai.inprojects.dbeast.disposable-probe";
+    let service = "dev.dbeast.dbeast.disposable-probe";
     let account = "vault-v1";
     native::write(&mut keychain, service, account, b"synthetic-secret").unwrap();
     let (_, original_item) = security_framework::os::macos::passwords::find_generic_password(

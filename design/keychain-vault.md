@@ -4,7 +4,7 @@
 
 The previous format created a separate item for each source and a new item identity whenever passwords changed. Startup read these items one by one. After the application signature changed, macOS could require a separate approval for each item. This matches the symptom of many prompts with several databases.
 
-In the new format a single `vault-v1` item in the service `ai.inprojects.dbeast.credentials.<configuration UUID>` holds revisions of the four secrets of every source: the database password, the SSH password, the SSH private key passphrase and the TLS identity. After migration, a single vault read at startup loads all saved passwords into memory. A regular autosave of history, filters and layout neither reads nor writes Keychain. Forever and Until restart keep working.
+In the new format a single `vault-v1` item in the service `dev.dbeast.dbeast.credentials.<configuration UUID>` holds revisions of the four secrets of every source: the database password, the SSH password, the SSH private key passphrase and the TLS identity. After migration, a single vault read at startup loads all saved passwords into memory. A regular autosave of history, filters and layout neither reads nor writes Keychain. Forever and Until restart keep working.
 
 All operations stay on the dedicated persistence worker. The tests and this increment do not use the real `config.json`, the login keychain or external databases.
 
